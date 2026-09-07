@@ -1,0 +1,53 @@
+# Model prices in USD per million tokens.
+#
+# /hyperpower:cost reads this file. Any entry older than 90 days is labelled
+# stale in the output. The number is still shown, marked unverified. It is
+# never presented as current.
+#
+# A model in your config with no entry here reports token counts and no money,
+# rather than a guess.
+#
+# Cache rates are derived, not stored:
+#   cache_read  = input x 0.1
+#   cache_write = input x 1.25   (5-minute TTL, the default)
+#   cache_write = input x 2.0    (1-hour TTL)
+
+version: 1
+currency: USD
+unit: per_million_tokens
+
+cache_multipliers:
+  read: 0.1
+  write_5m: 1.25
+  write_1h: 2.0
+
+models:
+  claude-opus-5:
+    input: 5.00
+    output: 25.00
+    context: 1000000
+    last_verified: 2026-06-24
+
+  claude-sonnet-5:
+    input: 2.00
+    output: 10.00
+    context: 1000000
+    last_verified: 2026-06-24
+
+  claude-haiku-4-5:
+    input: 1.00
+    output: 5.00
+    context: 200000
+    last_verified: 2026-06-24
+
+  claude-opus-4-8:
+    input: 5.00
+    output: 25.00
+    context: 1000000
+    last_verified: 2026-06-24
+
+  claude-sonnet-4-6:
+    input: 3.00
+    output: 15.00
+    context: 1000000
+    last_verified: 2026-06-24

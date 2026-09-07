@@ -1,0 +1,14 @@
+{
+  "name": "hyperpowers",
+  "owner": {
+    "name": "Kaushik",
+    "url": "https://github.com/adkaushik"
+  },
+  "plugins": [
+    {
+      "name": "hyperpower",
+      "source": "./plugins/hyperpower",
+      "description": "Agentic development harness. Gates that execute, decisions that persist, memory that improves without slowing runs down."
+    }
+  ]
+}
