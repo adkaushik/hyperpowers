@@ -1,6 +1,6 @@
 ---
 name: scout
-description: Log product and engineering opportunities noticed while working - bug risks, tech debt, test gaps, perf, ux, feature ideas. Every entry must cite evidence from the actual work. Writes to .hyperpower/backlog.jsonl. Run it when a task is done, or on demand with /scout.
+description: Log product and engineering opportunities noticed while working - bug risks, tech debt, test gaps, perf, ux, feature ideas. Every entry must cite evidence from the actual work. Writes to .hyperpower/backlog.jsonl. Run it when a task is done, or on demand with /hyperpower:scout.
 ---
 
 # Scout
@@ -20,7 +20,7 @@ An entry without evidence is slop. Drop it rather than write it.
 Check these in order. Stop when you have enough for three entries.
 
 1. `.hyperpower/runs/<run-id>/` if it exists - gate failures, refuted assumptions, fix-loop rounds above 1, findings marked PLAUSIBLE that were out of scope
-2. `git diff main...HEAD` and `git status --porcelain` - what changed
+2. `git diff $(git merge-base HEAD origin/<default-branch>)` and `git status --porcelain` - what changed. Read the default branch from `git symbolic-ref refs/remotes/origin/HEAD`. Do not hardcode `main`.
 3. For each changed source file, whether a matching test file exists
 4. `CODEBASE_RULEBOOK.md` or `.claude/rules/` - deviations the work had to route around
 5. Suppressed lint or type errors in the diff
@@ -67,12 +67,12 @@ Before writing, read the whole sheet.
 ## Config
 
 If `hyperpower.yml` exists at the repo root, read it and use `paths.source`,
-`paths.ignore`, and the matching `limits.*` cap. Without it, use the defaults below and do
-not ask the user to create one.
+`paths.ignore`, and `limits.scout_max_new_per_run`. Without it, use the defaults below and
+do not ask the user to create one.
 
 ## Caps
 
-Maximum three new keys per invocation. If you have more candidates, rank by evidence strength and keep the top three. The rest will resurface through `occurrences` on later runs.
+`limits.scout_max_new_per_run` new keys per invocation, default 3. If you have more candidates, rank by evidence strength and keep the top N. The rest will resurface through `occurrences` on later runs.
 
 Existing-key increments do not count against the cap.
 

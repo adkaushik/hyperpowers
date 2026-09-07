@@ -409,7 +409,7 @@ the harness.
 id: 2026-09-07-preview-masking-location
 run: 4f2a
 ticket: null
-decided_by: agent_directed
+decided_by: agent_autonomous
 question: Where does field masking happen for preview mode?
 chose: server-side masking before serialization
 status: active

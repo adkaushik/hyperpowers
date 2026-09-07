@@ -7,6 +7,7 @@
     "url": "https://github.com/adkaushik"
   },
   "homepage": "https://github.com/adkaushik/hyperpowers",
+  "repository": "https://github.com/adkaushik/hyperpowers",
   "license": "MIT",
-  "keywords": ["agentic", "harness", "code-review", "gates", "evals", "memory"]
+  "keywords": ["agentic", "harness", "code-review", "gates", "evals", "memory", "workflows"]
 }

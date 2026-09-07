@@ -75,7 +75,8 @@ All documentation, agent output, commit messages, and skill files follow two rul
 
 1. Lead with the action. First line is something the reader can do.
 2. Number multi-step work. One bounded action per step.
-3. Cap lists at five. If it grows past five, split into now versus later.
+3. Rank, never cap. Show the top five, then say how many remain and where the rest are. A
+   list truncated at five with no remainder count reads as complete coverage.
 4. No preamble, no recap, no closing pleasantries.
 5. Give specific time estimates. "About 15 minutes", not "some work".
 

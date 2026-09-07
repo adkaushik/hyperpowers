@@ -4,5 +4,5 @@ __pycache__/
 *.pyc
 .venv/
 .hyperpower/runs/
-.hyperpower/telemetry/
+.hyperpower/evals/
 hyperpower.local.yml

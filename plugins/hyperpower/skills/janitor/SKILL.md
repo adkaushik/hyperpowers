@@ -1,6 +1,6 @@
 ---
 name: janitor
-description: Log codebase hygiene debt found while touching files - outdated and deprecated dependencies, unused packages, files still on a pattern the repo has migrated away from, lockfile drift. Runs cheap tools first, LLM only to scope. Writes to .hyperpower/hygiene.jsonl. Use /janitor, or /janitor --all for a full sweep.
+description: Log codebase hygiene debt found while touching files - outdated and deprecated dependencies, unused packages, files still on a pattern the repo has migrated away from, lockfile drift. Runs cheap tools first, LLM only to scope. Writes to .hyperpower/hygiene.jsonl. Use /hyperpower:janitor, or /hyperpower:janitor --all for a full sweep.
 ---
 
 # Janitor
@@ -11,7 +11,7 @@ Deterministic tools first. Use the model only to decide what matters and what it
 
 ## Scope
 
-Default: files and dependencies touched by `git diff main...HEAD` plus uncommitted changes.
+Default: files and dependencies touched by `git diff $(git merge-base HEAD origin/<default-branch>)` plus uncommitted changes. Read the default branch from `git symbolic-ref refs/remotes/origin/HEAD`. Do not hardcode `main`.
 
 `--all`: whole repo. Slower. Only when asked.
 
@@ -74,12 +74,13 @@ For dependency entries, also update the version in the title when it changes. Do
 ## Config
 
 If `hyperpower.yml` exists at the repo root, read it and use `paths.source`,
-`paths.ignore`, and the matching `limits.*` cap. Without it, use the defaults below and do
-not ask the user to create one.
+`paths.ignore`, and `limits.janitor_max_new_per_run`. Without it, use the defaults below and
+do not ask the user to create one.
 
 ## Caps
 
-Maximum five new keys per invocation, scoped mode. Ten with `--all`.
+`limits.janitor_max_new_per_run` new keys per invocation in scoped mode, default 5. Double
+it for `--all`.
 
 Group by package, not by file. One key for "6 files on react-router v5", not six keys.
 

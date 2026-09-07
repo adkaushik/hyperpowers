@@ -18,16 +18,20 @@ missing says so.
 
 ## Built-in gates
 
-| Gate | Runs | Applies to |
-|---|---|---|
-| types | `commands.typecheck` | any typed language |
-| unit | `commands.test_scoped` | any repo with tests |
-| lint | `commands.lint` | any repo with a linter |
-| build | `commands.build` | any repo that builds |
-| slop | `antislop --profile core`, `ai-slop-detector` | any repo |
-| browser | boot `dev_server`, load `{route}`, assert it renders | web only |
-| a11y | axe assertions on `{route}` | web only |
-| visual | screenshot diff against the locked mock | web with a mock |
+| Gate | Runs | Applies to | Script |
+|---|---|---|---|
+| types | `commands.typecheck` | any typed language | `gates/types.sh` |
+| unit | `commands.test_scoped` | any repo with tests | `gates/unit.sh` |
+| lint | `commands.lint` | any repo with a linter | `gates/lint.sh` |
+| build | `commands.build` | any repo that builds | `gates/build.sh` |
+| slop | `antislop --profile core`, `ai-slop-detector` | any repo | `gates/slop.sh` |
+| browser | boot `dev_server`, load `{route}`, assert it renders | web only | not shipped yet |
+| a11y | axe assertions on `{route}` | web only | not shipped yet |
+| visual | screenshot diff against the locked mock | web with a mock | not shipped yet |
+
+The last three are in the config schema and ship `enabled: false`. No script exists for them
+yet. `unit` runs `commands.test_scoped` only. It never falls back to `commands.test`, because
+a scoped gate that silently runs the whole suite is reporting a check it was not asked for.
 
 ## Blocking versus advisory
 

@@ -1,0 +1,30 @@
+{
+  "description": "Session start injects the hyperpower protocol into the main agent. The commit gate is registered but inert until an opt-in flag file exists.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
+            "timeout": 10,
+            "statusMessage": "Loading hyperpower protocol..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/require-commit-prep.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -97,7 +97,13 @@ A run is a folder, not a conversation. Sessions are disposable.
   <step>.json         that step's output contract
   mistakes.jsonl      failure events
   usage.jsonl         one line per model call
+  corrections.jsonl   corrections from /hyperpower:correct
+  resume.jsonl        one line per /hyperpower:resume replay
+  gates/<gate>.log    full output of each gate command
 ```
+
+Steps, in pipeline order: `route`, `understand`, `plan`, `design`, `build`, `gates`,
+`review`, `fix`, `render`. A missing step file means the stage was skipped.
 
 Each step's cache key is the hash of `(prompt, upstream contract, git tree sha of files
 read)`.
