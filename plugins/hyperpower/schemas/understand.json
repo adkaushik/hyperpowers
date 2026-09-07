@@ -1,0 +1,424 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/adkaushik/hyperpowers/schemas/understand.json",
+  "title": "Understand contract",
+  "description": "Output of the Understand stage. A read-only map of the affected code: entry points, call sites, blast radius, seams, and the rulebook rules this change triggers. A contract that fails this schema is a hard stop, not a warning. The next stage never runs on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "step",
+    "status",
+    "summary",
+    "behaviour",
+    "affected_files",
+    "entry_points",
+    "call_sites",
+    "blast_radius",
+    "seams",
+    "tests_covering",
+    "ui_surface",
+    "rules_applicable",
+    "unknowns",
+    "files_read",
+    "assumptions",
+    "notes"
+  ],
+  "properties": {
+    "step": {
+      "type": "string",
+      "const": "understand"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run folder under .hyperpower/runs/. null when the stage ran without a run journal."
+    },
+    "prompt_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "sha256 of the prompt that produced this contract. The orchestrator stamps it, so it is absent on the contract a stage hands to hp-validate. /hyperpower:resume reads it."
+    },
+    "cache_key": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Stamped by hp-journal after validation. hp-journal owns this shape, so the schema records that the field is legal and checks nothing inside it."
+    },
+    "recorded_at": {
+      "type": "string",
+      "description": "Stamped by hp-journal when it writes the step file, so it is absent on the contract a stage hands to hp-validate."
+    },
+    "files_read": {
+      "type": "array",
+      "description": "Every path this stage read. /hyperpower:resume re-hashes this list to detect drift. A file read and left out is drift the resume check cannot see.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Every fact this stage relied on that it did not read in front of it. Present even when empty: an absent array reads to /hyperpower:why as zero assumptions declared. Carry an upstream assumption forward with its original id, claim and declared_at.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "claim",
+          "source",
+          "confidence",
+          "declared_at",
+          "checkable",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique within the run, not within the step. a1, a2."
+          },
+          "claim": {
+            "type": "string",
+            "description": "The fact relied on, in one sentence."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "rulebook",
+              "inferred",
+              "asked"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "declared_at": {
+            "type": "string",
+            "description": "The step that first declared it.",
+            "enum": [
+              "route",
+              "understand",
+              "plan",
+              "design",
+              "build",
+              "gates",
+              "review",
+              "fix",
+              "render"
+            ]
+          },
+          "checkable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file path or command that settles the claim later. null when nothing settles it, which stamps the status unresolved."
+          },
+          "status": {
+            "type": "string",
+            "description": "declared until the gate-time pass re-reads checkable and stamps it.",
+            "enum": [
+              "declared",
+              "verified",
+              "refuted",
+              "unresolved"
+            ]
+          }
+        }
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "description": "Options considered and dropped. /hyperpower:why --rejected reads this array by name, so it is flat and top level.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "option",
+          "reason"
+        ],
+        "properties": {
+          "option": {
+            "type": "string",
+            "description": "The option dropped."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it lost."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "description": "Anything the next stage needs. Never shaped and never capped.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "done",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "How the affected area works today, in the code as it is now."
+    },
+    "behaviour": {
+      "type": "string",
+      "description": "The requirement restated as the observable behaviour that must change."
+    },
+    "affected_files": {
+      "type": "array",
+      "description": "The deduplicated union of the files in entry_points and call_sites. Where the behaviour lives, not which files change. The planner decides that.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "entry_points": {
+      "type": "array",
+      "description": "Where a user or another system reaches the behaviour.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "file",
+          "line",
+          "symbol",
+          "kind"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "route",
+              "command",
+              "export",
+              "handler",
+              "job"
+            ]
+          }
+        }
+      }
+    },
+    "call_sites": {
+      "type": "array",
+      "description": "Call sites that were read, not grep candidates.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "symbol",
+          "file",
+          "line",
+          "hop"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "hop": {
+            "type": "integer",
+            "description": "1 for a direct caller."
+          }
+        }
+      }
+    },
+    "blast_radius": {
+      "type": "array",
+      "description": "Files outside affected_files that this change can break. A flat list of paths, because agents/reviewer.md and skills/review/SKILL.md both take blast_radius as string[]. The reason a file is here belongs in call_sites or seams, where the line numbers are.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "seams": {
+      "type": "array",
+      "description": "Boundaries where two sides must agree and can disagree silently. The highest-value output of this stage.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "sides",
+          "must_agree_on"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "http",
+              "schema",
+              "module",
+              "process",
+              "config",
+              "ui_state"
+            ]
+          },
+          "sides": {
+            "type": "array",
+            "description": "Both sides of the boundary.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "file",
+                "line"
+              ],
+              "properties": {
+                "file": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "must_agree_on": {
+            "type": "string",
+            "description": "shape, nullability, unit, encoding, ordering, or error contract."
+          }
+        }
+      }
+    },
+    "tests_covering": {
+      "type": "array",
+      "description": "Tests that already cover the affected code.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "file",
+          "covers",
+          "runs_with"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "covers": {
+            "type": "string"
+          },
+          "runs_with": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "ui_surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "touched",
+        "routes",
+        "evidence"
+      ],
+      "properties": {
+        "touched": {
+          "type": "boolean",
+          "description": "Design runs on true."
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence": {
+          "type": [
+            "string",
+            "array",
+            "null"
+          ]
+        }
+      }
+    },
+    "rules_applicable": {
+      "type": "array",
+      "description": "Only the CODEBASE_RULEBOOK.md rules this change triggers, each naming the files it governs. A rule listed with no file is noise every later stage pays for.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "rule",
+          "files",
+          "why"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "rule": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "why": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "unknowns": {
+      "type": "array",
+      "description": "What stayed unresolved after globbing, grepping and reading. Plan turns each one into an assumption or a task.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "question",
+          "searched",
+          "why_unresolved"
+        ],
+        "properties": {
+          "question": {
+            "type": "string"
+          },
+          "searched": {
+            "type": [
+              "string",
+              "array"
+            ]
+          },
+          "why_unresolved": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

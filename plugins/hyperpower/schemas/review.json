@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/adkaushik/hyperpowers/schemas/review.json",
+  "title": "Review contract",
+  "description": "Output of the Review stage. The partition, the findings, and one skeptic verdict per finding. A contract that fails this schema is a hard stop, not a warning. The next stage never runs on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "step",
+    "run_id",
+    "base_sha",
+    "slices",
+    "left_out",
+    "findings",
+    "assumptions",
+    "notes"
+  ],
+  "properties": {
+    "step": {
+      "type": "string",
+      "const": "review"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run folder under .hyperpower/runs/. null when the stage ran without a run journal."
+    },
+    "prompt_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "sha256 of the prompt that produced this contract. The orchestrator stamps it, so it is absent on the contract a stage hands to hp-validate. /hyperpower:resume reads it."
+    },
+    "cache_key": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Stamped by hp-journal after validation. hp-journal owns this shape, so the schema records that the field is legal and checks nothing inside it."
+    },
+    "recorded_at": {
+      "type": "string",
+      "description": "Stamped by hp-journal when it writes the step file, so it is absent on the contract a stage hands to hp-validate."
+    },
+    "files_read": {
+      "type": "array",
+      "description": "Every path this stage read. /hyperpower:resume re-hashes this list to detect drift. A file read and left out is drift the resume check cannot see.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Every fact this stage relied on that it did not read in front of it. Present even when empty: an absent array reads to /hyperpower:why as zero assumptions declared. Carry an upstream assumption forward with its original id, claim and declared_at.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "claim",
+          "source",
+          "confidence",
+          "declared_at",
+          "checkable",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique within the run, not within the step. a1, a2."
+          },
+          "claim": {
+            "type": "string",
+            "description": "The fact relied on, in one sentence."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "rulebook",
+              "inferred",
+              "asked"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "declared_at": {
+            "type": "string",
+            "description": "The step that first declared it.",
+            "enum": [
+              "route",
+              "understand",
+              "plan",
+              "design",
+              "build",
+              "gates",
+              "review",
+              "fix",
+              "render"
+            ]
+          },
+          "checkable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file path or command that settles the claim later. null when nothing settles it, which stamps the status unresolved."
+          },
+          "status": {
+            "type": "string",
+            "description": "declared until the gate-time pass re-reads checkable and stamps it.",
+            "enum": [
+              "declared",
+              "verified",
+              "refuted",
+              "unresolved"
+            ]
+          }
+        }
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "description": "Options considered and dropped. /hyperpower:why --rejected reads this array by name, so it is flat and top level.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "option",
+          "reason"
+        ],
+        "properties": {
+          "option": {
+            "type": "string",
+            "description": "The option dropped."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it lost."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "description": "Anything the next stage needs. Never shaped and never capped.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "base_sha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The sha the diff is against."
+    },
+    "slices": {
+      "type": "array",
+      "description": "Two to six slices, cut on subsystems and seams. Never by file count.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "slice_id",
+          "files",
+          "result"
+        ],
+        "properties": {
+          "slice_id": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "result": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "left_out": {
+      "type": "array",
+      "description": "Every changed file lands in exactly one slice or here. A file in neither is a partition bug.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "file",
+          "reason"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Ranked CONFIRMED first, then severity, then slice order. Never truncated: the cap-at-five rule applies to the rendered view, not to this array. An empty array is a valid and good answer, and means the diff is clean.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "slice_id",
+          "class",
+          "file",
+          "line",
+          "claim",
+          "failure_scenario",
+          "evidence",
+          "severity",
+          "verdict"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "f1, f2, unique within the slice."
+          },
+          "slice_id": {
+            "type": "string"
+          },
+          "class": {
+            "type": "string",
+            "enum": [
+              "logic",
+              "edge_case",
+              "regression",
+              "integration_seam",
+              "rulebook_deviation",
+              "undeclared_assumption"
+            ]
+          },
+          "file": {
+            "type": "string",
+            "description": "The anchor. Required."
+          },
+          "line": {
+            "type": "integer",
+            "description": "The anchor. A finding with no line is not a finding."
+          },
+          "claim": {
+            "type": "string",
+            "description": "One sentence. The defect, not the fix."
+          },
+          "failure_scenario": {
+            "type": "string",
+            "description": "Concrete inputs or state, then the wrong output or crash."
+          },
+          "evidence": {
+            "type": "array",
+            "description": "file:line citations, including the blast radius.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "checkable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For undeclared_assumption only: what settles the claim."
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "verdict": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The skeptic's tier. null for a collateral finding no skeptic adjudicated. REFUTED goes to this contract only, never to the rendered report.",
+            "enum": [
+              "CONFIRMED",
+              "PLAUSIBLE",
+              "REFUTED",
+              null
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "What the reviewer wrote. The skeptic sets verdict, not this.",
+            "enum": [
+              "unverified"
+            ]
+          },
+          "trace": {
+            "type": "array",
+            "description": "Required for CONFIRMED. One file:line per hop, entry point first.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "refutation_attempted": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What the skeptic searched for and did not find."
+          },
+          "undecidable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Required for PLAUSIBLE. What the code alone cannot settle. Never for want of a reproduction."
+          },
+          "collateral": {
+            "type": "array",
+            "description": "Other real defects the skeptic found while reading."
+          }
+        }
+      }
+    }
+  }
+}

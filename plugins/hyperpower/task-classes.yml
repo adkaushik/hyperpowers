@@ -1,0 +1,228 @@
+# hyperpower task classes.
+#
+# The routing table. /hyperpower:route reads this file, picks exactly one class,
+# and emits the route contract. /hyperpower:run executes the stages that contract
+# names, in order, and skips every stage it does not name.
+#
+# A class is defined by four things: how to recognise it, how to rule it out, the
+# ordered stage list it runs, and the model tier for every stage in that list.
+# A class missing any of the four is not usable. "all stages" is not a value.
+
+version: 1
+
+# Every stage the pipeline can run, in pipeline order. A class names a subset.
+#
+# route is not a member of any class stage list. It runs before the class is
+# known, so the class cannot select it. It still writes route.json to the run
+# journal, and /hyperpower:resume can replay it.
+pipeline: [understand, plan, design, build, gates, review, fix, render]
+
+# The two model tiers. They name the two keys under models: in hyperpower.yml.
+# There is no third tier. Do not add one here.
+tiers_allowed: [judgment, mechanical]
+
+# What the tier means, stage by stage.
+#
+#   understand  the model that reads the affected code and writes the map
+#   plan        the model that writes the plan contract
+#   design      the model that writes the spec and the mock
+#   build       the model hyperpower:builder runs on
+#   gates       the assumption-stamping pass only. Gate commands run no model.
+#   review      hyperpower:reviewer and hyperpower:skeptic. Diff partitioning
+#               always runs on mechanical, whatever this value says.
+#   fix         the model each fix-loop builder runs on
+#   render      the model that shapes the run output for the human
+
+# Lightest first. When more than one class fits, pick the one latest in this list
+# and say so. The ratchet is one way. Route never picks a class lighter than the
+# heaviest one that fits, and never lighter than the class already recorded in
+# meta.json on a replay.
+ratchet: [trivial, one-file-fix, dependency, bug, refactor, feature, ui-feature]
+
+# The class route uses when nothing fits. feature is the heaviest non-UI class,
+# so an unrecognised requirement gets the full non-UI pipeline rather than a
+# cheap one.
+fallback: feature
+
+classes:
+
+  trivial:
+    summary: Text a program does not execute. Nothing observable changes.
+    recognise:
+      - one file changes
+      - the change is a comment, a docstring, a markdown file, or a log message
+      - no test can observe the difference
+      - no export, type, condition, or dependency changes
+    not_this_class:
+      - a string that a test asserts on
+      - a constant that a branch reads
+      - any edit that changes a condition
+    stages: [understand, build, gates, fix, render]
+    tiers:
+      understand: mechanical
+      build: mechanical
+      gates: mechanical
+      # judgment, not mechanical. Build runs on mechanical here, so this is the one
+      # tier up that fix-loop rounds 4 and 5 escalate to. Setting it to mechanical
+      # would make the harness report an escalation that never happened.
+      fix: judgment
+      render: mechanical
+    # null means review is not in stages, so no slice ceiling applies. Route
+    # omits review_slices_max from the contract when this value is null.
+    review_slices_max: null
+    fix_loop: true
+    waits_for_human: false
+    notes:
+      - Review is skipped. The gates are the whole check.
+      - Build runs on mechanical, so fix-loop rounds 4 and 5 move it to judgment.
+
+  one-file-fix:
+    summary: One source file, a pattern the repo already uses, one acceptance condition.
+    recognise:
+      - exactly one file under paths.source changes
+      - CODEBASE_RULEBOOK.md or an adjacent file already shows the pattern
+      - acceptance is one observable condition
+      - no new module, no new dependency, no schema change
+    not_this_class:
+      - a caller in another file has to change as well
+      - the requirement describes wrong behaviour without naming the file
+    stages: [understand, build, gates, review, fix, render]
+    tiers:
+      understand: mechanical
+      build: judgment
+      gates: mechanical
+      review: judgment
+      fix: judgment
+      render: mechanical
+    review_slices_max: 1
+    fix_loop: true
+    waits_for_human: false
+    notes:
+      - Plan is skipped. The precedent in the rulebook is the plan.
+      - One slice, because one file cannot be partitioned into two coherent ones.
+
+  dependency:
+    summary: The manifest or the lockfile changes. Source edits repair call sites only.
+    recognise:
+      - a package is added, removed, upgraded, or pinned
+      - the lockfile changes
+      - source edits exist to keep call sites compiling, not to add behaviour
+    not_this_class:
+      - adopting a new library across the codebase. That is refactor or feature.
+      - a defect caused by a stale package. That is bug, and the ratchet picks it.
+    stages: [understand, plan, build, gates, review, fix, render]
+    tiers:
+      understand: mechanical
+      plan: mechanical
+      build: mechanical
+      gates: mechanical
+      review: judgment
+      fix: judgment
+      render: mechanical
+    review_slices_max: 2
+    fix_loop: true
+    waits_for_human: false
+    notes:
+      - Build runs on mechanical because the gates are the real check on a bump.
+      - Fix-loop rounds 4 and 5 move build to judgment, which is a real escalation.
+      - Two slices at most. One for the manifest, one for the repaired call sites.
+
+  bug:
+    summary: Observed behaviour is wrong. The correct behaviour is known and not in the code.
+    recognise:
+      - the requirement names a wrong result, a stack trace, a failing test, or an error code
+      - a reproduction exists, or the wrong output is quoted
+      - the file to change is not yet known, or more than one file is involved
+    not_this_class:
+      - make it faster. That is refactor.
+      - it never existed and was never built. That is feature.
+    stages: [understand, plan, build, gates, review, fix, render]
+    tiers:
+      understand: judgment
+      plan: judgment
+      build: judgment
+      gates: mechanical
+      review: judgment
+      fix: judgment
+      render: mechanical
+    review_slices_max: 4
+    fix_loop: true
+    waits_for_human: false
+    notes:
+      - Understand runs on judgment. Finding the root cause is the whole job here.
+      - Plan records the root cause and the options rejected, so the archivist can read them.
+
+  refactor:
+    summary: Observable behaviour must not change. Structure does.
+    recognise:
+      - the requirement says behaviour stays the same
+      - the work is a rename, an extraction, a move, a deduplication, or an internal API swap
+      - the existing tests are the acceptance criteria
+    not_this_class:
+      - a test has to be rewritten to accept the change. Behaviour changed, so it is bug or feature.
+      - the change adds a call site that did not exist. That is feature.
+    stages: [understand, plan, build, gates, review, fix, render]
+    tiers:
+      understand: mechanical
+      plan: judgment
+      build: judgment
+      gates: mechanical
+      review: judgment
+      fix: judgment
+      render: mechanical
+    review_slices_max: 6
+    fix_loop: true
+    waits_for_human: false
+    notes:
+      - Six slices. A refactor has the widest blast radius of any class here.
+      - Integration seams are the yield class. Cut slices on seams, not on file count.
+
+  feature:
+    summary: New behaviour a user or a caller can invoke. No rendered surface.
+    recognise:
+      - a new endpoint, command, module, field, job, or migration
+      - nothing in the repo does this today
+      - the output is consumed by another program, not read by a human
+    not_this_class:
+      - a human looks at the output. That is ui-feature.
+      - the behaviour exists and returns the wrong value. That is bug.
+    stages: [understand, plan, build, gates, review, fix, render]
+    tiers:
+      understand: mechanical
+      plan: judgment
+      build: judgment
+      gates: mechanical
+      review: judgment
+      fix: judgment
+      render: mechanical
+    review_slices_max: 6
+    fix_loop: true
+    waits_for_human: false
+    notes:
+      - This is the fallback class. An unrecognised requirement lands here.
+
+  ui-feature:
+    summary: A feature with rendered output a human looks at. The only class that runs Design.
+    recognise:
+      - a screen, a component, a page, an email template, or a table a human reads
+      - the requirement mentions layout, copy, empty states, or a mock
+      - commands.dev_url is set and the change is reachable from a route
+    not_this_class:
+      - a JSON response another program consumes. That is feature.
+      - a log line or a build output. That is trivial or feature.
+    stages: [understand, plan, design, build, gates, review, fix, render]
+    tiers:
+      understand: mechanical
+      plan: judgment
+      design: judgment
+      build: judgment
+      gates: mechanical
+      review: judgment
+      fix: judgment
+      render: mechanical
+    review_slices_max: 6
+    fix_loop: true
+    waits_for_human: true
+    notes:
+      - Design is the only stage in this file that waits for a human. The human locks the mock.
+      - The browser, a11y, and visual gates apply here. They ship disabled until their scripts exist.

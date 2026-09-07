@@ -1,7 +1,40 @@
 # scripts
 
-`run_evals.py` validates, runs, and scores the eval suite. Python 3.8 or newer, standard
-library only. No third-party imports, and no network access.
+Six executables. Python 3.8 or newer, standard library only. No third-party imports, and no
+network access.
+
+Five of them are the kernel. Skills and agents call them rather than parsing YAML, hashing
+files, validating contracts, or writing the run journal themselves, because a second
+implementation of any of those drifts from the first and nothing in the output shows it.
+
+| Script | Does | Exit codes | Reference |
+|---|---|---|---|
+| `hp-config` | merges `hyperpower.yml` and `hyperpower.local.yml`, prints the effective config, the per-field source, and the config hash | 0 ok, 1 parse error, 78 no config | `--help`, `docs/configuration.md` |
+| `hp-journal` | writes and reads `.hyperpower/runs/<run-id>/` | 0 written, 1 refused, 78 no config | `JOURNAL.md` |
+| `hp-validate` | checks a stage contract against `schemas/<stage>.json` | 0 valid, 1 invalid, 2 usage, 78 no schema | `../schemas/README.md` |
+| `hp-gates` | runs every enabled gate, records the aggregate | 0 no blocking failure, 1 blocking failure, 2 could not run | `--help`, `../gates/README.md` |
+| `hp-selfcheck` | checks the plugin against its own documentation, 13 checks | 0 clean, 1 findings | `--list-checks` |
+
+Each carries its own `--help` with the full flag list. The sibling documents named above are
+the contracts; this table is the index.
+
+```sh
+./hp-config --source
+./hp-journal new --task-class feature
+./hp-validate --list
+./hp-gates --run <run> --files src/a.ts --config config.json --json
+./hp-selfcheck --strict
+```
+
+`hp-selfcheck --strict` is what CI runs. Run it before opening a pull request. It catches a
+skill with no `docs/commands.md` section, a gate script with no schema entry, an agent the
+index is missing, a model id with no price, and a task class that one of
+`task-classes.yml`, `schemas/route.json`, and `schemas/plan.json` names and the others do
+not.
+
+## run_evals.py
+
+`run_evals.py` validates, runs, and scores the eval suite.
 
 ```sh
 ./run_evals.py validate

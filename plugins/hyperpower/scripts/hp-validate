@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""Validate a hyperpower stage contract against schemas/<stage>.json.
+
+Python 3.8 or newer, standard library only. No third-party imports, no network access.
+
+    hp-validate <stage> --file <path>
+    hp-validate <stage> --stdin
+    hp-validate --list
+
+A stage that cannot produce a valid contract is a hard stop. Exit 1 means the next stage
+must not run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_SCHEMAS = PLUGIN_DIR / "schemas"
+
+# Pipeline order. Ordering only: a schema file that is not listed here still validates.
+STAGES = (
+    "route",
+    "understand",
+    "plan",
+    "design",
+    "build",
+    "gates",
+    "review",
+    "fix",
+    "render",
+)
+
+EXIT_VALID = 0
+EXIT_INVALID = 1
+EXIT_USAGE = 2
+EXIT_NO_SCHEMA = 78
+
+# The whole vocabulary this validator implements. A schema using anything else is refused
+# at load time, so a constraint is never silently ignored.
+SUPPORTED = (
+    "type",
+    "enum",
+    "const",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+)
+METADATA = ("$schema", "$id", "title", "description")
+TYPE_NAMES = ("object", "array", "string", "integer", "number", "boolean", "null")
+
+STAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+PLAIN_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# The assumption record is fixed by the design. Every stage contract carries the array, and
+# every entry carries these seven fields. A schema that drops one, or invents an eighth, is
+# refused at load time rather than allowed to pass a variant downstream.
+ASSUMPTION_FIELDS = (
+    "id",
+    "claim",
+    "source",
+    "confidence",
+    "declared_at",
+    "checkable",
+    "status",
+)
+ASSUMPTION_SOURCE = ("rulebook", "inferred", "asked")
+ASSUMPTION_STATUS = ("declared", "verified", "refuted", "unresolved")
+
+
+class SchemaError(Exception):
+    """The schema could not be loaded. Nothing was checked."""
+
+
+# ---------------------------------------------------------------- json values
+
+
+def type_of(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
+
+
+def matches_type(value, name):
+    if name == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if name == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if name == "boolean":
+        return isinstance(value, bool)
+    return type_of(value) == name
+
+
+def same_value(left, right):
+    """JSON equality. true and 1 are different values, so bool is compared by type first."""
+    if isinstance(left, bool) != isinstance(right, bool):
+        return False
+    if (left is None) != (right is None):
+        return False
+    return left == right
+
+
+def show(value):
+    if isinstance(value, (dict, list)):
+        return type_of(value)
+    return json.dumps(value)
+
+
+def child_path(path, key):
+    if PLAIN_KEY_RE.match(key):
+        return "%s.%s" % (path, key)
+    return "%s[%s]" % (path, json.dumps(key))
+
+
+# ---------------------------------------------------------------- schema load
+
+
+def check_schema(node, where):
+    """Refuse a schema this validator cannot enforce. Raises SchemaError."""
+    if not isinstance(node, dict):
+        raise SchemaError("%s: schema node is %s, not an object" % (where, type_of(node)))
+
+    for key in node:
+        if key in SUPPORTED or key in METADATA:
+            continue
+        raise SchemaError(
+            "%s: unsupported keyword %s. hp-validate implements %s."
+            % (where, json.dumps(key), ", ".join(SUPPORTED))
+        )
+
+    if "type" in node:
+        names = node["type"]
+        if isinstance(names, str):
+            names = [names]
+        if not isinstance(names, list) or not names:
+            raise SchemaError("%s: type must be a string or a non-empty list of strings" % where)
+        for name in names:
+            if name not in TYPE_NAMES:
+                raise SchemaError(
+                    "%s: unknown type %s. Use one of %s."
+                    % (where, json.dumps(name), ", ".join(TYPE_NAMES))
+                )
+
+    if "enum" in node:
+        if not isinstance(node["enum"], list) or not node["enum"]:
+            raise SchemaError("%s: enum must be a non-empty list" % where)
+
+    if "additionalProperties" in node and not isinstance(node["additionalProperties"], bool):
+        raise SchemaError(
+            "%s: additionalProperties must be true or false. A subschema is not supported."
+            % where
+        )
+
+    props = node.get("properties", {})
+    if "properties" in node and not isinstance(props, dict):
+        raise SchemaError("%s: properties must be an object" % where)
+
+    if "required" in node:
+        required = node["required"]
+        if not isinstance(required, list) or not all(isinstance(n, str) for n in required):
+            raise SchemaError("%s: required must be a list of field names" % where)
+        if "properties" in node:
+            for name in required:
+                if name not in props:
+                    raise SchemaError(
+                        "%s: required field %s has no entry in properties"
+                        % (where, json.dumps(name))
+                    )
+
+    for name, sub in props.items():
+        check_schema(sub, child_path(where, name))
+
+    if "items" in node:
+        check_schema(node["items"], where + "[]")
+
+
+def check_assumptions(node):
+    """The assumption record is fixed by the design. Refuse a schema carrying a variant."""
+    if "assumptions" not in node.get("required", []):
+        raise SchemaError(
+            "$: required must list \"assumptions\". Every stage contract carries the array, "
+            "and an absent array reads to /hyperpower:why as zero assumptions declared."
+        )
+    block = node.get("properties", {}).get("assumptions", {})
+    if block.get("type") != "array":
+        raise SchemaError("$.assumptions: type must be \"array\"")
+    item = block.get("items")
+    if not isinstance(item, dict):
+        raise SchemaError("$.assumptions: needs an items schema for one assumption")
+    if item.get("additionalProperties") is not False:
+        raise SchemaError("$.assumptions[]: needs \"additionalProperties\": false")
+
+    fields = tuple(item.get("required", []))
+    if sorted(fields) != sorted(ASSUMPTION_FIELDS):
+        raise SchemaError(
+            "$.assumptions[]: required is %s. The fixed record is %s."
+            % (", ".join(fields) or "empty", ", ".join(ASSUMPTION_FIELDS))
+        )
+
+    props = item.get("properties", {})
+    for name, allowed in (("source", ASSUMPTION_SOURCE), ("status", ASSUMPTION_STATUS)):
+        found = tuple(props.get(name, {}).get("enum", ()))
+        if sorted(found) != sorted(allowed):
+            raise SchemaError(
+                "$.assumptions[].%s: enum is %s. The fixed vocabulary is %s."
+                % (name, ", ".join(map(str, found)) or "absent", ", ".join(allowed))
+            )
+
+
+def check_root(node, stage):
+    """A stage contract is an object with a required list and no room for invented fields."""
+    if node.get("type") != "object":
+        raise SchemaError("$: root type must be \"object\"")
+    if not node.get("required"):
+        raise SchemaError("$: root needs a non-empty required list")
+    if node.get("additionalProperties") is not False:
+        raise SchemaError("$: root needs \"additionalProperties\": false")
+    if "step" not in node.get("required", []):
+        raise SchemaError("$: required must list \"step\"")
+    named = node.get("properties", {}).get("step", {}).get("const")
+    if named != stage:
+        raise SchemaError(
+            "$.step: const is %s, but the file is %s.json. The step field names its own stage."
+            % (json.dumps(named), stage)
+        )
+    check_assumptions(node)
+
+
+def schema_path(stage, schemas_dir):
+    if not STAGE_NAME_RE.match(stage):
+        raise SchemaError(
+            "%s is not a stage name. Stage names are lowercase: %s."
+            % (json.dumps(stage), ", ".join(STAGES))
+        )
+    return schemas_dir / (stage + ".json")
+
+
+def load_schema(stage, schemas_dir):
+    path = schema_path(stage, schemas_dir)
+    if not path.is_file():
+        raise SchemaError(
+            "no schema for stage %s at %s. Known stages: %s."
+            % (stage, path, ", ".join(known_stages(schemas_dir)) or "none")
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise SchemaError("cannot read %s: %s" % (path, err))
+    try:
+        node = json.loads(text)
+    except ValueError as err:
+        raise SchemaError("%s is not valid JSON: %s" % (path, err))
+    try:
+        check_schema(node, "$")
+        check_root(node, stage)
+    except SchemaError as err:
+        raise SchemaError("%s: %s" % (path, err))
+    return node
+
+
+def known_stages(schemas_dir):
+    if not schemas_dir.is_dir():
+        return []
+    found = sorted(p.stem for p in schemas_dir.glob("*.json"))
+    ordered = [s for s in STAGES if s in found]
+    ordered.extend(s for s in found if s not in STAGES)
+    return ordered
+
+
+# ---------------------------------------------------------------- validation
+
+
+def validate(value, schema, path):
+    """Returns every violation as (json path, message). Order follows the schema."""
+    out = []
+
+    if "type" in schema:
+        names = schema["type"]
+        if isinstance(names, str):
+            names = [names]
+        if not any(matches_type(value, name) for name in names):
+            out.append((path, "expected %s, got %s" % (" or ".join(names), type_of(value))))
+            return out
+
+    if "const" in schema and not same_value(value, schema["const"]):
+        out.append((path, "expected %s, got %s" % (show(schema["const"]), show(value))))
+        return out
+
+    if "enum" in schema and not any(same_value(value, choice) for choice in schema["enum"]):
+        out.append(
+            (
+                path,
+                "%s is not one of: %s"
+                % (show(value), ", ".join(show(choice) for choice in schema["enum"])),
+            )
+        )
+
+    if isinstance(value, dict):
+        props = schema.get("properties", {})
+        for name in schema.get("required", []):
+            if name not in value:
+                out.append((child_path(path, name), "missing required field"))
+        if schema.get("additionalProperties") is False:
+            for name in sorted(value):
+                if name not in props:
+                    out.append((child_path(path, name), "field not in the schema"))
+        for name, sub in props.items():
+            if name in value:
+                out.extend(validate(value[name], sub, child_path(path, name)))
+
+    if isinstance(value, list) and "items" in schema:
+        for index, item in enumerate(value):
+            out.extend(validate(item, schema["items"], "%s[%d]" % (path, index)))
+
+    return out
+
+
+# ---------------------------------------------------------------- input
+
+
+def read_instance(args):
+    """Returns (source label, text). Raises ValueError with the reason to report."""
+    if args.stdin:
+        text = sys.stdin.read()
+        if not text.strip():
+            raise ValueError("no input on stdin")
+        return "stdin", text
+    path = Path(args.file)
+    try:
+        return str(path), path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise ValueError("cannot read %s: %s" % (path, err))
+
+
+# ---------------------------------------------------------------- reporting
+
+
+def report(source, schema_file, violations):
+    """Violations go to stderr. stdout carries the valid line and --list, nothing else."""
+    lines = ["invalid: %s against %s" % (source, schema_file)]
+    width = max(len(path) for path, _ in violations)
+    for path, message in violations:
+        lines.append("  %-*s  %s" % (width, path, message))
+    lines.append("%d violation%s." % (len(violations), "" if len(violations) == 1 else "s"))
+    sys.stderr.write("\n".join(lines) + "\n")
+
+
+def list_stages(schemas_dir):
+    """Prints each stage and the fields its contract must carry."""
+    if not schemas_dir.is_dir():
+        sys.stderr.write("no schemas directory at %s\n" % schemas_dir)
+        return EXIT_NO_SCHEMA
+    stages = known_stages(schemas_dir)
+    if not stages:
+        sys.stderr.write("no schemas in %s\n" % schemas_dir)
+        return EXIT_NO_SCHEMA
+
+    rows = []
+    for stage in stages:
+        schema = load_schema(stage, schemas_dir)
+        rows.append((stage, ", ".join(schema["required"])))
+
+    width = max(len(name) for name, _ in rows + [("stage", "")])
+    print("%-*s  %s" % (width, "stage", "required fields"))
+    for name, fields in rows:
+        print("%-*s  %s" % (width, name, fields))
+
+    missing = [s for s in STAGES if s not in stages]
+    if missing:
+        sys.stderr.write("missing stage schemas: %s\n" % ", ".join(missing))
+        return EXIT_NO_SCHEMA
+    return EXIT_VALID
+
+
+# ---------------------------------------------------------------- cli
+
+HELP_EPILOG = """exit codes:
+  0   the contract is valid
+  1   the contract is invalid, or could not be read or parsed
+  2   usage error
+  78  no schema for that stage, or the schema itself is unusable
+
+A stage that fails validation is a hard stop. Do not run the next stage on an
+invalid contract.
+"""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="hp-validate",
+        description="Validate a hyperpower stage contract against its JSON Schema.",
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("stage", nargs="?", help="stage name, such as build or review")
+    parser.add_argument("--file", "-f", metavar="PATH", help="contract to validate")
+    parser.add_argument("--stdin", action="store_true", help="read the contract from stdin")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_stages",
+        help="print the stages and their required fields",
+    )
+    parser.add_argument(
+        "--schemas-dir",
+        metavar="DIR",
+        default=str(DEFAULT_SCHEMAS),
+        help="schema directory. Default: %(default)s",
+    )
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    schemas_dir = Path(args.schemas_dir)
+
+    if args.list_stages:
+        if args.stage or args.file or args.stdin:
+            parser.error("--list takes no stage, --file, or --stdin")
+        try:
+            return list_stages(schemas_dir)
+        except SchemaError as err:
+            sys.stderr.write("%s\n" % err)
+            return EXIT_NO_SCHEMA
+
+    if not args.stage:
+        parser.error("name a stage, or pass --list")
+    if bool(args.file) == bool(args.stdin):
+        parser.error("pass exactly one of --file or --stdin")
+
+    try:
+        schema = load_schema(args.stage, schemas_dir)
+    except SchemaError as err:
+        sys.stderr.write("%s\n" % err)
+        return EXIT_NO_SCHEMA
+
+    schema_file = schema_path(args.stage, schemas_dir)
+
+    try:
+        source, text = read_instance(args)
+    except ValueError as err:
+        sys.stderr.write("invalid: %s\n" % err)
+        return EXIT_INVALID
+
+    try:
+        instance = json.loads(text)
+    except ValueError as err:
+        sys.stderr.write("invalid: %s is not valid JSON: %s\n" % (source, err))
+        return EXIT_INVALID
+
+    violations = validate(instance, schema, "$")
+    if violations:
+        report(source, schema_file, violations)
+        return EXIT_INVALID
+
+    print("valid: %s against %s" % (source, schema_file))
+    return EXIT_VALID
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

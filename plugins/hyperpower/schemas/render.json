@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/adkaushik/hyperpowers/schemas/render.json",
+  "title": "Render contract",
+  "description": "Output of the Render stage, the single boundary where machine output becomes human output. Records what the human saw and what the view left out. A contract that fails this schema is a hard stop, not a warning. The next stage never runs on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "step",
+    "view",
+    "shaping",
+    "sections",
+    "assumptions",
+    "notes"
+  ],
+  "properties": {
+    "step": {
+      "type": "string",
+      "const": "render"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run folder under .hyperpower/runs/. null when the stage ran without a run journal."
+    },
+    "prompt_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "sha256 of the prompt that produced this contract. The orchestrator stamps it, so it is absent on the contract a stage hands to hp-validate. /hyperpower:resume reads it."
+    },
+    "cache_key": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Stamped by hp-journal after validation. hp-journal owns this shape, so the schema records that the field is legal and checks nothing inside it."
+    },
+    "recorded_at": {
+      "type": "string",
+      "description": "Stamped by hp-journal when it writes the step file, so it is absent on the contract a stage hands to hp-validate."
+    },
+    "files_read": {
+      "type": "array",
+      "description": "Every path this stage read. /hyperpower:resume re-hashes this list to detect drift. A file read and left out is drift the resume check cannot see.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Every fact this stage relied on that it did not read in front of it. Present even when empty: an absent array reads to /hyperpower:why as zero assumptions declared. Carry an upstream assumption forward with its original id, claim and declared_at.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "claim",
+          "source",
+          "confidence",
+          "declared_at",
+          "checkable",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique within the run, not within the step. a1, a2."
+          },
+          "claim": {
+            "type": "string",
+            "description": "The fact relied on, in one sentence."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "rulebook",
+              "inferred",
+              "asked"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "declared_at": {
+            "type": "string",
+            "description": "The step that first declared it.",
+            "enum": [
+              "route",
+              "understand",
+              "plan",
+              "design",
+              "build",
+              "gates",
+              "review",
+              "fix",
+              "render"
+            ]
+          },
+          "checkable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file path or command that settles the claim later. null when nothing settles it, which stamps the status unresolved."
+          },
+          "status": {
+            "type": "string",
+            "description": "declared until the gate-time pass re-reads checkable and stamps it.",
+            "enum": [
+              "declared",
+              "verified",
+              "refuted",
+              "unresolved"
+            ]
+          }
+        }
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "description": "Options considered and dropped. /hyperpower:why --rejected reads this array by name, so it is flat and top level.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "option",
+          "reason"
+        ],
+        "properties": {
+          "option": {
+            "type": "string",
+            "description": "The option dropped."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it lost."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "description": "Anything the next stage needs. Never shaped and never capped.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "view": {
+      "type": "string",
+      "description": "The rendered text, verbatim. This is what the human saw."
+    },
+    "shaping": {
+      "type": "object",
+      "description": "The two voice flags. Both false still renders plainly.",
+      "additionalProperties": false,
+      "required": [
+        "adhd_shaping",
+        "plain_english"
+      ],
+      "properties": {
+        "adhd_shaping": {
+          "type": "boolean",
+          "description": "voice.adhd_shaping as it was read."
+        },
+        "plain_english": {
+          "type": "boolean",
+          "description": "voice.plain_english as it was read."
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "description": "One entry per ranked list in the view. Rank, never cap: the view shows five and says how many remain. The full list stays in the contract that produced it, and source names that file.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "shown",
+          "total",
+          "source"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "shown": {
+            "type": "integer",
+            "description": "How many rows the view printed."
+          },
+          "total": {
+            "type": "integer",
+            "description": "How many rows the source contract holds."
+          },
+          "source": {
+            "type": "string",
+            "description": "The contract file that holds the full list."
+          }
+        }
+      }
+    }
+  }
+}

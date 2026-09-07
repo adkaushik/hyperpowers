@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/adkaushik/hyperpowers/schemas/gates.json",
+  "title": "Gates contract",
+  "description": "Output of the Gates stage, written by scripts/hp-gates. Commands and exit codes, no model judgment. A contract that fails this schema is a hard stop, not a warning. The next stage never runs on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "step",
+    "run_id",
+    "ts",
+    "duration_ms",
+    "exit_code",
+    "counts",
+    "blocking_failures",
+    "timeout_seconds",
+    "route",
+    "prompt_hash",
+    "files_read",
+    "gates",
+    "assumptions",
+    "blocking_unverified"
+  ],
+  "properties": {
+    "step": {
+      "type": "string",
+      "const": "gates"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run folder under .hyperpower/runs/. null when the stage ran without a run journal."
+    },
+    "prompt_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "sha256 of the prompt that produced this contract. The orchestrator stamps it, so it is absent on the contract a stage hands to hp-validate. /hyperpower:resume reads it."
+    },
+    "cache_key": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Stamped by hp-journal after validation. hp-journal owns this shape, so the schema records that the field is legal and checks nothing inside it."
+    },
+    "recorded_at": {
+      "type": "string",
+      "description": "Stamped by hp-journal when it writes the step file, so it is absent on the contract a stage hands to hp-validate. ts is the stage's own timestamp; this one is the journal's."
+    },
+    "files_read": {
+      "type": "array",
+      "description": "Every path this stage read. /hyperpower:resume re-hashes this list to detect drift. A file read and left out is drift the resume check cannot see.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Every fact this stage relied on that it did not read in front of it. Present even when empty: an absent array reads to /hyperpower:why as zero assumptions declared. Carry an upstream assumption forward with its original id, claim and declared_at.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "claim",
+          "source",
+          "confidence",
+          "declared_at",
+          "checkable",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique within the run, not within the step. a1, a2."
+          },
+          "claim": {
+            "type": "string",
+            "description": "The fact relied on, in one sentence."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "rulebook",
+              "inferred",
+              "asked"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "declared_at": {
+            "type": "string",
+            "description": "The step that first declared it.",
+            "enum": [
+              "route",
+              "understand",
+              "plan",
+              "design",
+              "build",
+              "gates",
+              "review",
+              "fix",
+              "render"
+            ]
+          },
+          "checkable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file path or command that settles the claim later. null when nothing settles it, which stamps the status unresolved."
+          },
+          "status": {
+            "type": "string",
+            "description": "declared until the gate-time pass re-reads checkable and stamps it.",
+            "enum": [
+              "declared",
+              "verified",
+              "refuted",
+              "unresolved"
+            ]
+          }
+        }
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "description": "Options considered and dropped. /hyperpower:why --rejected reads this array by name, so it is flat and top level.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "option",
+          "reason"
+        ],
+        "properties": {
+          "option": {
+            "type": "string",
+            "description": "The option dropped."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it lost."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "description": "Anything the next stage needs. Never shaped and never capped.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "ts": {
+      "type": "string",
+      "description": "ISO 8601 timestamp of the aggregate."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "description": "Wall time for every gate together."
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "0 no blocking gate failed, 1 a blocking gate failed. A blocking gate that did not run does not change it, so the caller reads the per-gate results."
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pass",
+        "fail",
+        "did_not_run",
+        "total"
+      ],
+      "properties": {
+        "pass": {
+          "type": "integer"
+        },
+        "fail": {
+          "type": "integer"
+        },
+        "did_not_run": {
+          "type": "integer"
+        },
+        "total": {
+          "type": "integer"
+        }
+      }
+    },
+    "blocking_failures": {
+      "type": "array",
+      "description": "Gate names that failed and are blocking.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "description": "limits.gate_timeout_seconds as it was read."
+    },
+    "route": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The value substituted for {route}, or null."
+    },
+    "gates": {
+      "type": "array",
+      "description": "One record per configured gate. Written by hp-gates.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "gate",
+          "result",
+          "detail",
+          "evidence",
+          "blocking",
+          "exit_code",
+          "duration_ms",
+          "timed_out",
+          "script",
+          "ts"
+        ],
+        "properties": {
+          "gate": {
+            "type": "string"
+          },
+          "result": {
+            "type": "string",
+            "description": "did_not_run is never a pass. A gate that cannot run reports that it did not run.",
+            "enum": [
+              "pass",
+              "fail",
+              "did_not_run"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "blocking": {
+            "type": "boolean",
+            "description": "False reports a warning and does not stop the run."
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "null when the gate script could not be started."
+          },
+          "duration_ms": {
+            "type": "integer"
+          },
+          "timed_out": {
+            "type": "boolean",
+            "description": "A timeout is an environment fault. Never send one to the fix loop."
+          },
+          "script": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ts": {
+            "type": "string"
+          },
+          "log": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Path to the full gate output under the run journal."
+          }
+        }
+      }
+    },
+    "blocking_unverified": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Blocking gates that could not run. Not failures, but not passes either. Their presence sets exit code 78."
+    }
+  }
+}

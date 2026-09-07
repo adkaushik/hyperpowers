@@ -117,8 +117,15 @@ Return this JSON as your final message. Do not write it to disk. You have no wri
 and the orchestrator writes the journal.
 
 ```json
-{"step":"review","slice_id":"s2","findings":[],"out_of_scope":[],"notes":[]}
+{"step":"review_slice","slice_id":"s2","findings":[],"out_of_scope":[],"notes":[]}
 ```
+
+`step` is `review_slice`, not `review`. This is one slice's report, and the `review` step
+contract is what `skills/review` writes after merging every slice and adjudicating every
+finding. The two shapes differ: `slice_id` and `out_of_scope` are yours, `base_sha`,
+`slices`, `left_out`, and `assumptions` are the merged contract's. `hp-validate review`
+rejects this object, and `hp-journal step` refuses `review_slice` as a step name, so a
+slice report can never be recorded as the run's review.
 
 | Field | Meaning |
 |---|---|

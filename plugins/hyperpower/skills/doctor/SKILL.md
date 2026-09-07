@@ -13,9 +13,15 @@ No `hyperpower.yml` at the repo root: print `No hyperpower.yml. Run /hyperpower:
 
 ## Step 1 - load the effective config
 
-Read `hyperpower.yml`, then merge `hyperpower.local.yml` over it field by field. Verify what the merge produced, not what either file says alone.
+```sh
+hp-config --source > /tmp/hp-doctor-config.json
+```
 
-A local override that changes `commands.test_scoped` is the command doctor runs. Say which file each verified command came from in the report.
+`${CLAUDE_PLUGIN_ROOT}/scripts/hp-config` does the merge. Verify what the merge produced, not what either file says alone. Do not parse either YAML file yourself: a second parser verifies a config no run ever used.
+
+Exit 78 means there is no `hyperpower.yml`. Exit 1 means a file did not parse; print the file, the line, and the error from stderr, then stop.
+
+`sources` in the envelope maps every leaf to the file it came from, so report the file each verified command came from without guessing. A local override that changes `commands.test_scoped` is the command doctor runs.
 
 ## Step 2 - check the toolchain
 
@@ -31,10 +37,16 @@ Check the binaries a command needs before running it. A missing binary is a "did
 
 ## Step 3 - run every gate command
 
-1. Run the command for every gate, enabled and disabled alike. Override `enabled` to true while running, so a gate script's disabled exit does not mask the result. That is how a gate gets re-enabled.
-2. Time out each command at `limits.gate_timeout_seconds`.
-3. Substitute `{files}` with one existing file from `paths.tests` or `paths.source`. Substitute `{route}` with `/`.
-4. Exit 0 is a pass. Exit 78, exit 127, a missing binary, a missing module, or a timeout means the check did not happen: write `enabled: false` and a `reason`. A gate script that exits 78 names the cause in its JSON `detail`. Every other non-zero exit is a fail, and the gate stays enabled.
+```sh
+hp-gates --only <gate> --files <one-existing-file> --route / --config /tmp/hp-doctor-probe.json --json
+```
+
+`${CLAUDE_PLUGIN_ROOT}/scripts/hp-gates` is the runner `/hyperpower:run` uses. Run gates through it, one `--only` call per gate, so doctor verifies the same execution path a real run takes. Do not invoke `commands.<name>` directly, and do not write `gates.json`: doctor is a probe, not a run, so pass no `--run` and let it record nothing.
+
+1. Probe every gate, enabled and disabled alike. Write `/tmp/hp-doctor-probe.json` as the Step 1 config with every `gates.<name>.enabled` forced to `true`, and pass it with `--config`. A gate script's disabled exit would otherwise mask the result, and that is how a gate gets re-enabled.
+2. `limits.gate_timeout_seconds` from the same file caps each command. `hp-gates` enforces it and sets `timed_out` on the gate record.
+3. Substitute `{files}` with one existing file from `paths.tests` or `paths.source` via `--files`. Substitute `{route}` with `/` via `--route`. An empty `--files` scope makes a `{files}` gate report `did_not_run` instead of running against the whole repo.
+4. Read `gates[0].result` from the JSON, not the exit code. `pass` is a pass. `did_not_run` means the check did not happen: write `enabled: false` and a `reason` taken from that record's `detail`, which already names the cause. `fail` means the gate works and the code does not: it stays enabled.
 5. Never run `commands.install`. Print it as the fix instead.
 
 A failing test suite is a working gate. Report it as `fail`, leave it enabled, and do not write a reason.

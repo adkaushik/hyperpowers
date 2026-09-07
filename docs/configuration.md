@@ -18,6 +18,53 @@ Check what is actually in effect:
 
 It prints each field and which file it came from.
 
+## What reads these files
+
+One thing does: `plugins/hyperpower/scripts/hp-config`. Every skill, agent, and gate reads
+the config through it and never parses the YAML itself, so a run, `/hyperpower:config`, and
+`/hyperpower:doctor` all see the same values.
+
+```sh
+hp-config              # the effective config, indented
+hp-config --json       # the same, on one line
+hp-config --source     # config, sources, overrides, unknown_keys, type_errors, hash
+hp-config --hash       # the config hash alone
+```
+
+Exit 0 printed, 1 a file did not parse, 78 no `hyperpower.yml`. There is no fourth outcome:
+with no config the harness stops and says so rather than guessing one.
+
+`--source` maps every dotted leaf path to `hyperpower.yml`, `hyperpower.local.yml`, or
+`default`. A list is one leaf, so a local `paths.source` replaces the committed list whole
+and is labelled `hyperpower.local.yml` entirely. It does not concatenate.
+
+### The config hash
+
+`hp-config --hash` prints a sha256 over the effective config. `hp-journal new` records it
+in the run's `meta.json`, and `/hyperpower:resume` compares it before replaying: a hash
+that no longer matches means the gate commands may have changed, so every step is treated
+as drifted. Editing `hyperpower.yml` mid-run is visible rather than silent.
+
+### Unknown keys and wrong types
+
+A key not in the schema below is never merged and never dropped silently. It lands in
+`unknown_keys` with the file and value it came from, and `/hyperpower:config` prints it
+under `Not in schema`.
+
+A value whose type disagrees with the schema lands in `type_errors` and is still used, with
+one exception: a map replaced by a scalar keeps the defaults, because the section's other
+fields would otherwise vanish.
+
+### The YAML subset
+
+`hp-config` is standard library only, so it parses a deliberate subset: nested maps, block
+lists of scalars, inline maps, inline lists, quoted and unquoted scalars, `null`, booleans,
+integers, floats, and `#` comments.
+
+It rejects anchors, aliases, tags, block scalars, lists of maps, multiple documents,
+duplicate keys, and tabs in indentation, naming the file and the line. Write plain YAML and
+none of this comes up. Every example on this page parses.
+
 ## Writing it by hand
 
 You do not have to run the interview. Write the file yourself and `init` will read it,
@@ -57,6 +104,7 @@ gates:
   lint:    { enabled: true,  blocking: false }
   build:   { enabled: true,  blocking: true }
   slop:    { enabled: true,  blocking: true,  profile: core }
+  e2e:     { enabled: false, blocking: false, reason: "no e2e command configured" }
   browser: { enabled: false, blocking: false, reason: "no dev_url configured" }
   a11y:    { enabled: false, blocking: false }
   visual:  { enabled: false, blocking: false }

@@ -1,0 +1,402 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/adkaushik/hyperpowers/schemas/design.json",
+  "title": "Design contract",
+  "description": "Output of the Design stage, on UI work only. The spec, the mock, the lock, and the build brief written from the locked mock. A contract that fails this schema is a hard stop, not a warning. The next stage never runs on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "step",
+    "status",
+    "routes",
+    "spec",
+    "mock",
+    "locked",
+    "lock",
+    "spec_superseded",
+    "rejected",
+    "build_brief",
+    "tokens",
+    "verification",
+    "files_read",
+    "assumptions",
+    "notes"
+  ],
+  "properties": {
+    "step": {
+      "type": "string",
+      "const": "design"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run folder under .hyperpower/runs/. null when the stage ran without a run journal."
+    },
+    "prompt_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "sha256 of the prompt that produced this contract. The orchestrator stamps it, so it is absent on the contract a stage hands to hp-validate. /hyperpower:resume reads it."
+    },
+    "cache_key": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Stamped by hp-journal after validation. hp-journal owns this shape, so the schema records that the field is legal and checks nothing inside it."
+    },
+    "recorded_at": {
+      "type": "string",
+      "description": "Stamped by hp-journal when it writes the step file, so it is absent on the contract a stage hands to hp-validate."
+    },
+    "files_read": {
+      "type": "array",
+      "description": "Every path this stage read. /hyperpower:resume re-hashes this list to detect drift. A file read and left out is drift the resume check cannot see.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Every fact this stage relied on that it did not read in front of it. Present even when empty: an absent array reads to /hyperpower:why as zero assumptions declared. Carry an upstream assumption forward with its original id, claim and declared_at.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "claim",
+          "source",
+          "confidence",
+          "declared_at",
+          "checkable",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique within the run, not within the step. a1, a2."
+          },
+          "claim": {
+            "type": "string",
+            "description": "The fact relied on, in one sentence."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "rulebook",
+              "inferred",
+              "asked"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "declared_at": {
+            "type": "string",
+            "description": "The step that first declared it.",
+            "enum": [
+              "route",
+              "understand",
+              "plan",
+              "design",
+              "build",
+              "gates",
+              "review",
+              "fix",
+              "render"
+            ]
+          },
+          "checkable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file path or command that settles the claim later. null when nothing settles it, which stamps the status unresolved."
+          },
+          "status": {
+            "type": "string",
+            "description": "declared until the gate-time pass re-reads checkable and stamps it.",
+            "enum": [
+              "declared",
+              "verified",
+              "refuted",
+              "unresolved"
+            ]
+          }
+        }
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "description": "Designs considered and dropped. /hyperpower:why --rejected reads this array by name and prints option and reason, so it is flat and top level.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "option",
+          "reason"
+        ],
+        "properties": {
+          "option": {
+            "type": "string",
+            "description": "The design dropped."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it lost."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "description": "Anything the next stage needs. Never shaped and never capped.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "done",
+        "blocked"
+      ]
+    },
+    "routes": {
+      "type": "array",
+      "description": "The routes this surface lives at. The caller passes one of them to hp-gates --route per gate invocation, which is what fills {route} for the browser, a11y and visual gates.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "spec": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "All four lists. A spec with only the happy state produces a mock with only the happy state.",
+      "additionalProperties": false,
+      "required": [
+        "states",
+        "data",
+        "interactions",
+        "edge_cases"
+      ],
+      "properties": {
+        "states": {
+          "type": "array",
+          "description": "Every state the surface can be in."
+        },
+        "data": {
+          "type": "array",
+          "description": "Each field shown: its source, its type, and what renders when it is absent."
+        },
+        "interactions": {
+          "type": "array",
+          "description": "Each control, what it does, and what it shows while it is doing it."
+        },
+        "edge_cases": {
+          "type": "array",
+          "description": "The values that break the layout."
+        }
+      }
+    },
+    "mock": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "null when status is blocked and no mock was built.",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha",
+        "self_contained",
+        "states_shown"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Under paths.docs, never under .hyperpower/runs/."
+        },
+        "sha": {
+          "type": "string",
+          "description": "git hash-object of the mock file."
+        },
+        "self_contained": {
+          "type": "boolean",
+          "description": "No network request, script, font or remote image."
+        },
+        "states_shown": {
+          "type": "array"
+        }
+      }
+    },
+    "locked": {
+      "type": "boolean",
+      "description": "True only when a human locked this mock. locked true with lock.locked_by null is a contradiction, so never write that pair. A headless run writes false."
+    },
+    "lock": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "A mock nobody clicked is a proposal, not a contract. Never locked for it.",
+      "additionalProperties": false,
+      "required": [
+        "locked_by",
+        "locked_at",
+        "rounds",
+        "changes_requested"
+      ],
+      "properties": {
+        "locked_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "locked_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rounds": {
+          "type": "integer",
+          "description": "Three maximum. A fourth means the spec was wrong."
+        },
+        "changes_requested": {
+          "type": "array"
+        }
+      }
+    },
+    "spec_superseded": {
+      "type": "array",
+      "description": "Where the mock and the spec differ, the mock wins. The recorded disagreement tells the next reader which one decided.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "spec_said",
+          "mock_shows",
+          "why"
+        ],
+        "properties": {
+          "spec_said": {
+            "type": "string"
+          },
+          "mock_shows": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "build_brief": {
+      "type": "array",
+      "description": "Written from the locked mock, not from the spec. Every row cites the mock.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "element",
+          "selector",
+          "states",
+          "behaviour",
+          "source_component"
+        ],
+        "properties": {
+          "element": {
+            "type": "string",
+            "description": "What it is, in the mock's own words."
+          },
+          "selector": {
+            "type": "string",
+            "description": "The id or selector in the mock file."
+          },
+          "states": {
+            "type": "array"
+          },
+          "behaviour": {
+            "type": "string"
+          },
+          "source_component": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The existing component to reuse, or null for new."
+          }
+        }
+      }
+    },
+    "tokens": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "The repo's own colours, spacing and type scale. Never an invented palette.",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "used"
+      ],
+      "properties": {
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "used": {
+          "type": "array"
+        }
+      }
+    },
+    "verification": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "against",
+        "routes",
+        "gate",
+        "baseline_valid"
+      ],
+      "properties": {
+        "against": {
+          "type": "string",
+          "const": "mock"
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The routes the visual gate checks. Same list as the top-level routes."
+        },
+        "gate": {
+          "type": "string",
+          "const": "visual"
+        },
+        "baseline_valid": {
+          "type": "boolean",
+          "description": "False for an unlocked mock, so the visual gate has the fact and not an inference."
+        }
+      }
+    }
+  }
+}

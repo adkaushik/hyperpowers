@@ -1,0 +1,348 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/adkaushik/hyperpowers/schemas/plan.json",
+  "title": "Plan contract",
+  "description": "Output of the Plan stage. The task class, the files to change, the order, the tests that must exist first, and acceptance criteria a gate can check. A contract that fails this schema is a hard stop, not a warning. The next stage never runs on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "step",
+    "status",
+    "task_class",
+    "design_required",
+    "approach",
+    "rejected",
+    "files",
+    "tasks",
+    "out_of_scope",
+    "files_read",
+    "assumptions",
+    "notes"
+  ],
+  "properties": {
+    "step": {
+      "type": "string",
+      "const": "plan"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run folder under .hyperpower/runs/. null when the stage ran without a run journal."
+    },
+    "prompt_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "sha256 of the prompt that produced this contract. The orchestrator stamps it, so it is absent on the contract a stage hands to hp-validate. /hyperpower:resume reads it."
+    },
+    "cache_key": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Stamped by hp-journal after validation. hp-journal owns this shape, so the schema records that the field is legal and checks nothing inside it."
+    },
+    "recorded_at": {
+      "type": "string",
+      "description": "Stamped by hp-journal when it writes the step file, so it is absent on the contract a stage hands to hp-validate."
+    },
+    "files_read": {
+      "type": "array",
+      "description": "Every path this stage read. /hyperpower:resume re-hashes this list to detect drift. A file read and left out is drift the resume check cannot see.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Every fact this stage relied on that it did not read in front of it. Present even when empty: an absent array reads to /hyperpower:why as zero assumptions declared. Carry an upstream assumption forward with its original id, claim and declared_at.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "claim",
+          "source",
+          "confidence",
+          "declared_at",
+          "checkable",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique within the run, not within the step. a1, a2."
+          },
+          "claim": {
+            "type": "string",
+            "description": "The fact relied on, in one sentence."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "rulebook",
+              "inferred",
+              "asked"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "declared_at": {
+            "type": "string",
+            "description": "The step that first declared it.",
+            "enum": [
+              "route",
+              "understand",
+              "plan",
+              "design",
+              "build",
+              "gates",
+              "review",
+              "fix",
+              "render"
+            ]
+          },
+          "checkable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file path or command that settles the claim later. null when nothing settles it, which stamps the status unresolved."
+          },
+          "status": {
+            "type": "string",
+            "description": "declared until the gate-time pass re-reads checkable and stamps it.",
+            "enum": [
+              "declared",
+              "verified",
+              "refuted",
+              "unresolved"
+            ]
+          }
+        }
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "description": "Options considered and dropped. /hyperpower:why --rejected reads this array by name and prints option and reason, so it is flat and top level. Nesting it under the question it answers makes that command report no options recorded.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "option",
+          "reason"
+        ],
+        "properties": {
+          "option": {
+            "type": "string",
+            "description": "The option dropped."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it lost."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "description": "Anything the next stage needs. Never shaped and never capped.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "done",
+        "blocked"
+      ]
+    },
+    "task_class": {
+      "type": "string",
+      "description": "The class as route set it. The seven in task-classes.yml are the whole set, and route.json carries the same seven. agents/planner.md forbids changing the value or naming a class outside task-classes.yml, so the planner can only ever emit one of these. /hyperpower:usage groups by this field and meta.json records what route wrote, so a second vocabulary here fragments every aggregate silently.",
+      "enum": [
+        "trivial",
+        "one-file-fix",
+        "dependency",
+        "bug",
+        "refactor",
+        "feature",
+        "ui-feature"
+      ]
+    },
+    "design_required": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "reason"
+      ],
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Given either way."
+        }
+      }
+    },
+    "approach": {
+      "type": "string",
+      "description": "The chosen approach, one sentence."
+    },
+    "choices": {
+      "type": "array",
+      "description": "One entry per question that had more than one option. Optional. agents/planner.md carries this per task in tasks[], which is the builder's input contract.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "question",
+          "chose",
+          "constraint"
+        ],
+        "properties": {
+          "question": {
+            "type": "string"
+          },
+          "chose": {
+            "type": "string"
+          },
+          "constraint": {
+            "type": "string",
+            "description": "The constraint that forced it."
+          }
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "description": "The deduplicated union of every tasks[].files. The gate {files} scope comes from this list.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "change",
+          "why"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "change": {
+            "type": "string",
+            "enum": [
+              "create",
+              "edit",
+              "delete"
+            ]
+          },
+          "why": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "description": "The field names task, files and acceptance are the builder's input contract. Renaming them breaks the handoff.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "task",
+          "files",
+          "tests_first",
+          "acceptance",
+          "depends_on"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string",
+            "description": "The one requirement this task implements."
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tests_first": {
+            "type": "array",
+            "description": "The tests that must exist before the code does."
+          },
+          "acceptance": {
+            "type": "array",
+            "description": "Observable conditions a command can check.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "depends_on": {
+            "type": "array",
+            "description": "Task ids. A task never depends on a later task.",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "tests_required": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "asserts",
+          "exists"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "asserts": {
+            "type": "string",
+            "description": "What the test asserts, in one sentence."
+          },
+          "exists": {
+            "type": "boolean",
+            "description": "True when the file is already in the repo."
+          }
+        }
+      },
+      "description": "Optional. agents/planner.md carries this per task in tasks[], which is the builder's input contract."
+    },
+    "acceptance": {
+      "type": "array",
+      "description": "The criteria for the whole change. Each one checkable by a command. Optional. agents/planner.md carries this per task in tasks[], which is the builder's input contract.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "out_of_scope": {
+      "type": "array",
+      "description": "What this plan deliberately does not do.",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

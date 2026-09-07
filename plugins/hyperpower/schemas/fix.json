@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/adkaushik/hyperpowers/schemas/fix.json",
+  "title": "Fix contract",
+  "description": "Output of the bounded fix loop. Every round, what it tried, and how it failed. The loop reports; it never spins. A contract that fails this schema is a hard stop, not a warning. The next stage never runs on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "step",
+    "status",
+    "rounds",
+    "findings_fixed",
+    "findings_open",
+    "max_rounds",
+    "assumptions",
+    "notes"
+  ],
+  "properties": {
+    "step": {
+      "type": "string",
+      "const": "fix"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run folder under .hyperpower/runs/. null when the stage ran without a run journal."
+    },
+    "prompt_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "sha256 of the prompt that produced this contract. The orchestrator stamps it, so it is absent on the contract a stage hands to hp-validate. /hyperpower:resume reads it."
+    },
+    "cache_key": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Stamped by hp-journal after validation. hp-journal owns this shape, so the schema records that the field is legal and checks nothing inside it."
+    },
+    "recorded_at": {
+      "type": "string",
+      "description": "Stamped by hp-journal when it writes the step file, so it is absent on the contract a stage hands to hp-validate."
+    },
+    "files_read": {
+      "type": "array",
+      "description": "Every path this stage read. /hyperpower:resume re-hashes this list to detect drift. A file read and left out is drift the resume check cannot see.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Every fact this stage relied on that it did not read in front of it. Present even when empty: an absent array reads to /hyperpower:why as zero assumptions declared. Carry an upstream assumption forward with its original id, claim and declared_at.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "claim",
+          "source",
+          "confidence",
+          "declared_at",
+          "checkable",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique within the run, not within the step. a1, a2."
+          },
+          "claim": {
+            "type": "string",
+            "description": "The fact relied on, in one sentence."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "rulebook",
+              "inferred",
+              "asked"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "declared_at": {
+            "type": "string",
+            "description": "The step that first declared it.",
+            "enum": [
+              "route",
+              "understand",
+              "plan",
+              "design",
+              "build",
+              "gates",
+              "review",
+              "fix",
+              "render"
+            ]
+          },
+          "checkable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file path or command that settles the claim later. null when nothing settles it, which stamps the status unresolved."
+          },
+          "status": {
+            "type": "string",
+            "description": "declared until the gate-time pass re-reads checkable and stamps it.",
+            "enum": [
+              "declared",
+              "verified",
+              "refuted",
+              "unresolved"
+            ]
+          }
+        }
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "description": "Options considered and dropped. /hyperpower:why --rejected reads this array by name, so it is flat and top level.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "option",
+          "reason"
+        ],
+        "properties": {
+          "option": {
+            "type": "string",
+            "description": "The option dropped."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it lost."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "description": "Anything the next stage needs. Never shaped and never capped.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string",
+      "description": "blocked when the last round failed. That is a hard stop.",
+      "enum": [
+        "done",
+        "blocked"
+      ]
+    },
+    "rounds": {
+      "type": "array",
+      "description": "One fix.json per run, not one per round. Rounds live here, capped at limits.fix_loop_max_rounds.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "round",
+          "builder",
+          "model",
+          "targets",
+          "approach",
+          "changed_files",
+          "result",
+          "failure"
+        ],
+        "properties": {
+          "round": {
+            "type": "integer",
+            "description": "1 on the first attempt."
+          },
+          "builder": {
+            "type": "string",
+            "description": "same for a resumed builder, fresh for one holding only prior_attempts.",
+            "enum": [
+              "same",
+              "fresh"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "description": "The model that actually ran, not the tier that was asked for."
+          },
+          "targets": {
+            "type": "array",
+            "description": "Finding ids or gate names this round attacked.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approach": {
+            "type": "string",
+            "description": "What this round tried."
+          },
+          "changed_files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "pass",
+              "fail"
+            ]
+          },
+          "failure": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How it failed. null on a pass."
+          }
+        }
+      }
+    },
+    "findings_fixed": {
+      "type": "array",
+      "description": "Finding ids the loop cleared. Present even when empty.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "findings_open": {
+      "type": "array",
+      "description": "Finding ids still open when the loop stopped. Reported by Render, never dropped. Present even when empty.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "max_rounds": {
+      "type": "integer",
+      "description": "The ceiling this loop ran under, from limits.fix_loop_max_rounds. Recorded so a reader can tell a loop that stopped from one that was cut short."
+    }
+  }
+}

@@ -2,6 +2,9 @@
 """Eval runner for the hyperpower harness.
 
 Three subcommands: validate, run, score. Python 3.8 or newer, standard library only.
+
+Exit codes: 0 valid or PASS, 1 bad input or a refusal, 2 the release verdict failed,
+3 no baseline recorded so nothing was compared.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CASES = PLUGIN_DIR / "evals" / "cases.jsonl"
 DEFAULT_RUBRIC = PLUGIN_DIR / "evals" / "rubric.md"
+DEFAULT_BASELINE = PLUGIN_DIR / "evals" / "baseline.json"
+DEFAULT_PRICING = PLUGIN_DIR / "pricing.yml"
 
 DIMENSIONS = (
     "correctness",
@@ -61,6 +66,14 @@ EPSILON = 1e-9
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_VERDICT_FAIL = 2
+EXIT_NO_BASELINE = 3
+
+# Printed verbatim when the baseline file is absent or holds no scores.
+NO_BASELINE = "no baseline recorded, run /hyperpower:eval --baseline first"
+
+PRICE_STALE_DAYS = 90
+CHARS_PER_TOKEN = 4
+DEFAULT_OUTPUT_TOKENS = 800
 
 
 # ---------------------------------------------------------------- utilities
@@ -86,6 +99,31 @@ def sha256_file(path):
 
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_fingerprint(cases_digest, rubric_digest, conditions, trials):
+    parts = [str(cases_digest), str(rubric_digest), str(trials)]
+    parts.extend("{}={}".format(name, command or "") for name, command in conditions)
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def default_seed(cases_digest, rubric_digest, conditions, trials):
+    """Seed for label shuffling, derived from the run inputs.
+
+    No clock and no unseeded randomness. The same cases, rubric, conditions and trials
+    shuffle the same way and land on the same run id.
+    """
+    return int(_run_fingerprint(cases_digest, rubric_digest, conditions, trials)[:8], 16)
+
+
+def derive_run_id(cases_digest, rubric_digest, conditions, trials, seed):
+    """Reproducible id. The same cases, rubric, conditions, trials and seed give the same id.
+
+    No clock and no unseeded randomness, so re-running one eval lands on the same folder
+    instead of scattering near-identical runs the reader has to tell apart by timestamp.
+    """
+    parts = [_run_fingerprint(cases_digest, rubric_digest, conditions, trials), str(seed)]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
 def capped(items, limit=5):
@@ -352,6 +390,79 @@ def load_config(path=None):
     return summary
 
 
+# ---------------------------------------------------------------- pricing
+
+
+def load_pricing(path):
+    """Read pricing.yml. Return (prices, problem).
+
+    `prices` maps a model id to its input rate, output rate, and last_verified date, all
+    per million tokens. A file that cannot be read returns an empty map and the reason.
+    A model missing from the file never borrows another model's rate.
+    """
+    price_path = Path(path)
+    if not price_path.is_file():
+        return {}, "{} not found".format(price_path)
+    try:
+        data = parse_yaml_subset(price_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return {}, "cannot read {}: {}".format(price_path, exc.strerror or exc)
+    except Exception as exc:  # noqa: BLE001 - a broken price file must not stop the run
+        return {}, "cannot parse {}: {}".format(price_path, exc)
+
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, dict):
+        return {}, "{} has no models table".format(price_path)
+
+    prices = {}
+    for name, entry in models.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            rate_in = float(entry.get("input"))
+            rate_out = float(entry.get("output"))
+        except (TypeError, ValueError):
+            continue
+        prices[name] = {
+            "input": rate_in,
+            "output": rate_out,
+            "last_verified": entry.get("last_verified"),
+        }
+    if not prices:
+        return {}, "{} lists no priced model".format(price_path)
+    return prices, None
+
+
+def price_age_days(last_verified):
+    """Days since the rate was checked. None when the date is missing or malformed."""
+    if not isinstance(last_verified, str):
+        return None
+    try:
+        stamp = datetime.strptime(last_verified, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - stamp).days
+
+
+def estimate_tokens(text):
+    """About four characters per token. This is an estimate, never a count."""
+    return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+
+
+def money(amount):
+    if amount == 0 or amount >= 0.01:
+        return "${:.2f}".format(amount)
+    return "${:.4f}".format(amount)
+
+
+def thousands(count):
+    return "{:,}".format(int(count))
+
+
+def plural(count, word):
+    return "{} {}".format(count, word if count == 1 else word + "s")
+
+
 # ----------------------------------------------------------------- cases
 
 
@@ -558,42 +669,21 @@ def execute_condition(command, prompt, timeout):
     return completed.stdout, result
 
 
-def cmd_run(args):
-    cases_path = Path(args.cases)
-    cases = load_cases_or_exit(cases_path)
-    conditions = build_conditions(args)
-    if args.trials < 1:
-        fail("--trials must be 1 or more.")
+def plan_rows(cases, conditions, trials, rng):
+    """Lay out one row per case, trial, and condition. Writes nothing.
 
-    weights, rubric_digest = load_weights(args.rubric)
-    config = load_config(args.config)
-
-    run_id = "{}-{}".format(datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"), "%04x" % random.getrandbits(16))
-    if args.out:
-        out_dir = Path(args.out)
-    else:
-        anchor = Path(config["source"]).parent if config["source"] else Path.cwd()
-        out_dir = anchor / ".hyperpower" / "evals" / run_id
-    if out_dir.exists() and any(out_dir.iterdir()) and not args.force:
-        fail("{} exists and is not empty. Pass --force to overwrite it.".format(out_dir))
-
-    (out_dir / "prompts").mkdir(parents=True, exist_ok=True)
-    (out_dir / "responses").mkdir(parents=True, exist_ok=True)
-
-    seed = args.seed if args.seed is not None else random.getrandbits(32)
-    rng = random.Random(seed)
-
+    Labels are shuffled per case and trial, so a judge cannot infer the condition from
+    the label. Returns (rows, label to condition map).
+    """
     rows = []
     key_map = {}
     for case in cases:
-        for trial in range(1, args.trials + 1):
+        for trial in range(1, trials + 1):
             order = list(conditions)
             rng.shuffle(order)
             for label, (name, _cmd) in zip(LABELS, order):
                 row_id = "{}#t{}#{}".format(case["id"], trial, label)
                 stem = "{}-t{}-{}".format(case["id"], trial, label)
-                prompt_file = "prompts/{}.txt".format(stem)
-                (out_dir / prompt_file).write_text(case["prompt"] + "\n", encoding="utf-8")
                 rows.append(
                     {
                         "row_id": row_id,
@@ -601,11 +691,141 @@ def cmd_run(args):
                         "category": case["category"],
                         "trial": trial,
                         "label": label,
-                        "prompt_file": prompt_file,
+                        "prompt_file": "prompts/{}.txt".format(stem),
                         "response_file": "responses/{}.txt".format(stem),
                     }
                 )
                 key_map[row_id] = name
+    return rows, key_map
+
+
+def dry_run_report(args, cases, conditions, rows, key_map, out_label, config):
+    """Print what a run would execute and what it would cost. Write nothing, run nothing."""
+    prompts = {case["id"]: case["prompt"] for case in cases}
+    command_by_name = {name: cmd for name, cmd in conditions}
+
+    rows_by_condition = {}
+    input_by_condition = {}
+    for row in rows:
+        name = key_map[row["row_id"]]
+        rows_by_condition[name] = rows_by_condition.get(name, 0) + 1
+        tokens = estimate_tokens(prompts[row["case"]] + "\n") + args.assume_overhead_tokens
+        input_by_condition[name] = input_by_condition.get(name, 0) + tokens
+
+    spending = [name for name, _cmd in conditions if command_by_name[name]]
+    input_tokens = sum(input_by_condition[name] for name in spending)
+    responses = sum(rows_by_condition[name] for name in spending)
+    output_tokens = responses * args.assume_output_tokens
+
+    print("Dry run. Nothing was written, nothing was executed.")
+    print("")
+    print(
+        "{} rows: {} cases x {} trials x {} conditions.".format(
+            len(rows), len(cases), args.trials, len(conditions)
+        )
+    )
+    print("Would write to {}".format(out_label))
+    print("")
+    header = "{:<14}{:>6}  {}"
+    print(header.format("condition", "rows", "command"))
+    for name, command in conditions:
+        shown = command if command else "none. You produce these responses yourself."
+        if len(shown) > 58:
+            shown = shown[:55] + "..."
+        print(header.format(name[:13], rows_by_condition.get(name, 0), shown))
+    print("")
+
+    if not spending:
+        print("Estimated spend: {}. No condition command was given.".format(money(0.0)))
+        print("")
+        print("Next:")
+        print("1. Re-run with --baseline-cmd and --candidate-cmd to generate responses.")
+        return EXIT_OK
+
+    model = args.price_model or config["models"].get("judgment")
+    prices, problem = load_pricing(args.pricing)
+    entry = prices.get(model) if model else None
+
+    if entry:
+        input_cost = input_tokens / 1000000.0 * entry["input"]
+        output_cost = output_tokens / 1000000.0 * entry["output"]
+        print(
+            "Estimated spend: {} at {} prices.".format(money(input_cost + output_cost), model)
+        )
+        print("  input   ~{:>12} tokens  {}".format(thousands(input_tokens), money(input_cost)))
+        print("  output  ~{:>12} tokens  {}".format(thousands(output_tokens), money(output_cost)))
+        age = price_age_days(entry["last_verified"])
+        if age is not None and age > PRICE_STALE_DAYS:
+            print(
+                "  Price is stale, verified {} ({} days). The number is unverified.".format(
+                    entry["last_verified"], age
+                )
+            )
+    else:
+        print("Estimated spend: unknown. Tokens only.")
+        print("  input   ~{:>12} tokens".format(thousands(input_tokens)))
+        print("  output  ~{:>12} tokens".format(thousands(output_tokens)))
+        if problem:
+            print("  {}.".format(problem))
+        elif model:
+            print("  {} has no entry in {}. Add one, or pass --price-model.".format(model, args.pricing))
+        else:
+            print("  No model to price. Set models.judgment in hyperpower.yml, or pass --price-model.")
+
+    print("")
+    print("The estimate covers {} responses.".format(responses))
+    print(
+        "  input   the case prompt, plus {} overhead tokens per response.".format(
+            args.assume_overhead_tokens
+        )
+    )
+    print("  output  assumed at {} tokens per response.".format(args.assume_output_tokens))
+    print("This is a floor. A command that also sends a system prompt, tool definitions,")
+    print("or repo files spends more. Raise --assume-overhead-tokens to count it.")
+    print("")
+    print("Next:")
+    print("1. Re-run without --dry-run to spend it.")
+    return EXIT_OK
+
+
+def cmd_run(args):
+    cases_path = Path(args.cases)
+    cases = load_cases_or_exit(cases_path)
+    conditions = build_conditions(args)
+    if args.trials < 1:
+        fail("--trials must be 1 or more.")
+    if args.assume_output_tokens < 0 or args.assume_overhead_tokens < 0:
+        fail("--assume-output-tokens and --assume-overhead-tokens must be 0 or more.")
+
+    weights, rubric_digest = load_weights(args.rubric)
+    config = load_config(args.config)
+
+    cases_digest = sha256_file(cases_path)
+    seed = args.seed
+    if seed is None:
+        seed = default_seed(cases_digest, rubric_digest, conditions, args.trials)
+    rng = random.Random(seed)
+    rows, key_map = plan_rows(cases, conditions, args.trials, rng)
+
+    run_id = derive_run_id(cases_digest, rubric_digest, conditions, args.trials, seed)
+    anchor = Path(config["source"]).parent if config["source"] else Path.cwd()
+    if args.out:
+        out_dir = Path(args.out)
+    else:
+        out_dir = anchor / ".hyperpower" / "evals" / run_id
+
+    if args.dry_run:
+        label = str(out_dir) if args.out else str(anchor / ".hyperpower" / "evals" / "<run-id>")
+        return dry_run_report(args, cases, conditions, rows, key_map, label, config)
+
+    if out_dir.exists() and any(out_dir.iterdir()) and not args.force:
+        fail("{} exists and is not empty. Pass --force to overwrite it.".format(out_dir))
+
+    (out_dir / "prompts").mkdir(parents=True, exist_ok=True)
+    (out_dir / "responses").mkdir(parents=True, exist_ok=True)
+    prompts = {case["id"]: case["prompt"] for case in cases}
+    for row in rows:
+        (out_dir / row["prompt_file"]).write_text(prompts[row["case"]] + "\n", encoding="utf-8")
 
     executed = 0
     failed = 0
@@ -670,10 +890,19 @@ def cmd_run(args):
 
     print("Run {} written to {}".format(run_id, out_dir))
     print("{} rows: {} cases x {} trials x {} conditions.".format(len(rows), len(cases), args.trials, len(conditions)))
+    without_command = [name for name, command in conditions if not command]
     if executed:
         print("{} responses generated, {} failed.".format(executed, failed))
     else:
         print("No condition command given. Prompts are written. Produce the responses yourself.")
+    if executed and without_command:
+        waiting = len([row for row in rows if key_map[row["row_id"]] in without_command])
+        print(
+            "{} has no command, so {} of {} rows have no response file.".format(
+                listing(without_command), waiting, len(rows)
+            )
+        )
+        print("Produce those responses yourself. score refuses an unpaired set.")
     if not config["source"]:
         print("No hyperpower.yml found. Model tiers are recorded as unknown.")
     if not (config["voice"]["adhd_shaping"] and config["voice"]["plain_english"]):
@@ -766,11 +995,159 @@ def format_missing(pairs):
     return listing(["{} trial {}".format(case, trial) for case, trial in sorted(pairs)])
 
 
+def unrecorded_reason(record):
+    """Return why a baseline file holds no baseline, or None when it is usable.
+
+    The shipped evals/baseline.json is the unrecorded case: recorded_at is null and every
+    score is null. It is a template, not a comparison.
+    """
+    if not isinstance(record, dict):
+        return "the file does not hold a JSON object"
+    if record.get("recorded_at", record.get("recorded")) is None:
+        return "recorded_at is null"
+    means = record.get("means")
+    if not isinstance(means, dict):
+        return "means is missing"
+    blank = [dimension for dimension in DIMENSIONS if means.get(dimension) is None]
+    if blank:
+        return "means has no value for {}".format(listing(blank))
+    if record.get("weighted") is None:
+        return "weighted is null"
+    if not record.get("rows"):
+        return "rows is empty"
+    return None
+
+
+def pick_candidate(args, by_condition, key_candidate=None):
+    """Resolve the candidate condition when there are no baseline rows to compare against."""
+    if args.candidate:
+        name = args.candidate
+    elif key_candidate and key_candidate in by_condition:
+        name = key_candidate
+    elif len(by_condition) == 1:
+        name = sorted(by_condition)[0]
+    else:
+        fail(
+            "cannot tell which condition is the candidate. Pass --candidate NAME. Scored: {}.".format(
+                ", ".join(sorted(by_condition))
+            )
+        )
+    if name not in by_condition:
+        fail(
+            "condition {!r} has no score rows. Scored conditions: {}.".format(
+                name, ", ".join(sorted(by_condition))
+            )
+        )
+    return name
+
+
+def record_baseline_file(args, by_condition, weights, cases_path, cases_digest, rubric_digest, run_models, default_condition):
+    """Write the aggregate of one condition as the baseline to beat."""
+    recorded_name = args.record_baseline_condition or default_condition
+    target = by_condition.get(recorded_name)
+    if not target:
+        fail("cannot record a baseline for {!r}. It has no score rows.".format(recorded_name))
+    means, weighted = aggregate(target, weights)
+    keys = row_keys(target)
+    write_json(
+        Path(args.record_baseline),
+        {
+            "kind": "hyperpower-eval-baseline",
+            "version": 1,
+            "recorded_at": now_iso(),
+            "condition": recorded_name,
+            "cases_path": str(cases_path),
+            "cases_sha256": cases_digest,
+            "rubric_sha256": rubric_digest,
+            "trials": len({trial for _case, trial in keys}),
+            "models": run_models,
+            "rows": sorted([list(key) for key in keys]),
+            "means": means,
+            "weighted": weighted,
+            "blockers": len([row for row in target if row["blocker"]]),
+            "note": "Recorded from {} judged rows on condition {}.".format(len(target), recorded_name),
+        },
+    )
+    print("Baseline recorded to {}.".format(args.record_baseline))
+
+
+def report_no_baseline(args, by_condition, weights, cases, cases_path, cases_digest, rubric_digest, run_models, key_candidate, reason):
+    """Print the candidate scores, then say no baseline exists. Never a pass."""
+    candidate_name = pick_candidate(args, by_condition, key_candidate)
+    rows = by_condition[candidate_name]
+    means, weighted = aggregate(rows, weights)
+    blockers = [row for row in rows if row["blocker"]]
+    keys = row_keys(rows)
+    trials = sorted({trial for _case, trial in keys})
+    coverage = len({case for case, _trial in keys})
+
+    print("Eval score: {}, no comparison".format(candidate_name))
+    print(
+        "{} rows. {} of {} cases, trials {}.".format(
+            len(rows), coverage, len(cases), ",".join(str(trial) for trial in trials)
+        )
+    )
+    print("")
+    header = "{:<20}{:>7}{:>11}"
+    print(header.format("dimension", "weight", candidate_name[:10]))
+    for dimension in DIMENSIONS:
+        print(header.format(dimension, weights[dimension], "{:.2f}".format(means[dimension])))
+    print(header.format("weighted", 100, "{:.2f}".format(weighted)))
+    print("")
+    print("Blockers: {} {}.".format(candidate_name, len(blockers)))
+    print("")
+    print("Release verdict: NO BASELINE")
+    print(NO_BASELINE)
+    print("Cause: {}.".format(reason))
+    print("")
+
+    if args.json:
+        write_json(
+            Path(args.json),
+            {
+                "kind": "hyperpower-eval-result",
+                "created": now_iso(),
+                "baseline": None,
+                "candidate": candidate_name,
+                "weights": weights,
+                "cases_sha256": cases_digest,
+                "rubric_sha256": rubric_digest,
+                "rows_per_condition": len(rows),
+                "baseline_means": None,
+                "candidate_means": means,
+                "baseline_weighted": None,
+                "candidate_weighted": weighted,
+                "candidate_blockers": [row["case"] for row in blockers],
+                "verdict": "no_baseline",
+                "reasons": [NO_BASELINE, reason],
+                "public_comparison": False,
+            },
+        )
+
+    if args.record_baseline:
+        record_baseline_file(
+            args, by_condition, weights, cases_path, cases_digest, rubric_digest, run_models, candidate_name
+        )
+        print("")
+        print("Next:")
+        print("1. Change one prompt, then re-run and compare against that file.")
+    else:
+        print("Next:")
+        print(
+            "1. Record these scores as the baseline: {} score --run <run> --record-baseline .hyperpower/evals/baseline.json".format(
+                Path(sys.argv[0]).name
+            )
+        )
+        print("2. Change one prompt, then re-run and compare against that file.")
+    return EXIT_NO_BASELINE
+
+
 def cmd_score(args):
     weights, rubric_digest = load_weights(args.rubric)
 
     manifest = None
     label_map = None
+    key_candidate = None
     scores_path = Path(args.scores) if args.scores else None
     run_dir = Path(args.run) if args.run else None
 
@@ -783,6 +1160,7 @@ def cmd_score(args):
         if key_path.is_file():
             key_data = read_json_or_fail(key_path, "label key")
             label_map = key_data.get("labels") or {}
+            key_candidate = key_data.get("candidate")
         if scores_path is None:
             scores_path = run_dir / "scores.jsonl"
 
@@ -833,13 +1211,44 @@ def cmd_score(args):
     for row in rows:
         by_condition.setdefault(row["condition"], []).append(row)
 
+    # Clause 4 of the release rule: a public comparison needs the same cases, models,
+    # trials, and rubric. Digest drift already refuses above.
+    run_models = (manifest or {}).get("config", {}).get("models") or load_config(None)["models"]
+
     baseline_record = None
     if args.baseline_file:
-        baseline_record = read_json_or_fail(Path(args.baseline_file), "baseline file")
+        baseline_path = Path(args.baseline_file)
+        reason = None
+        if not baseline_path.is_file():
+            reason = "{} does not exist".format(baseline_path)
+        else:
+            record = read_json_or_fail(baseline_path, "baseline file")
+            reason = unrecorded_reason(record)
+            if reason is None:
+                baseline_record = record
+        if baseline_record is None:
+            return report_no_baseline(
+                args,
+                by_condition,
+                weights,
+                cases,
+                cases_path,
+                cases_digest,
+                rubric_digest,
+                run_models,
+                key_candidate,
+                reason,
+            )
 
     # Which conditions are being compared.
     if baseline_record:
         candidate_name = args.candidate
+        # The run's own key names its candidate. Trust that before any inference from the
+        # recorded condition name. A baseline recorded by --record-baseline carries the name
+        # of the condition it aggregated, which is normally "candidate" too, so excluding
+        # that name would drop this run's real candidate and compare the baseline arm.
+        if not candidate_name and key_candidate in by_condition:
+            candidate_name = key_candidate
         if not candidate_name:
             scored = sorted(by_condition)
             if len(scored) == 1:
@@ -850,10 +1259,14 @@ def cmd_score(args):
                     fail("cannot tell which condition is the candidate. Pass --candidate NAME. Scored: {}.".format(", ".join(scored)))
                 candidate_name = others[0]
         baseline_name = baseline_record.get("condition") or "baseline"
-        if baseline_name == candidate_name:
-            # The recorded baseline is a past run of the same condition name. Rename the
-            # column so the two are told apart in the report.
-            baseline_name = "recorded" if candidate_name == "baseline" else "baseline"
+        # The baseline column comes from the recorded file, not from rows judged in this run.
+        # Rename it whenever that name also names a condition here, so the two columns cannot
+        # be read as two arms of the same run.
+        if baseline_name == candidate_name or baseline_name in by_condition:
+            for alternative in ("recorded", "recorded-baseline", "baseline-file"):
+                if alternative != candidate_name and alternative not in by_condition:
+                    baseline_name = alternative
+                    break
         if candidate_name not in by_condition:
             fail("condition {!r} has no score rows. Scored conditions: {}.".format(candidate_name, ", ".join(sorted(by_condition))))
     else:
@@ -938,9 +1351,6 @@ def cmd_score(args):
     if candidate_weighted <= baseline_weighted + EPSILON:
         reasons.append("Weighted score {:.2f} does not beat baseline {:.2f}.".format(candidate_weighted, baseline_weighted))
 
-    # Clause 4 of the release rule: a public comparison needs the same cases, models,
-    # trials, and rubric. Digest drift already refused above.
-    run_models = (manifest or {}).get("config", {}).get("models") or load_config(None)["models"]
     baseline_models = baseline_record.get("models") if baseline_record else run_models
     same_models = bool(run_models) and run_models == baseline_models and any(run_models.values())
     same_trials = (baseline_record.get("trials") == len(trials)) if baseline_record else True
@@ -1005,29 +1415,9 @@ def cmd_score(args):
         )
 
     if args.record_baseline:
-        recorded_name = args.record_baseline_condition or candidate_name
-        target = by_condition.get(recorded_name)
-        if not target:
-            fail("cannot record a baseline for {!r}. It has no score rows.".format(recorded_name))
-        means, weighted = aggregate(target, weights)
-        write_json(
-            Path(args.record_baseline),
-            {
-                "kind": "hyperpower-eval-baseline",
-                "recorded": now_iso(),
-                "condition": recorded_name,
-                "cases_path": str(cases_path),
-                "cases_sha256": cases_digest,
-                "rubric_sha256": rubric_digest,
-                "trials": len(trials),
-                "models": run_models,
-                "rows": sorted([list(key) for key in row_keys(target)]),
-                "means": means,
-                "weighted": weighted,
-                "blockers": len([row for row in target if row["blocker"]]),
-            },
+        record_baseline_file(
+            args, by_condition, weights, cases_path, cases_digest, rubric_digest, run_models, candidate_name
         )
-        print("Baseline recorded to {}.".format(args.record_baseline))
 
     return EXIT_VERDICT_FAIL if reasons else EXIT_OK
 
@@ -1035,10 +1425,53 @@ def cmd_score(args):
 # ------------------------------------------------------------------- cli
 
 
+RUN_EPILOG = """condition commands
+
+  --baseline-cmd and --candidate-cmd each take one shell command. It runs once per row
+  through `sh -c`, so pass it as a single quoted argument.
+
+  stdin   the case prompt, verbatim, plus one trailing newline. Nothing else. No case
+          id, no category, no criteria, no JSON wrapper.
+  stdout  the whole response. It is written to responses/<case>-t<trial>-<label>.txt
+          and judged exactly as printed. Print nothing but the response.
+  stderr  ignored on exit 0. On any other exit the first 500 characters are recorded as
+          execution.error on that row.
+  exit    0 means a response was produced. Any other status, or a timeout, marks the row
+          as did not run. A row that did not run is never folded into the score.
+
+  Worked example. The baseline is the committed prompt, the candidate the edited one.
+
+    git show HEAD:plugins/hyperpower/skills/review/SKILL.md > /tmp/hp-base.md
+    cp plugins/hyperpower/skills/review/SKILL.md /tmp/hp-cand.md
+
+    run_evals.py run \\
+      --baseline-cmd  'claude -p --append-system-prompt "$(cat /tmp/hp-base.md)"' \\
+      --candidate-cmd 'claude -p --append-system-prompt "$(cat /tmp/hp-cand.md)"'
+
+  Check the wiring first with --baseline-cmd cat. The response file then holds the
+  prompt back, and nothing is spent.
+
+  --dry-run prints the row count, the commands, and the estimated cost from pricing.yml.
+  It writes nothing and executes nothing.
+"""
+
+SCORE_EPILOG = """baseline file
+
+  --baseline-file compares this run against scores recorded earlier, instead of against
+  baseline rows judged in the same run. Write it with --record-baseline.
+
+  A file that is absent, or one whose recorded_at is null, means no baseline exists. The
+  command then prints the candidate scores, prints
+  "%s", and exits 3.
+  It never prints PASS.
+""" % (NO_BASELINE,)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="run_evals.py",
         description="Validate, run, and score the hyperpower eval suite.",
+        epilog="Exit codes: 0 valid or PASS, 1 bad input, 2 verdict FAIL, 3 no baseline recorded.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1047,31 +1480,46 @@ def build_parser():
     validate.add_argument("--all", action="store_true", help="print every error, not the first five")
     validate.set_defaults(func=cmd_validate)
 
-    run = subparsers.add_parser("run", help="write blind-labelled rows and, when a command is given, generate responses")
+    run = subparsers.add_parser(
+        "run",
+        help="write blind-labelled rows and, when a command is given, generate responses",
+        epilog=RUN_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     run.add_argument("--cases", default=str(DEFAULT_CASES), help="path to cases.jsonl")
     run.add_argument("--rubric", default=str(DEFAULT_RUBRIC), help="path to rubric.md")
     run.add_argument("--config", default=None, help="path to hyperpower.yml. Default: nearest one above the working directory")
     run.add_argument("--baseline", default="baseline", help="baseline condition name")
-    run.add_argument("--baseline-cmd", default=None, help="shell command for the baseline. The prompt arrives on stdin.")
+    run.add_argument("--baseline-cmd", default=None, help="shell command for the baseline. The prompt arrives on stdin, the response is read from stdout.")
     run.add_argument("--candidate", default="candidate", help="candidate condition name")
-    run.add_argument("--candidate-cmd", default=None, help="shell command for the candidate. The prompt arrives on stdin.")
+    run.add_argument("--candidate-cmd", default=None, help="shell command for the candidate. The prompt arrives on stdin, the response is read from stdout.")
     run.add_argument("--control", default=None, help="optional third condition name")
     run.add_argument("--control-cmd", default=None, help="shell command for the third condition")
     run.add_argument("--trials", type=int, default=3, help="trials per case per condition. Default 3.")
-    run.add_argument("--seed", type=int, default=None, help="seed for label shuffling. Recorded in the manifest.")
+    run.add_argument("--seed", type=int, default=None, help="seed for label shuffling. Recorded in the manifest. Default: derived from the cases, rubric, conditions and trials, so the same run lands on the same run id.")
     run.add_argument("--timeout", type=int, default=600, help="per-response timeout in seconds. Default 600.")
     run.add_argument("--out", default=None, help="output directory. Default: .hyperpower/evals/<run-id>")
     run.add_argument("--force", action="store_true", help="overwrite a non-empty output directory")
+    run.add_argument("--dry-run", action="store_true", help="print what would run and what it would cost. Writes nothing, executes nothing.")
+    run.add_argument("--pricing", default=str(DEFAULT_PRICING), help="path to pricing.yml, for the --dry-run estimate")
+    run.add_argument("--price-model", default=None, help="model to price the estimate at. Default: models.judgment from the config")
+    run.add_argument("--assume-output-tokens", type=int, default=DEFAULT_OUTPUT_TOKENS, help="assumed output tokens per response, for --dry-run. Default {}.".format(DEFAULT_OUTPUT_TOKENS))
+    run.add_argument("--assume-overhead-tokens", type=int, default=0, help="input tokens each condition sends on top of the case prompt, for --dry-run. Default 0.")
     run.set_defaults(func=cmd_run)
 
-    score = subparsers.add_parser("score", help="aggregate judged score rows and print the release verdict")
+    score = subparsers.add_parser(
+        "score",
+        help="aggregate judged score rows and print the release verdict",
+        epilog=SCORE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     score.add_argument("--run", default=None, help="run directory holding manifest.json and key.json")
     score.add_argument("--scores", default=None, help="path to scores.jsonl. Default: <run>/scores.jsonl")
     score.add_argument("--cases", default=None, help="path to cases.jsonl. Default: the one named in the manifest")
     score.add_argument("--rubric", default=str(DEFAULT_RUBRIC), help="path to rubric.md")
     score.add_argument("--baseline", default=None, help="baseline condition name")
     score.add_argument("--candidate", default=None, help="candidate condition name")
-    score.add_argument("--baseline-file", default=None, help="recorded baseline to compare against, instead of baseline rows")
+    score.add_argument("--baseline-file", default=None, help="recorded baseline to compare against, instead of baseline rows. An unrecorded or missing file exits 3.")
     score.add_argument("--record-baseline", default=None, help="write the baseline aggregate to this path")
     score.add_argument("--record-baseline-condition", default=None, help="condition to record. Default: the baseline condition")
     score.add_argument("--json", default=None, help="write the aggregate result to this path")

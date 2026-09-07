@@ -1,0 +1,31 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  selfcheck:
+    name: plugin self-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Thirteen mechanical checks over plugins/ and docs/. Standard library only, so there
+      # is nothing to install. Prints file:line for every finding and exits 1 on any.
+      - name: hp-selfcheck
+        run: python3 plugins/hyperpower/scripts/hp-selfcheck
+
+      # hp-selfcheck runs this as its check 9. It runs again here as its own step so a bad
+      # cases.jsonl names itself in the step list instead of arriving as one line of
+      # check 9 output.
+      - name: eval suite validates
+        working-directory: plugins/hyperpower
+        run: python3 scripts/run_evals.py validate

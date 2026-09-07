@@ -9,6 +9,32 @@ Print the effective config, one leaf field per line, with the file each value ca
 
 This skill is read only. It never writes to either file.
 
+## Where the values come from
+
+```sh
+hp-config --source
+```
+
+`${CLAUDE_PLUGIN_ROOT}/scripts/hp-config` does the merge and prints one JSON envelope. Render that envelope. Do not parse `hyperpower.yml` or `hyperpower.local.yml` yourself: `hp-config` is the parser every stage of a run reads through, and a second parser here would report a config no run ever used.
+
+| Envelope key | Holds |
+|---|---|
+| `config` | the effective config after the merge |
+| `sources` | every dotted leaf path mapped to `hyperpower.yml`, `hyperpower.local.yml`, or `default` |
+| `overrides` | the leaves `hyperpower.local.yml` changed, with both values |
+| `unknown_keys` | keys not in the schema, with the file and value each came from |
+| `type_errors` | values whose type disagrees with the schema |
+| `hash` | the config hash, the same one `meta.json` records |
+| `files` | the absolute path of each file read, `null` for one that is absent |
+
+| Exit | Do |
+|---|---|
+| 0 | render the envelope |
+| 78 | print `No hyperpower.yml. Run /hyperpower:init.` Stop. |
+| 1 | print the file, the line number, and the parser error from stderr. Stop. |
+
+The three sections below describe what the envelope means and how to lay it out. They do not describe work to do by hand.
+
 ## Merge rule
 
 Per field, not per section. `hyperpower.local.yml` overrides `hyperpower.yml` at the leaf.
@@ -89,12 +115,16 @@ Rank, never cap. More than five overrides: show five and say how many remain.
 | `hyperpower.yml` only | the field list, then `No local overrides.` |
 | Either file is unparseable | the file name, the line number, and the parser error. Stop. |
 | A key not in the schema | the field list, then `Unknown key: <path>` under a `Not in schema` block |
+| A value whose type disagrees with the schema | the field list, then the `type_errors` entries under a `Wrong type` block |
 
-An unknown key is reported, never dropped and never silently accepted. Say which file it is in so the user can delete it.
+An unknown key is reported, never dropped and never silently accepted. Say which file it is in so the user can delete it. `hp-config` reports both blocks in `unknown_keys` and `type_errors`; print what is there and add nothing to it.
+
+A wrong-typed value is still used, except a map replaced by a scalar, where the defaults are kept. Say which, so the user knows whether the run saw their value.
 
 ## Do not
 
 - Do not write to `hyperpower.yml` or `hyperpower.local.yml`. Use `/hyperpower:paths` or an editor.
+- Do not parse either YAML file yourself. Call `hp-config --source` and render what it prints.
 - Do not merge section by section. That silently drops fields.
 - Do not hide fields that sit at their default.
 - Do not read config from anywhere else. Environment variables and CLI flags do not override these two files.

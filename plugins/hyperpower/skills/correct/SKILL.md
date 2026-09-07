@@ -71,37 +71,44 @@ Every scope does these three, in order.
 
 `key` is a stable kebab-case slug describing the claim, not the assumption id. Ids are per-run. Keys are how a repeat is counted across runs.
 
-Who reads the correction back:
+Who reads the correction back, and who retires it:
 
-| Scope | Read by |
-|---|---|
-| `once` | the next replay of that step. Then set `applied: true` and never read it again. |
-| `run` | every step replayed after it in this run |
-| `forever` | every step in this run, and every future run through the rulebook |
+| Scope | Read by | Retired by |
+|---|---|---|
+| `once` | the next replay of that step | `/hyperpower:resume`, which sets `applied: true` on the entry after that replay writes its `<step>.json`. See `skills/resume/SKILL.md` step 6 |
+| `run` | every step replayed after it in this run | nothing. It stands for the life of the run |
+| `forever` | every step in this run, and every future run through the rulebook | the promoter, only through a Step 7 demotion. See `agents/promoter.md` |
+
+Write the `once` entry with no `applied` field. This command never sets it, never reads it, and never rewrites `corrections.jsonl`. One owner for that field, and it is resume.
 
 ## Step 4 - forever writes a rulebook diff
 
 Print the diff. Wait for an answer. Write nothing to `CODEBASE_RULEBOOK.md` until it arrives.
 
 ```
-Rulebook diff for approval — CODEBASE_RULEBOOK.md
+Rulebook diff for approval - CODEBASE_RULEBOOK.md
 
-+ Settings API returns { items: [] }. Never treat it as a bare array.
++ ## R9 - Settings API returns { items: [] }. Never treat it as a bare array.
 +   source: correction, run 4f2a, step plan, assumption a1
++   <!-- hyperpower: added=2026-09-07 source=correction signal=forever_correction key=settings-api-shape evidence=1 last_prevented=2026-09-07 -->
 
 At 30 of 30 rules. Adding this evicts the weakest:
-- Prefer named exports in src/api/     (0 preventions in 20 runs)
+- R14 Prefer named exports in src/api/     (evidence 1, last prevented 2026-05-11)
 
 [approve / edit / cancel]
 ```
 
 1. Read the cap from `limits.rulebook_max_rules`. Use 30 when the config is absent.
-2. At the cap, name the rule to evict. Weakest means fewest preventions in the last 20 runs.
+2. At the cap, name the rule to evict. Rank weakest the way `agents/promoter.md` step 6 does: lowest `evidence`, then oldest `last_prevented`, then oldest `added`. A rule with no metadata comment carries no evidence count, so rank it last: `init` or a human wrote it.
 3. Never exceed the cap, and never raise `limits.rulebook_max_rules` to fit a rule.
 4. An evicted rule moves to the archive under `memory.decisions_dir`. It is demoted, not deleted.
 5. `edit` reprints the diff with the new wording and asks again. `cancel` writes nothing to the rulebook and leaves the correction in force at `run` scope. Report that it did.
 
-`memory.promoter: false` disables the promoter agent. It does not disable a `forever` correction. They are two separate writers of the rulebook.
+On `approve`, write the rule in the format declared in `skills/rules/SKILL.md`, section "Rule format". That section is the only statement of the format. Follow it exactly.
+
+The metadata comment is not optional here. `key` is the same kebab-case key this command wrote to `mistakes.jsonl` in Step 3, and it is how the promoter sees that this rule already exists. Without it the promoter counts the same `forever_correction` key, finds no rule, and appends a duplicate. Set `source=correction`, `signal=forever_correction`, `evidence` to the number of distinct runs that fired the key, and `added` and `last_prevented` to today.
+
+`memory.promoter: false` disables the promoter agent. It does not disable a `forever` correction. They are two separate writers of the rulebook, and this one is the only path that asks first.
 
 ## Config
 
@@ -118,4 +125,4 @@ Do not create `CODEBASE_RULEBOOK.md` here. `init` generates it from a repo scan.
 - Do not refuse to apply a correction.
 - Do not write `CODEBASE_RULEBOOK.md` without an explicit approval.
 - Do not invent an assumption id, and do not correct an id in a step the user did not name.
-- Do not apply a `once` correction more than once.
+- Do not set `applied` on a `once` correction here, and do not rewrite `corrections.jsonl`. `/hyperpower:resume` owns that field.

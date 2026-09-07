@@ -1,0 +1,42 @@
+{
+  "kind": "hyperpower-eval-baseline",
+  "version": 1,
+  "recorded_at": null,
+  "condition": null,
+  "cases_path": "evals/cases.jsonl",
+  "cases_sha256": null,
+  "rubric_sha256": null,
+  "trials": null,
+  "models": {
+    "judgment": null,
+    "mechanical": null
+  },
+  "rows": [],
+  "means": {
+    "correctness": null,
+    "autonomy": null,
+    "actionability": null,
+    "safety": null,
+    "concision": null,
+    "render_conformance": null
+  },
+  "weighted": null,
+  "blockers": null,
+  "note": "No baseline has been recorded. This file is the shipped template. run_evals.py score reads recorded_at, sees null, prints 'no baseline recorded, run /hyperpower:eval --baseline first', and exits 3. Record your own with: run_evals.py score --run <run-dir> --record-baseline .hyperpower/evals/baseline.json. Do not edit a recorded baseline by hand.",
+  "schema": {
+    "kind": "always the string hyperpower-eval-baseline",
+    "version": "schema version of this file. 1.",
+    "recorded_at": "UTC timestamp the baseline was recorded, YYYY-MM-DDTHH:MM:SSZ. null means no baseline is recorded.",
+    "condition": "name of the condition whose rows were aggregated, for example candidate.",
+    "cases_path": "path to the cases.jsonl the rows were judged on.",
+    "cases_sha256": "digest of that file. score refuses to compare when it differs.",
+    "rubric_sha256": "digest of rubric.md. score refuses to compare when it differs.",
+    "trials": "trials per case in the recorded run.",
+    "models": "models.judgment and models.mechanical in force. Used by the public comparison clause.",
+    "rows": "the judged rows, each a [case_id, trial] pair. score refuses to compare an unpaired set.",
+    "means": "mean score per dimension, 1.00 to 5.00. All six dimensions, every one non-null in a recorded baseline.",
+    "weighted": "weighted mean, 1.00 to 5.00. The candidate must beat this, strictly.",
+    "blockers": "count of blocking findings in the recorded run.",
+    "note": "one line of provenance. Not read by any code."
+  }
+}

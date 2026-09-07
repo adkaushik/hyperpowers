@@ -38,13 +38,19 @@ A path in `files_read` that no longer exists is drift. Count it as one file.
 
 ## Step 2 - re-hash the working tree
 
-Recompute the cache key for every recorded step up to and including the one named by `--from`. Compare each against the key recorded in that step's contract.
+```sh
+hp-journal drift <run> --from <step>
+```
 
-Skip paths matched by `paths.ignore`. Count files, not hunks and not lines.
+`${CLAUDE_PLUGIN_ROOT}/scripts/hp-journal` recomputes the cache key for every recorded step up to and including the one named by `--from`, compares each against the key recorded in that step's contract, skips paths matched by `paths.ignore`, and prints the report in Step 3's format. Add `--json` for the full comparison: per step `state`, `changed_files`, the changed file list, and a `drifted` object with a boolean for each of the three inputs.
+
+Do not recompute the cache key yourself. `hp-journal hash` wrote it, and a second implementation of the same hash drifts from the first without anything in the output showing it. Run the command and read what it prints.
+
+Count files, not hunks and not lines. A step with no recorded cache key prints `UNHASHED`, which is drifted, not `ok`.
 
 ## Step 3 - report drift
 
-Use this format exactly. Two-space indent, step names padded to a common width.
+`hp-journal drift` prints this format. Do not reformat what it printed. Two-space indent, step names padded to a common width.
 
 ```
 Resume run 4f2a from Gates.
@@ -54,11 +60,13 @@ Resume run 4f2a from Gates.
 Re-run from Build instead? [build / gates-anyway / abort]
 ```
 
-1. `ok` is lowercase. `DRIFTED` is uppercase. No emoji, no colour words, no tick marks.
-2. A drifted line ends with the file count and nothing after it.
+1. `ok` is lowercase. `DRIFTED` and `UNHASHED` are uppercase. No emoji, no colour words, no tick marks.
+2. A drifted line names the file count when any file changed. When no file changed, it names the input that did: `DRIFTED — upstream plan.json changed since this step`, or `DRIFTED — prompt changed since this step`.
 3. An `ok` line carries no count.
-4. Print every step, including clean ones. The clean lines are what make the drifted one readable.
-5. The prompt offers the earliest drifted step, then `<requested-step>-anyway`, then `abort`.
+4. `UNHASHED — no cache key recorded for this step` means the step was never hashed. Treat it as drifted. It is not `ok`, and it is never replayed over.
+5. A `config_hash` that no longer matches prints `Config hash changed since this run. Treat every step as drifted.` under the step lines.
+6. Print every step, including clean ones. The clean lines are what make the drifted one readable.
+7. The prompt offers the earliest drifted step, then `<requested-step>-anyway`, then `abort`. It prints only when a step earlier than the requested one drifted; when the requested step is itself the earliest drifted one, there is nothing to offer instead.
 
 Option names are the lowercased step names. Requested step `Gates` gives `gates-anyway`. Requested step `Review` gives `review-anyway`.
 
@@ -82,7 +90,7 @@ Re-entering at step N invalidates step N and everything downstream. Never partia
 
 1. Move each invalidated `<step>.json` into `.hyperpower/runs/<run-id>/superseded/<timestamp>/`. Do not delete it.
 2. Append one line to `.hyperpower/runs/<run-id>/resume.jsonl` with the timestamp, the `--from` step, the answer taken, and the drifted step names.
-3. Leave `meta.json`, `mistakes.jsonl`, `usage.jsonl`, and `corrections.jsonl` in place. They are the run's history.
+3. Leave `meta.json`, `mistakes.jsonl`, `usage.jsonl`, and `corrections.jsonl` in place. They are the run's history. Step 6 stamps `applied: true` on every `once` entry in `corrections.jsonl` that it applies, which is one per replayed step that carried one. That is the only edit this command makes to any of them.
 
 Never keep `review.json` when `build.json` was invalidated. A review of a superseded build is the exact failure this command exists to prevent.
 
@@ -90,7 +98,19 @@ Never keep `review.json` when `build.json` was invalidated. A review of a supers
 
 Replay the invalidated steps in pipeline order. Each writes a fresh `<step>.json` with a newly computed cache key.
 
-Corrections in `corrections.jsonl` apply during the replay: `scope: once` entries to the next replay of their own step, `scope: run` and `scope: forever` entries to every step replayed after them.
+Corrections in `corrections.jsonl` apply during the replay.
+
+| Scope | Applies to | Then |
+|---|---|---|
+| `once` | the next replay of its own step, and only when the entry has no `applied: true` | set `applied: true` on that entry |
+| `run` | every step replayed after it in this run | nothing. It stands for the life of the run |
+| `forever` | every step replayed after it, and every future run through the rulebook | nothing. The rulebook carries it |
+
+This command owns the `applied` field. `/hyperpower:correct` writes the entry without it and never touches it. Nothing else writes it, so an unstamped `once` entry means the correction has not been used yet.
+
+Order matters. Write the step's fresh `<step>.json` first, then stamp `applied: true`. A replay that fails, aborts, or is interrupted before the contract lands leaves the entry unstamped, so the next replay applies the correction again. Stamping first drops the correction silently.
+
+Rewrite that one line in place and leave every other line byte for byte as it was. Skip a `once` entry that already carries `applied: true`: do not apply it, and do not report it as applied a second time.
 
 Use the model tiers in the current `models` config, not the tiers recorded in `meta.json`. When they differ, say so in the output.
 
@@ -98,9 +118,11 @@ Stop when a blocking gate fails. Report the gate, the command, and the exit code
 
 ## Config
 
-If `hyperpower.yml` exists at the repo root, read it and use `paths.ignore`, `models`, `gates`, and `limits.gate_timeout_seconds`.
+Call `${CLAUDE_PLUGIN_ROOT}/scripts/hp-config --json` and use `paths.ignore`, `models`, `gates`, and `limits.gate_timeout_seconds` from what it prints. Do not parse `hyperpower.yml` yourself: `hp-config` is what the original run read, and a second parser can produce a different config hash from the same bytes.
 
-Without it, print the drift report and stop. Replay needs the gate commands, and the harness does not guess them. Tell the user to run `/hyperpower:init`.
+Exit 78 means there is no `hyperpower.yml`. Print the drift report and stop. Replay needs the gate commands, and the harness does not guess them. Tell the user to run `/hyperpower:init`.
+
+Replay the gates with `hp-gates --run <run> --files <changed,files> --config <path>`, the same runner `/hyperpower:run` uses. Do not run gate commands directly.
 
 ## Do not
 

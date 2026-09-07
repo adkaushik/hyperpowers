@@ -1,0 +1,1748 @@
+#!/usr/bin/env python3
+"""hp-selfcheck - check the hyperpower plugin against its own documentation.
+
+Thirteen mechanical checks over plugins/ and docs/. No model judgment, no network,
+Python 3 standard library only. This validates the plugin itself. It never reads a
+user's repo config.
+
+Every finding prints as `path:line: [check] message`. Exit 1 on any error.
+
+Exit codes: 0 every check passed, 1 at least one error, 2 bad usage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_USAGE = 2
+
+ERROR = "error"
+WARN = "warn"
+
+SKIP_DIRS = frozenset(
+    (".git", "__pycache__", "node_modules", ".hyperpower", ".venv", "venv", "dist")
+)
+
+TEXT_SUFFIXES = frozenset(
+    (
+        "",
+        ".md",
+        ".py",
+        ".js",
+        ".sh",
+        ".json",
+        ".jsonl",
+        ".yml",
+        ".yaml",
+        ".txt",
+        ".cfg",
+        ".toml",
+    )
+)
+
+# The three placeholder markers the slop gate names. They are built from parts so this
+# file does not itself contain the literal tokens it searches for. A literal here would
+# make hp-selfcheck fail its own check 7.
+SLOP_MARKERS = tuple("".join(parts) for parts in (("TO", "DO"), ("FIX", "ME"), ("X", "XX")))
+
+# Descriptive prose that names the markers instead of deferring work. One entry per
+# allowed line: the repo-relative path, and a substring that must appear on that line.
+# A marker anywhere else is a finding.
+SLOP_ALLOWLIST = (("docs/gates.md", "Catches placeholders"),)
+
+# Top-level keys in the hyperpower.yml schema. Used to find config references in text.
+CONFIG_ROOTS = (
+    "project",
+    "paths",
+    "commands",
+    "gates",
+    "models",
+    "limits",
+    "memory",
+    "telemetry",
+    "voice",
+)
+
+CONFIG_REF_RE = re.compile(
+    r"(?<![\w/.-])(" + "|".join(CONFIG_ROOTS) + r")((?:\.[^\s\"'`,;)\]}|]+)+)"
+)
+
+# A dotted match whose leaf is a method call is language syntax, not a config field.
+# `paths.get(` in Python and `paths.map(` in JavaScript are the common cases.
+CONFIG_METHOD_NAMES = frozenset(
+    (
+        "get",
+        "items",
+        "keys",
+        "values",
+        "append",
+        "extend",
+        "insert",
+        "remove",
+        "pop",
+        "copy",
+        "update",
+        "setdefault",
+        "sort",
+        "sorted",
+        "join",
+        "split",
+        "strip",
+        "format",
+        "startswith",
+        "endswith",
+        "lower",
+        "upper",
+        "replace",
+        "count",
+        "index",
+        "length",
+        "push",
+        "slice",
+        "map",
+        "filter",
+        "find",
+        "forEach",
+        "includes",
+        "concat",
+        "reduce",
+        "some",
+        "every",
+        "toString",
+    )
+)
+
+# A dotted match containing one of these segments is a filename, not a config field.
+FILE_SUFFIX_SEGMENTS = frozenset(
+    (
+        "md",
+        "json",
+        "jsonl",
+        "yml",
+        "yaml",
+        "js",
+        "py",
+        "sh",
+        "txt",
+        "log",
+        "html",
+        "lock",
+        "toml",
+        "cfg",
+        "ini",
+        "csv",
+        "png",
+        "svg",
+    )
+)
+
+# docs/configuration.md shows `reason` only on the browser gate. Its field-notes table
+# lists `reason` as valid for every gate, written by init or doctor. Inject it so a gate
+# script reading gates.<name>.reason is not reported as reading an undocumented field.
+GATE_UNIVERSAL_FIELDS = ("reason",)
+
+# Values Claude Code accepts in an agent's `model` frontmatter besides a full model id.
+MODEL_ALIASES = frozenset(("inherit", "opus", "sonnet", "haiku"))
+
+MODEL_ID_RE = re.compile(r"\bclaude-(?:opus|sonnet|haiku)-[0-9][0-9a-z-]*")
+
+SPAWN_RE = re.compile(r"\bspawn(?:s|ed|ing)?\b", re.IGNORECASE)
+BACKTICK_RE = re.compile(r"`([^`\n]+)`")
+NAMESPACED_RE = re.compile(r"\bhyperpower:([A-Za-z0-9_<>-]+)")
+AGENT_TYPES_RE = re.compile(r"agentTypes\s*:\s*\[([^\]]*)\]")
+AGENT_TYPE_RE = re.compile(r"agentType\s*:\s*['\"]([^'\"]+)['\"]")
+COMMAND_HEADING_RE = re.compile(r"^###\s+`/hyperpower:([a-z0-9-]+)")
+COUNT_SENTENCE_RE = re.compile(r"^([A-Za-z]+)\s+commands in\b", re.MULTILINE)
+INDEX_ROW_RE = re.compile(r"^\|\s*`([a-z0-9-]+)\.md`\s*\|")
+
+NUMBER_WORDS = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+    "twenty-one",
+    "twenty-two",
+    "twenty-three",
+    "twenty-four",
+    "twenty-five",
+    "twenty-six",
+    "twenty-seven",
+    "twenty-eight",
+    "twenty-nine",
+    "thirty",
+)
+
+
+# ------------------------------------------------------------------ yaml subset
+
+
+class YamlError(Exception):
+    """A YAML document used a construct this parser does not support."""
+
+    def __init__(self, message, path=None, line=None):
+        Exception.__init__(self, message)
+        self.message = message
+        self.path = path
+        self.line = line
+
+    def render(self):
+        where = ""
+        if self.path is not None:
+            where = str(self.path)
+            if self.line is not None:
+                where = "{}:{}".format(where, self.line)
+            where += ": "
+        return where + self.message
+
+
+def _strip_comment(line):
+    """Drop a trailing # comment. A # inside quotes, or glued to a word, stays."""
+    quote = None
+    for index, char in enumerate(line):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            continue
+        if char == "#" and (index == 0 or line[index - 1] in " \t"):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _unquote(text, path, line):
+    quote = text[0]
+    if len(text) < 2 or text[-1] != quote:
+        raise YamlError("unterminated quoted string: {}".format(text), path, line)
+    body = text[1:-1]
+    if quote == "'":
+        return body.replace("''", "'")
+    out = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            raise YamlError("trailing backslash in string", path, line)
+        escape = body[index]
+        out.append({"n": "\n", "t": "\t", "r": "\r", "0": "\0"}.get(escape, escape))
+        index += 1
+    return "".join(out)
+
+
+def _plain_scalar(text, path, line):
+    """Convert an unquoted scalar. Booleans, integers, floats, null, else a string."""
+    if text == "" or text in ("null", "~", "Null", "NULL"):
+        return None
+    if text in ("true", "True", "TRUE"):
+        return True
+    if text in ("false", "False", "FALSE"):
+        return False
+    if text[0] in "&*!|>":
+        raise YamlError(
+            "unsupported YAML feature at {!r}: anchors, tags and block scalars are not "
+            "parsed".format(text[0]),
+            path,
+            line,
+        )
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    return text
+
+
+def _flow_value(text, pos, path, line):
+    pos = _flow_skip(text, pos)
+    if pos >= len(text):
+        raise YamlError("flow value ended early", path, line)
+    char = text[pos]
+    if char == "[":
+        return _flow_list(text, pos, path, line)
+    if char == "{":
+        return _flow_map(text, pos, path, line)
+    if char in "\"'":
+        end = _flow_quote_end(text, pos, path, line)
+        return _unquote(text[pos : end + 1], path, line), end + 1
+    end = pos
+    while end < len(text) and text[end] not in ",]}":
+        end += 1
+    return _plain_scalar(text[pos:end].strip(), path, line), end
+
+
+def _flow_skip(text, pos):
+    while pos < len(text) and text[pos] in " \t":
+        pos += 1
+    return pos
+
+
+def _flow_quote_end(text, pos, path, line):
+    quote = text[pos]
+    index = pos + 1
+    while index < len(text):
+        if quote == '"' and text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == quote:
+            return index
+        index += 1
+    raise YamlError("unterminated quoted string in flow value", path, line)
+
+
+def _flow_list(text, pos, path, line):
+    items = []
+    pos = _flow_skip(text, pos + 1)
+    if pos < len(text) and text[pos] == "]":
+        return items, pos + 1
+    while pos < len(text):
+        value, pos = _flow_value(text, pos, path, line)
+        items.append(value)
+        pos = _flow_skip(text, pos)
+        if pos >= len(text):
+            break
+        if text[pos] == ",":
+            pos = _flow_skip(text, pos + 1)
+            continue
+        if text[pos] == "]":
+            return items, pos + 1
+        raise YamlError("expected , or ] in flow list", path, line)
+    raise YamlError("unterminated flow list", path, line)
+
+
+def _flow_map(text, pos, path, line):
+    result = {}
+    pos = _flow_skip(text, pos + 1)
+    if pos < len(text) and text[pos] == "}":
+        return result, pos + 1
+    while pos < len(text):
+        pos = _flow_skip(text, pos)
+        if pos >= len(text):
+            break
+        if text[pos] in "\"'":
+            end = _flow_quote_end(text, pos, path, line)
+            key = _unquote(text[pos : end + 1], path, line)
+            pos = end + 1
+        else:
+            end = pos
+            while end < len(text) and text[end] not in ":,}":
+                end += 1
+            key = text[pos:end].strip()
+            pos = end
+        pos = _flow_skip(text, pos)
+        if pos >= len(text) or text[pos] != ":":
+            raise YamlError("expected : after key {!r} in flow map".format(key), path, line)
+        value, pos = _flow_value(text, pos + 1, path, line)
+        result[key] = value
+        pos = _flow_skip(text, pos)
+        if pos >= len(text):
+            break
+        if text[pos] == ",":
+            pos += 1
+            continue
+        if text[pos] == "}":
+            return result, pos + 1
+        raise YamlError("expected , or } in flow map", path, line)
+    raise YamlError("unterminated flow map", path, line)
+
+
+def _parse_scalar(text, path, line):
+    if text.startswith("[") or text.startswith("{"):
+        value, pos = _flow_value(text, 0, path, line)
+        if text[pos:].strip():
+            raise YamlError(
+                "trailing content after flow value: {}".format(text[pos:].strip()), path, line
+            )
+        return value
+    if text[0] in "\"'":
+        return _unquote(text, path, line)
+    return _plain_scalar(text, path, line)
+
+
+def _split_key(text, path, line):
+    quote = None
+    for index, char in enumerate(text):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            continue
+        if char in "[{":
+            break
+        if char == ":" and (index + 1 == len(text) or text[index + 1] in " \t"):
+            key = text[:index].strip()
+            if key and key[0] in "\"'":
+                key = _unquote(key, path, line)
+            return key, text[index + 1 :].strip()
+    raise YamlError("expected `key: value` and found {!r}".format(text), path, line)
+
+
+def _is_key_line(text):
+    try:
+        _split_key(text, None, None)
+    except YamlError:
+        return False
+    return True
+
+
+def _parse_block(lines, index, indent, path):
+    text = lines[index][2]
+    if text == "-" or text.startswith("- "):
+        return _parse_sequence(lines, index, indent, path)
+    return _parse_mapping(lines, index, indent, path)
+
+
+def _parse_mapping(lines, index, indent, path):
+    result = {}
+    while index < len(lines):
+        number, line_indent, text = lines[index]
+        if line_indent < indent:
+            break
+        if line_indent > indent:
+            raise YamlError("unexpected indent", path, number)
+        if text == "-" or text.startswith("- "):
+            break
+        key, rest = _split_key(text, path, number)
+        if rest == "":
+            following = lines[index + 1] if index + 1 < len(lines) else None
+            if following is not None and following[1] > line_indent:
+                value, index = _parse_block(lines, index + 1, following[1], path)
+                result[key] = value
+                continue
+            if following is not None and following[1] == line_indent and (
+                following[2] == "-" or following[2].startswith("- ")
+            ):
+                value, index = _parse_sequence(lines, index + 1, line_indent, path)
+                result[key] = value
+                continue
+            result[key] = None
+            index += 1
+            continue
+        result[key] = _parse_scalar(rest, path, number)
+        index += 1
+        if index < len(lines) and lines[index][1] > line_indent:
+            raise YamlError(
+                "indented block under key {!r}, which already has an inline value".format(key),
+                path,
+                lines[index][0],
+            )
+    return result, index
+
+
+def _parse_sequence(lines, index, indent, path):
+    items = []
+    while index < len(lines):
+        number, line_indent, text = lines[index]
+        if line_indent < indent:
+            break
+        if line_indent > indent:
+            raise YamlError("unexpected indent in list", path, number)
+        if not (text == "-" or text.startswith("- ")):
+            break
+        rest = text[1:].strip()
+        if rest == "":
+            following = lines[index + 1] if index + 1 < len(lines) else None
+            if following is not None and following[1] > line_indent:
+                value, index = _parse_block(lines, index + 1, following[1], path)
+                items.append(value)
+                continue
+            items.append(None)
+            index += 1
+            continue
+        if _is_key_line(rest):
+            sub = [(number, line_indent + 2, rest)]
+            cursor = index + 1
+            while cursor < len(lines) and lines[cursor][1] > line_indent:
+                sub.append(lines[cursor])
+                cursor += 1
+            value, used = _parse_mapping(sub, 0, line_indent + 2, path)
+            if used != len(sub):
+                raise YamlError("could not parse list item as a map", path, number)
+            items.append(value)
+            index = cursor
+            continue
+        items.append(_parse_scalar(rest, path, number))
+        index += 1
+    return items, index
+
+
+def parse_yaml(text, path="<yaml>"):
+    """Parse the YAML subset this repo uses. Raise YamlError on anything else."""
+    lines = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        body = _strip_comment(raw)
+        if not body.strip():
+            continue
+        if body.strip() in ("---", "..."):
+            continue
+        # Measure the whole leading whitespace run, not the space-only prefix. Measuring
+        # spaces alone would read a tab-indented line as top level and change the shape of
+        # the document without reporting anything.
+        lead = len(body) - len(body.lstrip(" \t"))
+        if "\t" in body[:lead]:
+            raise YamlError(
+                "tab in indentation. YAML forbids it. Indent with spaces.", path, number
+            )
+        indent = lead
+        lines.append((number, indent, body.strip()))
+    if not lines:
+        return {}
+    value, index = _parse_block(lines, 0, lines[0][1], path)
+    if index != len(lines):
+        raise YamlError("unexpected content", path, lines[index][0])
+    return value
+
+
+# ------------------------------------------------------------------ frontmatter
+
+
+def parse_frontmatter(text):
+    """Return (fields, error, line). fields maps key to (value, line number)."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None, "no frontmatter: the file does not open with ---", 1
+    end = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() in ("---", "..."):
+            end = index
+            break
+    if end is None:
+        return None, "frontmatter is not closed with ---", 1
+    fields = {}
+    for index in range(1, end):
+        raw = lines[index]
+        if not raw.strip():
+            continue
+        if raw.lstrip().startswith("#"):
+            continue
+        if raw[0] in " \t":
+            return None, "nested frontmatter is not supported", index + 1
+        if ":" not in raw:
+            return None, "frontmatter line is not `key: value`", index + 1
+        key, _, value = raw.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1]
+        fields[key] = (value, index + 1)
+    return fields, None, None
+
+
+# ------------------------------------------------------------------ findings
+
+
+class Finding(object):
+    __slots__ = ("check", "path", "line", "message", "severity", "fix")
+
+    def __init__(self, check, path, line, message, severity=ERROR, fix=None):
+        self.check = check
+        self.path = path
+        self.line = line if line else 1
+        self.message = message
+        self.severity = severity
+        self.fix = fix
+
+    def render(self):
+        mark = "" if self.severity == ERROR else " (warning)"
+        return "{}:{}: [{}]{} {}".format(self.path, self.line, self.check, mark, self.message)
+
+
+class Repo(object):
+    """Paths and cached reads for one checkout."""
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        self.plugin = os.path.join(self.root, "plugins", "hyperpower")
+        self.docs = os.path.join(self.root, "docs")
+        self._text = {}
+
+    def path(self, *parts):
+        return os.path.join(self.root, *parts)
+
+    def rel(self, absolute):
+        return os.path.relpath(absolute, self.root)
+
+    def read(self, absolute):
+        if absolute not in self._text:
+            with open(absolute, "r", encoding="utf-8", errors="replace") as handle:
+                self._text[absolute] = handle.read()
+        return self._text[absolute]
+
+    def exists(self, *parts):
+        return os.path.exists(self.path(*parts))
+
+    def walk(self, *parts):
+        """Yield absolute paths of text files under a subtree, skipping build dirs."""
+        base = self.path(*parts) if parts else self.root
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            for name in sorted(filenames):
+                suffix = os.path.splitext(name)[1]
+                if suffix not in TEXT_SUFFIXES:
+                    continue
+                yield os.path.join(dirpath, name)
+
+    def agent_files(self):
+        base = os.path.join(self.plugin, "agents")
+        if not os.path.isdir(base):
+            return []
+        return [
+            os.path.join(base, name)
+            for name in sorted(os.listdir(base))
+            if name.endswith(".md") and name != "README.md"
+        ]
+
+    def agent_names(self):
+        return [os.path.splitext(os.path.basename(p))[0] for p in self.agent_files()]
+
+    def skill_dirs(self):
+        base = os.path.join(self.plugin, "skills")
+        if not os.path.isdir(base):
+            return []
+        return [
+            os.path.join(base, name)
+            for name in sorted(os.listdir(base))
+            if os.path.isdir(os.path.join(base, name))
+        ]
+
+    def skill_names(self):
+        return [os.path.basename(p) for p in self.skill_dirs()]
+
+    def gate_scripts(self):
+        base = os.path.join(self.plugin, "gates")
+        if not os.path.isdir(base):
+            return []
+        return [
+            os.path.join(base, name)
+            for name in sorted(os.listdir(base))
+            if name.endswith(".sh") and name != "_lib.sh"
+        ]
+
+
+# ------------------------------------------------------------------ fixes
+
+
+def fix_frontmatter_field(absolute, key, value):
+    """Rewrite one frontmatter key in place, or insert it after the opening ---."""
+
+    def apply():
+        with open(absolute, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        lines = text.split("\n")
+        if not lines or lines[0].strip() != "---":
+            return False
+        end = None
+        for index in range(1, len(lines)):
+            if lines[index].strip() in ("---", "..."):
+                end = index
+                break
+        if end is None:
+            return False
+        line = "{}: {}".format(key, value)
+        for index in range(1, end):
+            head = lines[index].partition(":")[0].strip()
+            if head == key:
+                lines[index] = line
+                break
+        else:
+            lines.insert(1, line)
+        with open(absolute, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        return True
+
+    return apply
+
+
+def fix_make_executable(absolute):
+    def apply():
+        mode = os.stat(absolute).st_mode
+        os.chmod(absolute, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return True
+
+    return apply
+
+
+def fix_drop_executable(absolute):
+    def apply():
+        mode = os.stat(absolute).st_mode
+        os.chmod(absolute, mode & ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+        return True
+
+    return apply
+
+
+# ------------------------------------------------------------------ check 1 and 2
+
+
+def check_frontmatter(repo):
+    """1. Every SKILL.md and agent .md has parseable frontmatter with name and description.
+    2. Every name is bare and matches its file. A hyperpower- prefix is the drift defect."""
+    findings = []
+    targets = [(p, os.path.splitext(os.path.basename(p))[0], "agent") for p in repo.agent_files()]
+    for directory in repo.skill_dirs():
+        skill = os.path.join(directory, "SKILL.md")
+        if not os.path.exists(skill):
+            findings.append(
+                Finding(
+                    "frontmatter",
+                    repo.rel(directory),
+                    1,
+                    "skill directory has no SKILL.md",
+                )
+            )
+            continue
+        targets.append((skill, os.path.basename(directory), "skill"))
+
+    for absolute, expected, kind in targets:
+        relative = repo.rel(absolute)
+        fields, error, line = parse_frontmatter(repo.read(absolute))
+        if fields is None:
+            findings.append(Finding("frontmatter", relative, line, error))
+            continue
+        if "name" not in fields:
+            findings.append(
+                Finding(
+                    "frontmatter",
+                    relative,
+                    1,
+                    "frontmatter has no `name`. Expected `name: {}`.".format(expected),
+                    fix=fix_frontmatter_field(absolute, "name", expected),
+                )
+            )
+        if "description" not in fields:
+            findings.append(
+                Finding(
+                    "frontmatter",
+                    relative,
+                    1,
+                    "frontmatter has no `description`. Write when to use this {}.".format(kind),
+                )
+            )
+        elif not fields["description"][0]:
+            findings.append(
+                Finding(
+                    "frontmatter",
+                    relative,
+                    fields["description"][1],
+                    "`description` is empty. Write when to use this {}.".format(kind),
+                )
+            )
+        if "name" not in fields:
+            continue
+        name, name_line = fields["name"]
+        if name.startswith("hyperpower-") or name.startswith("hyperpower:"):
+            findings.append(
+                Finding(
+                    "agent-name",
+                    relative,
+                    name_line,
+                    "name {!r} carries the plugin prefix. The frontmatter name is bare. "
+                    "The plugin supplies the namespace. Use `name: {}`.".format(name, expected),
+                    fix=fix_frontmatter_field(absolute, "name", expected),
+                )
+            )
+        elif name != expected:
+            findings.append(
+                Finding(
+                    "agent-name",
+                    relative,
+                    name_line,
+                    "name {!r} does not match the {} file. Callers spawn it as "
+                    "`hyperpower:{}`. Use `name: {}`.".format(name, kind, expected, expected),
+                    fix=fix_frontmatter_field(absolute, "name", expected),
+                )
+            )
+    return findings
+
+
+# ------------------------------------------------------------------ check 3
+
+
+def check_agent_dispatch(repo):
+    """3. Every dispatched agentType resolves to a file in agents/, namespaced."""
+    findings = []
+    agents = set(repo.agent_names())
+    skills = set(repo.skill_names())
+    known = agents | skills
+
+    scanned = []
+    scanned.extend(os.path.join(d, "SKILL.md") for d in repo.skill_dirs())
+    workflows = os.path.join(repo.plugin, "workflows")
+    if os.path.isdir(workflows):
+        scanned.extend(
+            os.path.join(workflows, n) for n in sorted(os.listdir(workflows)) if n.endswith(".js")
+        )
+    scanned.extend(repo.agent_files())
+    for extra in ("agents/README.md", "workflows/README.md", "hooks/hooks.json"):
+        absolute = os.path.join(repo.plugin, extra)
+        if os.path.exists(absolute):
+            scanned.append(absolute)
+
+    for absolute in scanned:
+        if not os.path.exists(absolute):
+            continue
+        relative = repo.rel(absolute)
+        text = repo.read(absolute)
+        lines = text.split("\n")
+
+        # Lines the agentType scan already reported. The generic reference scan skips
+        # them so one bad dispatch does not print twice.
+        dispatched = set()
+        if absolute.endswith(".js"):
+            for match in AGENT_TYPES_RE.finditer(text):
+                number = text.count("\n", 0, match.start()) + 1
+                for entry in re.findall(r"['\"]([^'\"]+)['\"]", match.group(1)):
+                    found = _dispatch_finding(relative, number, entry, agents)
+                    if found:
+                        dispatched.add(number)
+                    findings.extend(found)
+            for match in AGENT_TYPE_RE.finditer(text):
+                number = text.count("\n", 0, match.start()) + 1
+                found = _dispatch_finding(relative, number, match.group(1), agents)
+                if found:
+                    dispatched.add(number)
+                findings.extend(found)
+
+        for number, line in enumerate(lines, 1):
+            if number in dispatched:
+                continue
+            for token in NAMESPACED_RE.findall(line):
+                if "<" in token or ">" in token:
+                    continue
+                if token in known:
+                    continue
+                findings.append(
+                    Finding(
+                        "agent-dispatch",
+                        relative,
+                        number,
+                        "`hyperpower:{}` resolves to nothing. There is no agents/{}.md and "
+                        "no skills/{}/SKILL.md.".format(token, token, token),
+                    )
+                )
+
+        for number, line in enumerate(lines, 1):
+            if not SPAWN_RE.search(line):
+                continue
+            tokens = BACKTICK_RE.findall(line)
+            if any(token.startswith("hyperpower:") for token in tokens):
+                continue
+            for token in tokens:
+                if token in agents:
+                    findings.append(
+                        Finding(
+                            "agent-dispatch",
+                            relative,
+                            number,
+                            "bare agent name `{}` on a spawn line. Spawn `hyperpower:{}`. "
+                            "A bare name resolves to a same-named agent in the user's own "
+                            "~/.claude/agents/, and that failure is silent.".format(token, token),
+                        )
+                    )
+    return findings
+
+
+def _dispatch_finding(relative, number, entry, agents):
+    if entry.startswith("hyperpower:"):
+        name = entry.split(":", 1)[1]
+        if name in agents:
+            return []
+        return [
+            Finding(
+                "agent-dispatch",
+                relative,
+                number,
+                "agentType {!r} has no file at agents/{}.md.".format(entry, name),
+            )
+        ]
+    if entry in agents:
+        return [
+            Finding(
+                "agent-dispatch",
+                relative,
+                number,
+                "agentType {!r} is bare. Use 'hyperpower:{}'.".format(entry, entry),
+            )
+        ]
+    return [
+        Finding(
+            "agent-dispatch",
+            relative,
+            number,
+            "agentType {!r} is neither namespaced nor a known agent.".format(entry),
+        )
+    ]
+
+
+# ------------------------------------------------------------------ check 4
+
+
+def check_commands_doc(repo):
+    """4. docs/commands.md and skills/ name the same commands, both directions."""
+    findings = []
+    doc = repo.path("docs", "commands.md")
+    if not os.path.exists(doc):
+        return [Finding("commands-doc", "docs/commands.md", 1, "docs/commands.md is missing")]
+    relative = repo.rel(doc)
+    text = repo.read(doc)
+    documented = {}
+    for number, line in enumerate(text.split("\n"), 1):
+        match = COMMAND_HEADING_RE.match(line)
+        if match:
+            documented.setdefault(match.group(1), number)
+
+    skills = repo.skill_names()
+    for name in skills:
+        if name not in documented:
+            findings.append(
+                Finding(
+                    "commands-doc",
+                    relative,
+                    1,
+                    "skills/{}/SKILL.md exists and docs/commands.md has no "
+                    "`### `/hyperpower:{}`` section.".format(name, name),
+                )
+            )
+    for name, number in sorted(documented.items(), key=lambda item: item[1]):
+        if name not in skills:
+            findings.append(
+                Finding(
+                    "commands-doc",
+                    relative,
+                    number,
+                    "documents /hyperpower:{} and there is no "
+                    "skills/{}/SKILL.md.".format(name, name),
+                )
+            )
+
+    match = COUNT_SENTENCE_RE.search(text)
+    if match:
+        number = text.count("\n", 0, match.start()) + 1
+        word = match.group(1).lower()
+        actual = len(documented)
+        expected = NUMBER_WORDS[actual] if actual < len(NUMBER_WORDS) else str(actual)
+        if word != expected:
+            findings.append(
+                Finding(
+                    "commands-doc",
+                    relative,
+                    number,
+                    "says {!r} commands and documents {}. Write {!r}.".format(
+                        match.group(1), actual, expected.capitalize()
+                    ),
+                )
+            )
+    return findings
+
+
+# ------------------------------------------------------------------ schema
+
+
+def load_schema(repo):
+    """Parse the Full schema block in docs/configuration.md. It is the authority."""
+    doc = repo.path("docs", "configuration.md")
+    if not os.path.exists(doc):
+        raise YamlError("docs/configuration.md is missing", "docs/configuration.md", 1)
+    text = repo.read(doc)
+    lines = text.split("\n")
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip().lower().startswith("## full schema"):
+            start = index
+            break
+    if start is None:
+        raise YamlError("no `## Full schema` heading", "docs/configuration.md", 1)
+    open_at = None
+    for index in range(start, len(lines)):
+        if lines[index].strip() in ("```yaml", "```yml"):
+            open_at = index
+            break
+    if open_at is None:
+        raise YamlError(
+            "no yaml block under `## Full schema`", "docs/configuration.md", start + 1
+        )
+    close_at = None
+    for index in range(open_at + 1, len(lines)):
+        if lines[index].strip() == "```":
+            close_at = index
+            break
+    if close_at is None:
+        raise YamlError("unterminated yaml block", "docs/configuration.md", open_at + 1)
+    block = "\n".join(lines[open_at + 1 : close_at])
+    schema = parse_yaml(block, "docs/configuration.md")
+    if not isinstance(schema, dict):
+        raise YamlError(
+            "the `## Full schema` yaml block parsed to a {}. It must be a mapping of "
+            "top-level config sections.".format(type(schema).__name__),
+            "docs/configuration.md",
+            open_at + 2,
+        )
+    gates = schema.get("gates")
+    if isinstance(gates, dict):
+        for gate in gates.values():
+            if isinstance(gate, dict):
+                for field in GATE_UNIVERSAL_FIELDS:
+                    gate.setdefault(field, None)
+    return schema, open_at + 2
+
+
+# ------------------------------------------------------------------ check 5, 11
+
+
+def check_gates_shipped(repo, schema):
+    """5. Every schema gate has a script, or docs/gates.md marks it not shipped.
+    11. Every gate script has a schema entry, or nothing can configure it."""
+    findings = []
+    gates = schema.get("gates") or {}
+    doc = repo.path("docs", "gates.md")
+    doc_text = repo.read(doc) if os.path.exists(doc) else ""
+    doc_lines = doc_text.split("\n")
+
+    scripts = {os.path.splitext(os.path.basename(p))[0]: p for p in repo.gate_scripts()}
+    for name in sorted(gates):
+        if name in scripts:
+            continue
+        marked = any(
+            name in line and "not shipped" in line.lower() for line in doc_lines
+        )
+        if marked:
+            continue
+        findings.append(
+            Finding(
+                "gate-shipped",
+                "docs/gates.md",
+                1,
+                "gate {!r} is in the docs/configuration.md schema, there is no "
+                "gates/{}.sh, and docs/gates.md does not mark it not shipped.".format(name, name),
+            )
+        )
+    for name, absolute in sorted(scripts.items()):
+        if name in gates:
+            continue
+        findings.append(
+            Finding(
+                "gate-orphan",
+                repo.rel(absolute),
+                1,
+                "gate script {!r} has no `gates.{}` entry in the docs/configuration.md "
+                "schema. Add the entry, or delete the script.".format(name, name),
+            )
+        )
+    return findings
+
+
+# ------------------------------------------------------------------ check 6
+
+
+def check_gate_contract(repo):
+    """6. Every gate script is executable and its could-not-run path exits 78."""
+    findings = []
+    library = os.path.join(repo.plugin, "gates", "_lib.sh")
+    if os.path.exists(library) and os.access(library, os.X_OK):
+        findings.append(
+            Finding(
+                "gate-contract",
+                repo.rel(library),
+                1,
+                "_lib.sh is executable. It is sourced, never executed. Run "
+                "`chmod -x` on it.",
+                fix=fix_drop_executable(library),
+            )
+        )
+    for absolute in repo.gate_scripts():
+        relative = repo.rel(absolute)
+        if not os.access(absolute, os.X_OK):
+            findings.append(
+                Finding(
+                    "gate-contract",
+                    relative,
+                    1,
+                    "gate script is not executable. The caller runs it directly.",
+                    fix=fix_make_executable(absolute),
+                )
+            )
+            continue
+        try:
+            done = subprocess.run(
+                [absolute],
+                cwd=repo.plugin,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            findings.append(
+                Finding(
+                    "gate-contract",
+                    relative,
+                    1,
+                    "gate did not exit within 60s on empty config. The could-not-run path "
+                    "must exit 78 immediately.",
+                )
+            )
+            continue
+        except OSError as error:
+            findings.append(
+                Finding("gate-contract", relative, 1, "gate could not run: {}".format(error))
+            )
+            continue
+        if done.returncode != 78:
+            findings.append(
+                Finding(
+                    "gate-contract",
+                    relative,
+                    1,
+                    "gate exited {} on empty config. A gate that cannot run exits 78 and "
+                    "never reports a pass it did not verify.".format(done.returncode),
+                )
+            )
+            continue
+        body = done.stdout.decode("utf-8", "replace").strip()
+        try:
+            result = json.loads(body)
+        except ValueError:
+            findings.append(
+                Finding(
+                    "gate-contract",
+                    relative,
+                    1,
+                    "gate wrote non-JSON to stdout: {!r}".format(body[:120]),
+                )
+            )
+            continue
+        if not isinstance(result, dict):
+            findings.append(
+                Finding(
+                    "gate-contract",
+                    relative,
+                    1,
+                    "gate wrote a JSON {} to stdout. A gate result is a JSON object with a "
+                    "`result` key.".format(type(result).__name__),
+                )
+            )
+            continue
+        if result.get("result") != "did_not_run":
+            findings.append(
+                Finding(
+                    "gate-contract",
+                    relative,
+                    1,
+                    "gate exited 78 and reported result {!r}. It must be "
+                    "\"did_not_run\".".format(result.get("result")),
+                )
+            )
+    return findings
+
+
+# ------------------------------------------------------------------ check 7
+
+
+def check_slop_markers(repo):
+    """7. No placeholder marker outside the documented allowlist."""
+    findings = []
+    allowed = {}
+    for path, needle in SLOP_ALLOWLIST:
+        allowed.setdefault(path, []).append(needle)
+    for absolute in repo.walk():
+        relative = repo.rel(absolute)
+        try:
+            text = repo.read(absolute)
+        except OSError:
+            continue
+        for number, line in enumerate(text.split("\n"), 1):
+            if not any(marker in line for marker in SLOP_MARKERS):
+                continue
+            if any(needle in line for needle in allowed.get(relative, ())):
+                continue
+            hit = next(marker for marker in SLOP_MARKERS if marker in line)
+            findings.append(
+                Finding(
+                    "slop-markers",
+                    relative,
+                    number,
+                    "{} marker. Do the work, or record it in .hyperpower/backlog.jsonl "
+                    "with /hyperpower:scout.".format(hit),
+                )
+            )
+    return findings
+
+
+# ------------------------------------------------------------------ check 8
+
+
+def _schema_paths(schema):
+    known = set()
+
+    def walk(node, prefix):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                path = "{}.{}".format(prefix, key) if prefix else str(key)
+                known.add(path)
+                walk(value, path)
+
+    walk(schema, "")
+    return known
+
+
+def _is_wildcard(segment):
+    return not re.match(r"^[A-Za-z0-9_]+$", segment)
+
+
+def field_exists(schema, dotted):
+    """True when the reference names a schema field. A wildcard segment ends the walk."""
+    node = schema
+    for segment in dotted.split("."):
+        if _is_wildcard(segment):
+            return True
+        if isinstance(node, dict):
+            if segment in node:
+                node = node[segment]
+                continue
+            return False
+        if isinstance(node, list):
+            return True
+        return False
+    return True
+
+
+def check_config_fields(repo, schema):
+    """8. Every config field read under plugins/ exists in the schema."""
+    findings = []
+    seen = set()
+    for absolute in repo.walk("plugins"):
+        relative = repo.rel(absolute)
+        text = repo.read(absolute)
+        for number, line in enumerate(text.split("\n"), 1):
+            for match in CONFIG_REF_RE.finditer(line):
+                dotted = (match.group(1) + match.group(2)).rstrip(".,:;>")
+                segments = dotted.split(".")
+                if len(segments) < 2:
+                    continue
+                if segments[-1] in CONFIG_METHOD_NAMES:
+                    continue
+                tail = line[match.end() :]
+                if tail.startswith("("):
+                    continue
+                if any(segment in FILE_SUFFIX_SEGMENTS for segment in segments[1:]):
+                    continue
+                if field_exists(schema, dotted):
+                    continue
+                key = (relative, number, dotted)
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    Finding(
+                        "config-fields",
+                        relative,
+                        number,
+                        "reads config field `{}`, which is not in the docs/configuration.md "
+                        "schema. Add it to the schema, or read a documented field.".format(dotted),
+                    )
+                )
+    return findings
+
+
+# ------------------------------------------------------------------ check 9
+
+
+def check_evals(repo):
+    """9. python3 scripts/run_evals.py validate passes."""
+    script = os.path.join(repo.plugin, "scripts", "run_evals.py")
+    relative = repo.rel(script)
+    if not os.path.exists(script):
+        return [Finding("evals", relative, 1, "run_evals.py is missing")]
+    try:
+        done = subprocess.run(
+            [sys.executable, script, "validate"],
+            cwd=repo.plugin,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return [Finding("evals", relative, 1, "run_evals.py validate did not finish in 180s")]
+    except OSError as error:
+        return [Finding("evals", relative, 1, "run_evals.py could not run: {}".format(error))]
+    if done.returncode == 0:
+        return []
+    body = done.stdout.decode("utf-8", "replace").strip().split("\n")
+    head = " | ".join(line.strip() for line in body[:5] if line.strip())
+    return [
+        Finding(
+            "evals",
+            repo.rel(os.path.join(repo.plugin, "evals", "cases.jsonl")),
+            1,
+            "run_evals.py validate exited {}: {}".format(done.returncode, head or "no output"),
+        )
+    ]
+
+
+# ------------------------------------------------------------------ check 10
+
+
+def check_pricing(repo):
+    """10. Every model id named in the tree has a pricing.yml entry."""
+    findings = []
+    pricing_path = os.path.join(repo.plugin, "pricing.yml")
+    relative = repo.rel(pricing_path)
+    if not os.path.exists(pricing_path):
+        return [Finding("pricing", relative, 1, "pricing.yml is missing")]
+    try:
+        pricing = parse_yaml(repo.read(pricing_path), relative)
+    except YamlError as error:
+        return [Finding("pricing", relative, error.line or 1, "pricing.yml: " + error.message)]
+    if not isinstance(pricing, dict):
+        return [
+            Finding(
+                "pricing",
+                relative,
+                1,
+                "pricing.yml parsed to a {}. It must be a mapping with a `models:` "
+                "key.".format(type(pricing).__name__),
+            )
+        ]
+    priced = pricing.get("models") or {}
+    if not isinstance(priced, dict) or not priced:
+        return [Finding("pricing", relative, 1, "pricing.yml has no `models:` map")]
+
+    seen = set()
+    for absolute in repo.walk():
+        if absolute == pricing_path:
+            continue
+        rel = repo.rel(absolute)
+        for number, line in enumerate(repo.read(absolute).split("\n"), 1):
+            for model in MODEL_ID_RE.findall(line):
+                if model in priced or (rel, model) in seen:
+                    continue
+                seen.add((rel, model))
+                findings.append(
+                    Finding(
+                        "pricing",
+                        rel,
+                        number,
+                        "model id {!r} has no entry in pricing.yml. /hyperpower:cost would "
+                        "report tokens and no money for it.".format(model),
+                    )
+                )
+
+    for absolute in repo.agent_files():
+        fields, error, _ = parse_frontmatter(repo.read(absolute))
+        if fields is None or "model" not in fields:
+            continue
+        value, line = fields["model"]
+        if value in MODEL_ALIASES or value in priced:
+            continue
+        findings.append(
+            Finding(
+                "pricing",
+                repo.rel(absolute),
+                line,
+                "frontmatter model {!r} is neither a tier alias ({}) nor a model id in "
+                "pricing.yml.".format(value, ", ".join(sorted(MODEL_ALIASES))),
+            )
+        )
+    return findings
+
+
+# ------------------------------------------------------------------ check 12
+
+
+def check_agents_index(repo):
+    """12. agents/README.md indexes every agent file, and only real ones."""
+    index = os.path.join(repo.plugin, "agents", "README.md")
+    if not os.path.exists(index):
+        return [
+            Finding(
+                "agents-index",
+                repo.rel(os.path.join(repo.plugin, "agents")),
+                1,
+                "agents/README.md is missing. It is the index every caller reads.",
+            )
+        ]
+    relative = repo.rel(index)
+    rows = {}
+    for number, line in enumerate(repo.read(index).split("\n"), 1):
+        match = INDEX_ROW_RE.match(line.strip())
+        if match:
+            rows.setdefault(match.group(1), number)
+    findings = []
+    names = repo.agent_names()
+    for name in names:
+        if name not in rows:
+            findings.append(
+                Finding(
+                    "agents-index",
+                    relative,
+                    1,
+                    "agents/{}.md is not in the index table. Add a row: file, frontmatter "
+                    "name, spawn name, model, job.".format(name),
+                )
+            )
+    for name, number in sorted(rows.items(), key=lambda item: item[1]):
+        if name not in names:
+            findings.append(
+                Finding(
+                    "agents-index",
+                    relative,
+                    number,
+                    "index row names `{}.md`, which does not exist.".format(name),
+                )
+            )
+    return findings
+
+
+# ------------------------------------------------------------------ check 13
+
+
+def _schema_enum(repo, stage, field):
+    """The enum on one property of schemas/<stage>.json, or (None, relative, reason)."""
+    path = os.path.join(repo.plugin, "schemas", stage + ".json")
+    relative = repo.rel(path)
+    if not os.path.exists(path):
+        return None, relative, "schemas/{}.json is missing".format(stage)
+    try:
+        schema = json.loads(repo.read(path))
+    except ValueError as error:
+        return None, relative, "schemas/{}.json is not JSON: {}".format(stage, error)
+    node = schema.get("properties", {}).get(field, {})
+    values = node.get("enum")
+    if not isinstance(values, list):
+        return None, relative, "schemas/{}.json has no enum on `{}`".format(stage, field)
+    return [value for value in values if value is not None], relative, None
+
+
+def check_task_classes(repo):
+    """13. task-classes.yml, route.json and plan.json name the same task classes.
+
+    Route writes the class into meta.json and the planner copies it into plan.json, so a
+    class in one list and not another stops that run at Plan, and /hyperpower:usage groups
+    by a value it never sees. The three lists are one vocabulary or the pipeline has a hole.
+    """
+    source = os.path.join(repo.plugin, "task-classes.yml")
+    relative = repo.rel(source)
+    if not os.path.exists(source):
+        return [Finding("task-classes", relative, 1, "task-classes.yml is missing")]
+    try:
+        classes = parse_yaml(repo.read(source), relative).get("classes")
+    except YamlError as error:
+        return [Finding("task-classes", relative, error.line or 1, error.message)]
+    if not isinstance(classes, dict) or not classes:
+        return [
+            Finding(
+                "task-classes",
+                relative,
+                1,
+                "task-classes.yml has no `classes:` map. It is the whole vocabulary.",
+            )
+        ]
+    expected = set(classes)
+    findings = []
+    for stage in ("route", "plan"):
+        values, where, reason = _schema_enum(repo, stage, "task_class")
+        if values is None:
+            findings.append(Finding("task-classes", where, 1, reason))
+            continue
+        for name in sorted(expected - set(values)):
+            findings.append(
+                Finding(
+                    "task-classes",
+                    where,
+                    1,
+                    "task_class enum omits `{}`, which task-classes.yml defines. A {} run "
+                    "cannot produce a valid {} contract.".format(name, name, stage),
+                )
+            )
+        for name in sorted(set(values) - expected):
+            findings.append(
+                Finding(
+                    "task-classes",
+                    where,
+                    1,
+                    "task_class enum names `{}`, which task-classes.yml does not define. "
+                    "No route can ever pick it.".format(name),
+                )
+            )
+    return findings
+
+
+# ------------------------------------------------------------------ runner
+
+
+CHECKS = (
+    ("frontmatter", "1. SKILL.md and agent frontmatter parses and carries name and description"),
+    ("agent-name", "2. every frontmatter name is bare and matches its file"),
+    ("agent-dispatch", "3. every dispatched agentType resolves to a file in agents/"),
+    ("commands-doc", "4. docs/commands.md and skills/ agree, both directions"),
+    ("gate-shipped", "5. every schema gate has a script or is marked not shipped"),
+    ("gate-contract", "6. every gate script is executable and exits 78 when it cannot run"),
+    ("slop-markers", "7. no placeholder markers outside the allowlist"),
+    ("config-fields", "8. every config field read under plugins/ is in the schema"),
+    ("evals", "9. run_evals.py validate passes"),
+    ("pricing", "10. every model id named in the tree is priced"),
+    ("gate-orphan", "11. every gate script has a schema entry"),
+    ("agents-index", "12. agents/README.md indexes every agent file"),
+    ("task-classes", "13. task-classes.yml, route.json and plan.json name the same classes"),
+)
+
+# Checks --fix can repair. A finding carries its own repair or none. These are the only
+# checks that ever produce one. Everything else needs a human, because the repair is prose
+# or a design decision.
+FIXABLE = frozenset(("frontmatter", "agent-name", "gate-contract"))
+
+NOT_FIXABLE_REASON = {
+    "frontmatter": "a description is prose, and a file with no frontmatter needs one written",
+    "gate-contract": "the could-not-run path is logic in the script, not a file mode",
+    "agent-dispatch": "renaming a dispatch target changes which agent runs",
+    "commands-doc": "a command section is prose describing what the command does",
+    "gate-shipped": "shipping a gate means writing the script",
+    "gate-orphan": "the schema entry needs the gate's default enabled and blocking values",
+    "slop-markers": "the marker stands for work that was deferred",
+    "config-fields": "the field is either undocumented or misread, and only a human knows which",
+    "evals": "run_evals.py names the bad case and the reason",
+    "pricing": "a price is a fact this script cannot look up",
+    "agents-index": "an index row states the agent's job",
+    "task-classes": "adding or dropping a class changes what the router can pick",
+}
+
+
+SCHEMA_CHECKS = ("gate-shipped", "gate-orphan", "config-fields")
+
+
+def run_checks(repo, only=None):
+    findings = []
+    schema = None
+    schema_error = None
+    try:
+        schema, _ = load_schema(repo)
+    except YamlError as error:
+        schema_error = error
+
+    def wanted(check):
+        return only is None or check in only
+
+    # Report an unreadable schema against the first requested check that needs it. Reporting
+    # it unconditionally would fail `--only pricing` on a problem that check never consults.
+    if schema_error is not None:
+        blocked = [check for check in SCHEMA_CHECKS if wanted(check)]
+        if blocked:
+            findings.append(
+                Finding(
+                    blocked[0],
+                    schema_error.path or "docs/configuration.md",
+                    schema_error.line or 1,
+                    "cannot read the config schema, so {} cannot run: {}".format(
+                        " and ".join(blocked), schema_error.message
+                    ),
+                )
+            )
+
+    if wanted("frontmatter") or wanted("agent-name"):
+        for finding in check_frontmatter(repo):
+            if wanted(finding.check):
+                findings.append(finding)
+    if wanted("agent-dispatch"):
+        findings.extend(check_agent_dispatch(repo))
+    if wanted("commands-doc"):
+        findings.extend(check_commands_doc(repo))
+    if (wanted("gate-shipped") or wanted("gate-orphan")) and schema is not None:
+        for finding in check_gates_shipped(repo, schema):
+            if wanted(finding.check):
+                findings.append(finding)
+    if wanted("gate-contract"):
+        findings.extend(check_gate_contract(repo))
+    if wanted("slop-markers"):
+        findings.extend(check_slop_markers(repo))
+    if wanted("config-fields") and schema is not None:
+        findings.extend(check_config_fields(repo, schema))
+    if wanted("evals"):
+        findings.extend(check_evals(repo))
+    if wanted("pricing"):
+        findings.extend(check_pricing(repo))
+    if wanted("agents-index"):
+        findings.extend(check_agents_index(repo))
+    if wanted("task-classes"):
+        findings.extend(check_task_classes(repo))
+
+    findings.sort(key=lambda f: (f.path, f.line, f.check, f.message))
+    return findings
+
+
+def report(findings, only, strict, stream):
+    ran = [check for check, _ in CHECKS if only is None or check in only]
+    failed = set()
+    errors = 0
+    warnings = 0
+    for finding in findings:
+        severity = ERROR if strict else finding.severity
+        if severity == ERROR:
+            errors += 1
+        else:
+            warnings += 1
+        failed.add(finding.check)
+        stream.write(finding.render() + "\n")
+    if findings:
+        stream.write("\n")
+    passed = len(ran) - len([check for check in ran if check in failed])
+    stream.write("{} checks, {} passed, {} failed.\n".format(len(ran), passed, len(ran) - passed))
+    if errors or warnings:
+        stream.write("{} errors, {} warnings.\n".format(errors, warnings))
+    repairable = len([f for f in findings if f.fix is not None])
+    if repairable:
+        stream.write("{} are repaired by --fix.\n".format(repairable))
+    return errors
+
+
+def describe_unfixable(findings, stream):
+    """Name every check with a finding --fix cannot repair, and why."""
+    blocked = sorted({f.check for f in findings if f.fix is None})
+    if not blocked:
+        return
+    stream.write("\nNot fixable mechanically:\n")
+    for check in blocked:
+        stream.write(
+            "  {} - {}\n".format(check, NOT_FIXABLE_REASON.get(check, "needs a human"))
+        )
+
+
+def build_parser():
+    lines = ["Checks:"]
+    for check, text in CHECKS:
+        lines.append("  {:<16} {}".format(check, text))
+    lines.append("")
+    lines.append("Markers check 7 searches for: " + ", ".join(SLOP_MARKERS))
+    lines.append("")
+    lines.append("--fix repairs " + ", ".join(sorted(FIXABLE)) + " and nothing else.")
+    parser = argparse.ArgumentParser(
+        prog="hp-selfcheck",
+        description="Check the hyperpower plugin against its own documentation.",
+        epilog="\n".join(lines),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="repository root. Default: three directories above this script.",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=None,
+        metavar="CHECK",
+        help="run one check. Repeatable. Default: all of them.",
+    )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="apply the mechanical repairs, then re-run every check.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat warnings as errors.",
+    )
+    parser.add_argument(
+        "--list-checks",
+        action="store_true",
+        help="print the check names and exit.",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.list_checks:
+        for check, text in CHECKS:
+            sys.stdout.write("{:<16} {}\n".format(check, text))
+        return EXIT_OK
+
+    names = [check for check, _ in CHECKS]
+    only = None
+    if args.only:
+        unknown = [check for check in args.only if check not in names]
+        if unknown:
+            sys.stderr.write(
+                "unknown check: {}. Known: {}\n".format(", ".join(unknown), ", ".join(names))
+            )
+            return EXIT_USAGE
+        only = set(args.only)
+
+    root = args.root
+    if root is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    if not os.path.isdir(os.path.join(root, "plugins", "hyperpower")):
+        sys.stderr.write(
+            "{}: not a hyperpowers checkout. plugins/hyperpower is missing. "
+            "Pass --root.\n".format(root)
+        )
+        return EXIT_USAGE
+
+    repo = Repo(root)
+    findings = run_checks(repo, only)
+
+    if args.fix:
+        applied = []
+        for finding in findings:
+            if finding.fix is None:
+                continue
+            try:
+                if finding.fix():
+                    applied.append(finding)
+            except OSError as error:
+                sys.stderr.write("could not fix {}: {}\n".format(finding.path, error))
+        for finding in applied:
+            sys.stdout.write("fixed {}:{}: [{}]\n".format(finding.path, finding.line, finding.check))
+        sys.stdout.write("{} fixed.\n\n".format(len(applied)))
+        repo = Repo(root)
+        findings = run_checks(repo, only)
+        errors = report(findings, only, args.strict, sys.stdout)
+        describe_unfixable(findings, sys.stdout)
+        return EXIT_FAIL if errors else EXIT_OK
+
+    errors = report(findings, only, args.strict, sys.stdout)
+    describe_unfixable(findings, sys.stdout)
+    return EXIT_FAIL if errors else EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

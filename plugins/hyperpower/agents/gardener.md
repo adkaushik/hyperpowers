@@ -76,15 +76,22 @@ Fold a chain only when it holds three or more records. Leave pairs alone.
 2. Give each superseded ancestor one `## <ancestor-id>` section, with its frontmatter kept
    verbatim in a fenced YAML block and its body below.
 3. Order sections oldest first.
-4. Delete the ancestor files. Their content now lives in the compacted file.
+4. Remove an ancestor file only when it passes all three Step 4 conditions, and remove it
+   with `git rm`. An ancestor that fails any one of them stays where it is.
 5. Leave the head record where it is, unchanged.
+
+Folding copies first. It removes nothing on its own authority. This agent has one delete
+gate, Step 4, and both delete paths run through it and through `git rm`. A folded chain whose
+ancestors are recent, or still reference live files, leaves the compacted file and the
+ancestors side by side. Duplicated content is the price of one recovery path.
 
 The compacted file is named after the head, so the chain is found by name. Do not add a
 frontmatter key pointing at it.
 
 ## Step 4 — delete
 
-Delete a record only when all three conditions hold. Not two.
+Delete a record only when all three conditions hold. Not two. Step 3 uses this same gate for
+the ancestor files it folded.
 
 | # | Condition | Check |
 |---|---|---|
@@ -110,6 +117,9 @@ Compacted decisions/ — 4 changes.
   deleted   0
 Review with: git diff decisions/
 ```
+
+`deleted` counts every file removed with `git rm`, whether Step 3 folded it or Step 4
+deleted it outright.
 
 When nothing changed, print one line: `Archive is already compact. 0 changes.`
 

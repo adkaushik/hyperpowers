@@ -1,0 +1,1276 @@
+#!/usr/bin/env python3
+"""hp-journal - write the hyperpower run journal under .hyperpower/runs/<run-id>/.
+
+Every consumer of a run reads this folder: /hyperpower:why, /hyperpower:resume,
+/hyperpower:usage, /hyperpower:cost, the archivist, and the promoter. JOURNAL.md beside
+this file documents every record shape.
+
+Python 3 standard library only. No third-party imports, no network access.
+
+Every append opens with O_APPEND and writes one line in one write() call, so two agents
+writing at the same time never interleave a partial record.
+
+Exit codes: 0 done, 1 bad input or a write that failed, 78 no hyperpower.yml.
+"""
+
+import argparse
+import datetime
+import errno
+import fnmatch
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_NO_CONFIG = 78
+
+JOURNAL_DIR = ".hyperpower"
+RUNS_DIR = os.path.join(JOURNAL_DIR, "runs")
+
+# Pipeline order. A <step>.json outside this list is not a step, and is refused.
+STEPS = [
+    "route",
+    "understand",
+    "plan",
+    "design",
+    "build",
+    "gates",
+    "review",
+    "fix",
+    "render",
+]
+
+# The promoter counts these four and no others.
+MISTAKE_KINDS = [
+    "forever_correction",
+    "assumption_refuted",
+    "gate_failed",
+    "finding_confirmed",
+]
+
+RUN_OUTCOMES = ["ok", "failed", "blocked", "aborted"]
+
+RUN_ID_WIDTH = 4
+RUN_ID_MAX_COUNTER = 10000
+LATEST = "latest"
+
+# One line must fit in one write(). 4096 bytes is the smallest POSIX PIPE_BUF, and it is
+# the size below which an O_APPEND write is atomic in practice.
+MAX_LINE_BYTES = 4096
+
+LOCK_TIMEOUT_SECONDS = 10.0
+LOCK_STALE_SECONDS = 60.0
+
+
+class JournalError(Exception):
+    """A journal operation could not be completed. The message names the cause and fix."""
+
+
+# ------------------------------------------------------------------- hp-config
+
+
+def load_config_module():
+    """Import the sibling hp-config script. It has no .py suffix, so name the loader."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    if not os.path.isfile(path):
+        raise JournalError(
+            "hp-config is missing from {}. Reinstall the plugin.".format(
+                os.path.dirname(path)
+            )
+        )
+    loader = importlib.machinery.SourceFileLoader("hp_config", path)
+    spec = importlib.util.spec_from_file_location("hp_config", path, loader=loader)
+    module = importlib.util.module_from_spec(spec)
+    # The plugin directory is installed once and shared. Importing must not leave a
+    # __pycache__ entry in it.
+    cached = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = cached
+    return module
+
+
+def load_config(root):
+    """Return (loaded_config, error_message, missing).
+
+    `missing` is true only when there is no hyperpower.yml. A file that exists and does not
+    parse is bad input, not a missing config, so the caller exits 1 rather than 78.
+    """
+    module = load_config_module()
+    try:
+        return module.load(root), None, False
+    except module.ConfigError as exc:
+        return None, exc.render(), exc.message == module.NO_CONFIG_MESSAGE
+
+
+# ----------------------------------------------------------------------- paths
+
+
+def find_root(explicit=None):
+    """Repo root: --root, then HYPERPOWER_REPO_ROOT, then git, then hyperpower.yml, then cwd."""
+    if explicit:
+        return os.path.abspath(explicit)
+    from_env = os.environ.get("HYPERPOWER_REPO_ROOT", "")
+    if from_env:
+        return os.path.abspath(from_env)
+    top = run_git(["rev-parse", "--show-toplevel"], os.getcwd())
+    if top:
+        return os.path.abspath(top)
+    current = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(current, "hyperpower.yml")):
+            return current
+        if os.path.isdir(os.path.join(current, JOURNAL_DIR)):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return os.getcwd()
+        current = parent
+
+
+def runs_root(root):
+    return os.path.join(root, RUNS_DIR)
+
+
+def run_git(args, cwd):
+    """Run one git command. Return stripped stdout, or an empty string on any failure."""
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+def relative_path(root, path):
+    """Repo-relative POSIX path. Refuse a path outside the repo root."""
+    absolute = os.path.abspath(os.path.join(root, path))
+    relative = os.path.relpath(absolute, root)
+    if relative == ".." or relative.startswith(".." + os.sep):
+        raise JournalError(
+            "{} is outside the repo root {}. Journal paths are repo-relative.".format(
+                path, root
+            )
+        )
+    return relative.replace(os.sep, "/")
+
+
+# -------------------------------------------------------------------------- io
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class FileLock(object):
+    """Exclusive lock for a read-modify-write of one JSON file in a run folder.
+
+    O_EXCL create, so two callers cannot both hold it. A lock older than
+    LOCK_STALE_SECONDS belonged to a process that died, and is broken.
+    """
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        deadline = time.time() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                handle = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except OSError as exc:
+                if exc.errno != errno.EEXIST:
+                    raise JournalError(
+                        "cannot take the lock {}: {}".format(self.path, exc.strerror)
+                    )
+                self._break_if_stale()
+                if time.time() >= deadline:
+                    raise JournalError(
+                        "{} is locked by another writer. Retry, or delete the lock file "
+                        "if no hyperpower process is running.".format(self.path)
+                    )
+                time.sleep(0.02)
+                continue
+            try:
+                os.write(handle, str(os.getpid()).encode("ascii"))
+            finally:
+                os.close(handle)
+            return self
+
+    def _break_if_stale(self):
+        try:
+            age = time.time() - os.path.getmtime(self.path)
+        except OSError:
+            return
+        if age > LOCK_STALE_SECONDS:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        return False
+
+
+def append_record(path, record):
+    """Append one JSON line with O_APPEND and a single write(). Never interleaves."""
+    line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
+    data = line.encode("utf-8")
+    if len(data) > MAX_LINE_BYTES:
+        raise JournalError(
+            "the record is {} bytes and the limit is {}. Shorten it: a line larger than "
+            "this cannot be appended atomically.".format(len(data), MAX_LINE_BYTES)
+        )
+    try:
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    except OSError as exc:
+        raise JournalError("cannot open {}: {}".format(path, exc.strerror))
+    try:
+        written = os.write(handle, data)
+    except OSError as exc:
+        raise JournalError("cannot write {}: {}".format(path, exc.strerror))
+    finally:
+        os.close(handle)
+    if written != len(data):
+        raise JournalError(
+            "short write to {}: {} of {} bytes. The record is incomplete; check disk "
+            "space.".format(path, written, len(data))
+        )
+
+
+def read_json(path, what):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            body = handle.read()
+    except OSError as exc:
+        raise JournalError("cannot read {}: {}".format(path, exc.strerror))
+    try:
+        return json.loads(body)
+    except ValueError as exc:
+        raise JournalError("{} is not valid JSON: {}".format(what, exc))
+
+
+def write_json(path, payload):
+    """Replace a JSON file atomically. A reader sees the old file or the new one."""
+    temp = "{}.{}.tmp".format(path, os.getpid())
+    body = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except OSError as exc:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise JournalError("cannot write {}: {}".format(path, exc.strerror))
+
+
+# ------------------------------------------------------------------- hashing
+
+
+def git_blob_hash(path):
+    """The value `git hash-object <path>` prints. None when the file is gone."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    header = "blob {}\0".format(len(data)).encode("ascii")
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def sha256_text(text):
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as exc:
+        raise JournalError("cannot read {}: {}".format(path, exc.strerror))
+    return "sha256:" + digest.hexdigest()
+
+
+def files_digest(blobs):
+    """One digest over the whole file list. Sorted, so call order cannot change it."""
+    body = "".join(
+        "{} {}\n".format(path, blobs[path] or "missing") for path in sorted(blobs)
+    )
+    return sha256_text(body)
+
+
+def combined_key(prompt_hash, upstream_hash, files_hash):
+    body = "{}\n{}\n{}\n".format(
+        prompt_hash or "none", upstream_hash or "none", files_hash or "none"
+    )
+    return sha256_text(body)
+
+
+# ------------------------------------------------------------------- run ids
+
+
+def derive_run_id(base_sha, counter, width):
+    """Reproducible id. Same base sha and counter always give the same id."""
+    return hashlib.sha256(
+        "{}:{}".format(base_sha, counter).encode("utf-8")
+    ).hexdigest()[:width]
+
+
+def claim_run_dir(root, base_sha):
+    """Create the first free run folder for this base sha. mkdir is the atomic claim."""
+    parent = runs_root(root)
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as exc:
+        raise JournalError("cannot create {}: {}".format(parent, exc.strerror))
+    for width in (RUN_ID_WIDTH, RUN_ID_WIDTH * 2):
+        for counter in range(RUN_ID_MAX_COUNTER):
+            run_id = derive_run_id(base_sha, counter, width)
+            path = os.path.join(parent, run_id)
+            try:
+                os.mkdir(path)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    continue
+                raise JournalError("cannot create {}: {}".format(path, exc.strerror))
+            return run_id, path, counter, width
+    raise JournalError(
+        "no free run id for base sha {} after {} attempts at both widths. Archive old "
+        "runs under {}.".format(base_sha, RUN_ID_MAX_COUNTER, parent)
+    )
+
+
+def list_runs(root):
+    """Every recorded run, newest first.
+
+    started_at has one-second resolution, so runs claimed inside the same second tie. The
+    counter breaks that tie: it is the order claim_run_dir issued them in. Without it
+    `latest` can resolve to the older of two runs created in the same second.
+    """
+    parent = runs_root(root)
+    if not os.path.isdir(parent):
+        return []
+    ordered = []
+    for name in sorted(os.listdir(parent)):
+        path = os.path.join(parent, name)
+        if not os.path.isdir(path):
+            continue
+        meta_path = os.path.join(path, "meta.json")
+        meta = {}
+        if os.path.isfile(meta_path):
+            try:
+                meta = read_json(meta_path, meta_path)
+            except JournalError:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        started = meta.get("started_at") or ""
+        if not started:
+            try:
+                started = datetime.datetime.fromtimestamp(
+                    os.path.getmtime(path), datetime.timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except OSError:
+                started = ""
+        counter = meta.get("id_counter")
+        if not isinstance(counter, int) or isinstance(counter, bool):
+            counter = -1
+        ordered.append(
+            (
+                (started, counter, name),
+                {
+                    "run": name,
+                    "path": path,
+                    "started_at": started,
+                    "base_sha": meta.get("base_sha"),
+                    "task_class": meta.get("task_class"),
+                    "outcome": meta.get("outcome"),
+                    "has_meta": os.path.isfile(meta_path),
+                },
+            )
+        )
+    ordered.sort(key=lambda item: item[0], reverse=True)
+    return [row for _key, row in ordered]
+
+
+def resolve_run(root, run_id):
+    """Run folder for an id. `latest` resolves to the newest recorded run."""
+    if run_id == LATEST:
+        rows = list_runs(root)
+        if not rows:
+            raise JournalError(
+                "no runs are recorded under {}.".format(runs_root(root))
+            )
+        return rows[0]["run"], rows[0]["path"]
+    # A run id names one folder under .hyperpower/runs/. Anything with a separator or a
+    # .. segment would write outside the journal, so it is refused rather than resolved.
+    if run_id in ("", ".", "..") or run_id != os.path.basename(run_id):
+        raise JournalError(
+            "{} is not a run id. A run id is one folder name under {}.".format(
+                json.dumps(run_id), runs_root(root)
+            )
+        )
+    path = os.path.join(runs_root(root), run_id)
+    if not os.path.isdir(path):
+        known = [row["run"] for row in list_runs(root)]
+        shown = known[:5]
+        if not shown:
+            detail = "none"
+        else:
+            detail = ", ".join(shown)
+            if len(known) > len(shown):
+                detail += ", and {} more in hp-journal list".format(
+                    len(known) - len(shown)
+                )
+        raise JournalError(
+            "run {} has no directory under {}. Recorded runs, newest first: {}".format(
+                run_id, runs_root(root), detail
+            )
+        )
+    return run_id, path
+
+
+def check_step(name):
+    if name not in STEPS:
+        raise JournalError(
+            "{} is not a pipeline step. Steps, in order: {}".format(
+                name, ", ".join(STEPS)
+            )
+        )
+    return name
+
+
+def step_path(run_dir, step):
+    return os.path.join(run_dir, step + ".json")
+
+
+def recorded_steps(run_dir):
+    return [step for step in STEPS if os.path.isfile(step_path(run_dir, step))]
+
+
+def upstream_step(run_dir, step):
+    """The nearest earlier step that has a contract on disk. None for the first one."""
+    index = STEPS.index(step)
+    for candidate in reversed(STEPS[:index]):
+        if os.path.isfile(step_path(run_dir, candidate)):
+            return candidate
+    return None
+
+
+# ------------------------------------------------------------------- ignoring
+
+
+def ignore_patterns(config):
+    if not config:
+        return []
+    patterns = config.get("config", {}).get("paths", {}).get("ignore", [])
+    if not isinstance(patterns, list):
+        return []
+    out = []
+    for raw in patterns:
+        if not isinstance(raw, str) or raw == "":
+            continue
+        pattern = raw.rstrip("/")
+        if pattern.endswith("/*"):
+            pattern = pattern[:-2]
+        if pattern:
+            out.append(pattern)
+    return out
+
+
+def is_ignored(path, patterns):
+    """Same rule as gates/_lib.sh: the pattern itself, or anything under it."""
+    for pattern in patterns:
+        if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, pattern + "/*"):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- subcommands
+
+
+def cmd_new(args):
+    root = find_root(args.root)
+    config, config_error, config_missing = load_config(root)
+    if config is None:
+        sys.stderr.write("hp-journal: " + config_error + "\n")
+        return EXIT_NO_CONFIG if config_missing else EXIT_ERROR
+
+    base_sha = args.base or run_git(["rev-parse", "HEAD"], root)
+    if not base_sha:
+        raise JournalError(
+            "no base sha. {} is not a git repository with a commit. Pass --base "
+            "<sha>.".format(root)
+        )
+
+    run_id, run_dir, counter, width = claim_run_dir(root, base_sha)
+    os.makedirs(os.path.join(run_dir, "gates"), exist_ok=True)
+
+    models = config["config"]["models"]
+    meta = {
+        "run": run_id,
+        "schema": 1,
+        "base_sha": base_sha,
+        "task_class": args.task_class,
+        "models": {
+            "judgment": models.get("judgment"),
+            "mechanical": models.get("mechanical"),
+        },
+        "config_hash": config["hash"],
+        "config_files": [
+            name
+            for name in (
+                os.path.basename(config["files"]["config"]),
+                os.path.basename(config["files"]["local"])
+                if config["files"]["local"]
+                else None,
+            )
+            if name
+        ],
+        "started_at": now_iso(),
+        "finished_at": None,
+        "outcome": None,
+        "id_counter": counter,
+        "id_derivation": "sha256(<base_sha>:<counter>) truncated to {} hex "
+        "characters".format(width),
+    }
+    write_json(os.path.join(run_dir, "meta.json"), meta)
+
+    if args.json:
+        sys.stdout.write(
+            json.dumps({"run": run_id, "path": run_dir}, separators=(",", ":")) + "\n"
+        )
+    else:
+        sys.stdout.write(run_id + "\n")
+    return EXIT_OK
+
+
+def cmd_step(args):
+    root = find_root(args.root)
+    run_id, run_dir = resolve_run(root, args.run)
+    step = check_step(args.step)
+
+    if args.stdin:
+        body = sys.stdin.read()
+        source = "stdin"
+    else:
+        try:
+            with open(args.file, "r", encoding="utf-8") as handle:
+                body = handle.read()
+        except OSError as exc:
+            raise JournalError("cannot read {}: {}".format(args.file, exc.strerror))
+        source = args.file
+    if body.strip() == "":
+        raise JournalError("{} is empty. A step contract is a JSON object.".format(source))
+    try:
+        payload = json.loads(body)
+    except ValueError as exc:
+        raise JournalError("{} is not valid JSON: {}".format(source, exc))
+    if not isinstance(payload, dict):
+        raise JournalError(
+            "{} holds a {}. A step contract is a JSON object.".format(
+                source, type(payload).__name__
+            )
+        )
+    if "step" in payload and payload["step"] != step:
+        raise JournalError(
+            "the contract names step {} and you asked to write {}. Fix one of "
+            "them.".format(json.dumps(payload["step"]), step)
+        )
+    if "run_id" in payload and payload["run_id"] not in (run_id, None):
+        raise JournalError(
+            "the contract names run {} and you asked to write run {}. Fix one of "
+            "them.".format(json.dumps(payload["run_id"]), run_id)
+        )
+
+    target = step_path(run_dir, step)
+    with FileLock(target + ".lock"):
+        existing = {}
+        if os.path.isfile(target):
+            existing = read_json(target, target)
+            if not isinstance(existing, dict):
+                existing = {}
+        record = {"step": step, "run_id": run_id, "recorded_at": now_iso()}
+        for key, value in payload.items():
+            if key in record:
+                continue
+            record[key] = value
+        # hp-journal hash owns these three. A contract that omits them keeps what was
+        # already hashed, so hash and step can be called in either order.
+        for key in ("prompt_hash", "files_read", "cache_key"):
+            if key not in record and key in existing:
+                record[key] = existing[key]
+        write_json(target, record)
+
+    sys.stdout.write(target + "\n")
+    return EXIT_OK
+
+
+def check_count(value, flag):
+    if value is None:
+        return None
+    if value < 0:
+        raise JournalError("{} must be zero or more, not {}.".format(flag, value))
+    return value
+
+
+def cmd_usage(args):
+    root = find_root(args.root)
+    _run_id, run_dir = resolve_run(root, args.run)
+
+    stage = args.stage.strip()
+    if stage == "" or any(char.isspace() for char in stage):
+        raise JournalError("--stage must be one word, such as build or gate:types.")
+    is_gate = stage.startswith("gate:")
+    if is_gate and stage == "gate:":
+        raise JournalError("--stage gate: needs a gate name, such as gate:types.")
+
+    outcome = args.outcome.strip()
+    if outcome == "":
+        raise JournalError("--outcome must not be empty. Use ok for a pass.")
+
+    if is_gate:
+        for name, value in (
+            ("--model", args.model),
+            ("--agent", args.agent),
+            ("--input", args.input),
+            ("--output", args.output),
+        ):
+            if value is not None:
+                raise JournalError(
+                    "{} is not written for a gate record. A gate makes no model call, so "
+                    "it carries no model, agent, or token counts.".format(name)
+                )
+        if args.cache_read:
+            raise JournalError("--cache-read is not written for a gate record.")
+        # duration_ms is always written, null when the caller passed none, so a gate record
+        # and a model call carry the same key set for that field.
+        record = {
+            "ts": now_iso(),
+            "stage": stage,
+            "duration_ms": check_count(args.duration_ms, "--duration-ms"),
+            "outcome": outcome,
+        }
+    else:
+        if args.model is None:
+            raise JournalError("--model is required for a model call.")
+        if args.input is None or args.output is None:
+            raise JournalError(
+                "--input and --output are required for a model call. Record the counts "
+                "the API returned; do not estimate them."
+            )
+        record = {
+            "ts": now_iso(),
+            "stage": stage,
+            "agent": args.agent,
+            "model": args.model,
+            "input_tokens": check_count(args.input, "--input"),
+            "output_tokens": check_count(args.output, "--output"),
+            "cache_read": check_count(args.cache_read, "--cache-read"),
+            "duration_ms": check_count(args.duration_ms, "--duration-ms"),
+            "outcome": outcome,
+        }
+
+    append_record(os.path.join(run_dir, "usage.jsonl"), record)
+    return EXIT_OK
+
+
+def check_key(value):
+    body = value.strip()
+    if body == "":
+        raise JournalError("--key must not be empty.")
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-")
+    if set(body) - allowed or body.startswith("-") or body.endswith("-"):
+        raise JournalError(
+            "--key must be a kebab-case slug of lowercase letters, digits and hyphens, "
+            "such as settings-api-shape. The promoter counts this key across runs, so an "
+            "unstable key disables promotion."
+        )
+    return body
+
+
+def cmd_mistake(args):
+    root = find_root(args.root)
+    run_id, run_dir = resolve_run(root, args.run)
+
+    if args.kind not in MISTAKE_KINDS:
+        raise JournalError(
+            "{} is not a mistake kind. The promoter counts these four and no others: "
+            "{}".format(args.kind, ", ".join(MISTAKE_KINDS))
+        )
+    key = check_key(args.key)
+    ref = args.ref or "{}/{}/meta.json".format(RUNS_DIR, run_id)
+    if ref.strip() == "":
+        raise JournalError("--ref must not be empty. Name the file holding the evidence.")
+
+    record = {"run": run_id, "kind": args.kind, "key": key, "ref": ref}
+    append_record(os.path.join(run_dir, "mistakes.jsonl"), record)
+    return EXIT_OK
+
+
+def collect_files(root, args):
+    paths = []
+    for group in args.files or []:
+        for item in group.split(","):
+            body = item.strip()
+            if body:
+                paths.append(body)
+    if args.files_from:
+        try:
+            with open(args.files_from, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    body = line.strip()
+                    if body:
+                        paths.append(body)
+        except OSError as exc:
+            raise JournalError(
+                "cannot read {}: {}".format(args.files_from, exc.strerror)
+            )
+    seen = []
+    for path in paths:
+        relative = relative_path(root, path)
+        if relative not in seen:
+            seen.append(relative)
+    return sorted(seen)
+
+
+def resolve_prompt_hash(args, existing):
+    given = [
+        name
+        for name, value in (
+            ("--prompt-hash", args.prompt_hash),
+            ("--prompt-file", args.prompt_file),
+            ("--prompt", args.prompt),
+        )
+        if value is not None
+    ]
+    if len(given) > 1:
+        raise JournalError(
+            "pass one of --prompt-hash, --prompt-file, --prompt. You passed: {}".format(
+                ", ".join(given)
+            )
+        )
+    if args.prompt_hash is not None:
+        body = args.prompt_hash.strip()
+        if body == "":
+            raise JournalError("--prompt-hash must not be empty.")
+        return body
+    if args.prompt_file is not None:
+        return sha256_file(args.prompt_file)
+    if args.prompt is not None:
+        return sha256_text(args.prompt)
+    recorded = existing.get("prompt_hash")
+    if recorded:
+        return recorded
+    raise JournalError(
+        "no prompt to hash and none recorded in this step. Pass --prompt-file, --prompt, "
+        "or --prompt-hash. Keying a step on the files alone lets a resumed run reuse a "
+        "contract whose prompt changed."
+    )
+
+
+def cmd_hash(args):
+    root = find_root(args.root)
+    run_id, run_dir = resolve_run(root, args.run)
+    step = check_step(args.step)
+    if not args.files and not args.files_from:
+        raise JournalError(
+            "pass --files a,b or --files-from FILE. The list is what the step read; an "
+            "empty file list is written as an empty list, not omitted."
+        )
+
+    files = collect_files(root, args)
+    blobs = {path: git_blob_hash(os.path.join(root, path)) for path in files}
+    files_hash = files_digest(blobs)
+
+    parent = upstream_step(run_dir, step)
+    upstream_hash = sha256_file(step_path(run_dir, parent)) if parent else None
+
+    target = step_path(run_dir, step)
+    with FileLock(target + ".lock"):
+        existing = {}
+        if os.path.isfile(target):
+            existing = read_json(target, target)
+            if not isinstance(existing, dict):
+                existing = {}
+        prompt_hash = resolve_prompt_hash(args, existing)
+        key = combined_key(prompt_hash, upstream_hash, files_hash)
+
+        record = dict(existing)
+        record.setdefault("step", step)
+        record.setdefault("run_id", run_id)
+        record["prompt_hash"] = prompt_hash
+        record["files_read"] = files
+        record["cache_key"] = {
+            "key": key,
+            "prompt_hash": prompt_hash,
+            "upstream_step": parent,
+            "upstream_hash": upstream_hash,
+            "files_hash": files_hash,
+            "blobs": blobs,
+            "hashed_at": now_iso(),
+        }
+        write_json(target, record)
+
+    if args.json:
+        sys.stdout.write(
+            json.dumps(record["cache_key"], separators=(",", ":")) + "\n"
+        )
+    else:
+        sys.stdout.write(key + "\n")
+    return EXIT_OK
+
+
+def measure_step(root, run_dir, step, patterns):
+    """Compare a step's three recorded inputs against the working tree now."""
+    contract = read_json(step_path(run_dir, step), step + ".json")
+    if not isinstance(contract, dict):
+        contract = {}
+    cache = contract.get("cache_key")
+    if not isinstance(cache, dict) or not cache.get("key"):
+        return {
+            "step": step,
+            "state": "unhashed",
+            "changed_files": 0,
+            "files": [],
+            "drifted": {"prompt": False, "upstream": False, "files": False},
+            "upstream_step": None,
+        }
+
+    prompt_now = contract.get("prompt_hash")
+    prompt_drifted = bool(prompt_now) and prompt_now != cache.get("prompt_hash")
+
+    parent = cache.get("upstream_step")
+    upstream_drifted = False
+    if parent:
+        parent_file = step_path(run_dir, parent)
+        if os.path.isfile(parent_file):
+            upstream_drifted = sha256_file(parent_file) != cache.get("upstream_hash")
+        else:
+            upstream_drifted = True
+
+    blobs = cache.get("blobs")
+    if not isinstance(blobs, dict):
+        blobs = {}
+    changed = []
+    for path in sorted(blobs):
+        if is_ignored(path, patterns):
+            continue
+        if git_blob_hash(os.path.join(root, path)) != blobs[path]:
+            changed.append(path)
+
+    drifted = prompt_drifted or upstream_drifted or bool(changed)
+    return {
+        "step": step,
+        "state": "drifted" if drifted else "ok",
+        "changed_files": len(changed),
+        "files": changed,
+        "drifted": {
+            "prompt": prompt_drifted,
+            "upstream": upstream_drifted,
+            "files": bool(changed),
+        },
+        "upstream_step": parent,
+    }
+
+
+def drift_lines(row):
+    """The value column for one step. First line, then any extra detail lines."""
+    if row["state"] == "unhashed":
+        return ["UNHASHED — no cache key recorded for this step"]
+    if row["state"] == "ok":
+        return ["ok"]
+    count = row["changed_files"]
+    lines = []
+    if count:
+        noun = "file" if count == 1 else "files"
+        lines.append("DRIFTED — {} {} changed since this step".format(count, noun))
+        if row["drifted"]["upstream"]:
+            lines.append(
+                "upstream {}.json changed since this step".format(row["upstream_step"])
+            )
+        if row["drifted"]["prompt"]:
+            lines.append("prompt changed since this step")
+        return lines
+    if row["drifted"]["upstream"]:
+        lines.append(
+            "DRIFTED — upstream {}.json changed since this step".format(
+                row["upstream_step"]
+            )
+        )
+        if row["drifted"]["prompt"]:
+            lines.append("prompt changed since this step")
+        return lines
+    return ["DRIFTED — prompt changed since this step"]
+
+
+def cmd_drift(args):
+    root = find_root(args.root)
+    run_id, run_dir = resolve_run(root, args.run)
+    config, config_error, _config_missing = load_config(root)
+    patterns = ignore_patterns(config)
+
+    notes = []
+    if config is None:
+        notes.append(config_error)
+        notes.append("paths.ignore was not applied. Every recorded file was compared.")
+
+    recorded = recorded_steps(run_dir)
+    if not recorded:
+        raise JournalError(
+            "run {} recorded no step contracts. There is nothing to compare.".format(
+                run_id
+            )
+        )
+
+    from_step = None
+    if args.from_step:
+        from_step = check_step(args.from_step)
+        if from_step not in recorded:
+            raise JournalError(
+                "run {} never recorded step {}. It recorded: {}".format(
+                    run_id, from_step, ", ".join(recorded)
+                )
+            )
+        printed = recorded[: recorded.index(from_step) + 1]
+    else:
+        printed = recorded
+
+    config_drifted = False
+    meta_path = os.path.join(run_dir, "meta.json")
+    if os.path.isfile(meta_path) and config is not None:
+        meta = read_json(meta_path, meta_path)
+        if isinstance(meta, dict) and meta.get("config_hash"):
+            config_drifted = meta["config_hash"] != config["hash"]
+
+    rows = [measure_step(root, run_dir, step, patterns) for step in printed]
+    earliest = None
+    for row in rows:
+        if row["state"] != "ok":
+            earliest = row["step"]
+            break
+    if config_drifted:
+        earliest = printed[0]
+        notes.append(
+            "Config hash changed since this run. Treat every step as drifted. Gate "
+            "commands may have changed."
+        )
+
+    if args.json:
+        payload = {
+            "run": run_id,
+            "from": from_step,
+            "config_drifted": config_drifted,
+            "all_drifted": config_drifted,
+            "earliest_drifted": earliest,
+            "notes": notes,
+            "steps": rows,
+        }
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        return EXIT_OK
+
+    if from_step:
+        header = "Resume run {} from {}.".format(run_id, from_step.capitalize())
+    else:
+        header = "Drift report for run {}.".format(run_id)
+    out = [header]
+    width = max(len(row["step"]) for row in rows) + 3
+    for row in rows:
+        lines = drift_lines(row)
+        out.append("  " + row["step"].capitalize().ljust(width) + lines[0])
+        for extra in lines[1:]:
+            out.append("  " + " " * width + extra)
+    out.extend(notes)
+    # The question exists only when a step earlier than the requested one drifted. When
+    # the requested step is itself the earliest drifted one, there is nothing to offer
+    # instead of it, and /hyperpower:resume replays from it.
+    if from_step and earliest and STEPS.index(earliest) < STEPS.index(from_step):
+        out.append(
+            "Re-run from {} instead? [{} / {}-anyway / abort]".format(
+                earliest.capitalize(), earliest, from_step
+            )
+        )
+    sys.stdout.write("\n".join(out) + "\n")
+    return EXIT_OK
+
+
+def cmd_finish(args):
+    root = find_root(args.root)
+    run_id, run_dir = resolve_run(root, args.run)
+    if args.outcome not in RUN_OUTCOMES:
+        raise JournalError(
+            "{} is not a run outcome. Use one of: {}".format(
+                args.outcome, ", ".join(RUN_OUTCOMES)
+            )
+        )
+    target = os.path.join(run_dir, "meta.json")
+    if not os.path.isfile(target):
+        raise JournalError(
+            "run {} has no meta.json. It was not created by hp-journal new.".format(run_id)
+        )
+    with FileLock(target + ".lock"):
+        meta = read_json(target, target)
+        if not isinstance(meta, dict):
+            raise JournalError("{} is not a JSON object.".format(target))
+        meta["outcome"] = args.outcome
+        meta["finished_at"] = now_iso()
+        write_json(target, meta)
+    sys.stdout.write("{} {}\n".format(run_id, args.outcome))
+    return EXIT_OK
+
+
+def cmd_list(args):
+    root = find_root(args.root)
+    rows = list_runs(root)[: args.limit]
+    if args.json:
+        sys.stdout.write(json.dumps(rows, separators=(",", ":")) + "\n")
+        return EXIT_OK
+    if not rows:
+        sys.stdout.write("no runs recorded under {}\n".format(runs_root(root)))
+        return EXIT_OK
+    out = []
+    for row in rows:
+        base = (row["base_sha"] or "-")[:7]
+        out.append(
+            "{}  {}  {}  {}  {}".format(
+                row["run"],
+                row["started_at"] or "-",
+                base,
+                row["task_class"] or "-",
+                row["outcome"] or "-",
+            )
+        )
+    sys.stdout.write("\n".join(out) + "\n")
+    return EXIT_OK
+
+
+def cmd_path(args):
+    root = find_root(args.root)
+    _run_id, run_dir = resolve_run(root, args.run)
+    sys.stdout.write(run_dir + "\n")
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------- cli
+
+
+def add_root(parser):
+    parser.add_argument(
+        "--root",
+        default=None,
+        metavar="DIR",
+        help="repo root. Default: HYPERPOWER_REPO_ROOT, then the git top level",
+    )
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="hp-journal",
+        description=(
+            "Write the run journal under .hyperpower/runs/<run-id>/. Every append is "
+            "atomic, so parallel agents can write the same run."
+        ),
+        epilog="Record shapes are documented in JOURNAL.md beside this script.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    new = subparsers.add_parser(
+        "new", help="create a run folder and meta.json, then print the run id"
+    )
+    add_root(new)
+    new.add_argument(
+        "--task-class",
+        default=None,
+        metavar="C",
+        help="task class the router picked. Recorded as null when omitted.",
+    )
+    new.add_argument(
+        "--base",
+        default=None,
+        metavar="SHA",
+        help="base sha the run works against. Default: git rev-parse HEAD",
+    )
+    new.add_argument("--json", action="store_true", help="print the id and path as JSON")
+    new.set_defaults(handler=cmd_new)
+
+    step = subparsers.add_parser("step", help="write a step's output contract")
+    add_root(step)
+    step.add_argument("run", help="run id, or latest")
+    step.add_argument("step", help="one of: " + ", ".join(STEPS))
+    group = step.add_mutually_exclusive_group(required=True)
+    group.add_argument("--file", metavar="F", help="JSON file holding the contract")
+    group.add_argument("--stdin", action="store_true", help="read the contract from stdin")
+    step.set_defaults(handler=cmd_step)
+
+    usage = subparsers.add_parser("usage", help="append one usage record")
+    add_root(usage)
+    usage.add_argument("run", help="run id, or latest")
+    usage.add_argument(
+        "--stage",
+        required=True,
+        metavar="S",
+        help="pipeline stage, or gate:<name> for a gate result",
+    )
+    usage.add_argument("--agent", default=None, metavar="A", help="agent role that called")
+    usage.add_argument("--model", default=None, metavar="M", help="model id")
+    usage.add_argument("--input", type=int, default=None, metavar="N", help="input tokens")
+    usage.add_argument(
+        "--output", type=int, default=None, metavar="N", help="output tokens"
+    )
+    usage.add_argument(
+        "--cache-read",
+        type=int,
+        default=0,
+        metavar="N",
+        dest="cache_read",
+        help="cached input tokens read. Counted separately from --input.",
+    )
+    usage.add_argument(
+        "--duration-ms",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="duration_ms",
+        help="wall clock for the call",
+    )
+    usage.add_argument(
+        "--outcome", default="ok", metavar="O", help="ok for a pass, else a short reason"
+    )
+    usage.set_defaults(handler=cmd_usage)
+
+    mistake = subparsers.add_parser("mistake", help="append one failure event")
+    add_root(mistake)
+    mistake.add_argument("run", help="run id, or latest")
+    mistake.add_argument(
+        "--kind", required=True, metavar="K", help="one of: " + ", ".join(MISTAKE_KINDS)
+    )
+    mistake.add_argument(
+        "--key",
+        required=True,
+        metavar="K",
+        help="stable kebab-case slug naming the cause, not the instance",
+    )
+    mistake.add_argument(
+        "--ref",
+        default=None,
+        metavar="R",
+        help="repo-relative path to the evidence. Default: the run's meta.json",
+    )
+    mistake.set_defaults(handler=cmd_mistake)
+
+    hashes = subparsers.add_parser("hash", help="compute and store a step's cache key")
+    add_root(hashes)
+    hashes.add_argument("run", help="run id, or latest")
+    hashes.add_argument("step", help="one of: " + ", ".join(STEPS))
+    hashes.add_argument(
+        "--files",
+        action="append",
+        default=None,
+        metavar="F1,F2",
+        help="files the step read. Repeatable, and comma-separated.",
+    )
+    hashes.add_argument(
+        "--files-from",
+        default=None,
+        metavar="FILE",
+        dest="files_from",
+        help="file holding one path per line. Use it when a path holds a comma.",
+    )
+    hashes.add_argument(
+        "--prompt-file", default=None, metavar="F", dest="prompt_file",
+        help="file holding the prompt. Its sha256 becomes prompt_hash.",
+    )
+    hashes.add_argument("--prompt", default=None, metavar="TEXT", help="the prompt text")
+    hashes.add_argument(
+        "--prompt-hash",
+        default=None,
+        metavar="H",
+        dest="prompt_hash",
+        help="a prompt digest computed elsewhere",
+    )
+    hashes.add_argument(
+        "--json", action="store_true", help="print the whole cache key block"
+    )
+    hashes.set_defaults(handler=cmd_hash)
+
+    drift = subparsers.add_parser(
+        "drift", help="re-hash the working tree and report per-step drift"
+    )
+    add_root(drift)
+    drift.add_argument("run", help="run id, or latest")
+    drift.add_argument(
+        "--from",
+        default=None,
+        metavar="STEP",
+        dest="from_step",
+        help="report up to this step, in the format /hyperpower:resume prints",
+    )
+    drift.add_argument("--json", action="store_true", help="print the full comparison")
+    drift.set_defaults(handler=cmd_drift)
+
+    finish = subparsers.add_parser("finish", help="stamp the run outcome")
+    add_root(finish)
+    finish.add_argument("run", help="run id, or latest")
+    finish.add_argument(
+        "--outcome", required=True, metavar="O", help="one of: " + ", ".join(RUN_OUTCOMES)
+    )
+    finish.set_defaults(handler=cmd_finish)
+
+    listing = subparsers.add_parser("list", help="list recorded runs, newest first")
+    add_root(listing)
+    listing.add_argument(
+        "--limit", type=int, default=20, metavar="N", help="rows to print. Default 20."
+    )
+    listing.add_argument("--json", action="store_true", help="print the rows as JSON")
+    listing.set_defaults(handler=cmd_list)
+
+    where = subparsers.add_parser("path", help="print the path to a run folder")
+    add_root(where)
+    where.add_argument("run", help="run id, or latest")
+    where.set_defaults(handler=cmd_path)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "handler", None):
+        parser.print_help()
+        return EXIT_ERROR
+    try:
+        return args.handler(args)
+    except JournalError as exc:
+        sys.stderr.write("hp-journal: {}\n".format(exc))
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())

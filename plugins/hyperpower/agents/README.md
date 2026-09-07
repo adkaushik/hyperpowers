@@ -7,6 +7,9 @@ not when a name would be nice.
 
 | File | Frontmatter `name` | Spawn as | Model | Job |
 |---|---|---|---|---|
+| `mapper.md` | `mapper` | `hyperpower:mapper` | inherit | Map the affected code read-only, and select the rulebook rules it triggers |
+| `planner.md` | `planner` | `hyperpower:planner` | inherit | Turn the map into typed tasks, tests first, with checkable acceptance |
+| `designer.md` | `designer` | `hyperpower:designer` | inherit | Write the spec, build the mock, get it locked, write the build brief |
 | `builder.md` | `builder` | `hyperpower:builder` | opus | Implement one task from a typed contract, test first |
 | `reviewer.md` | `reviewer` | `hyperpower:reviewer` | opus | Review one slice of a partitioned diff, extract undeclared assumptions |
 | `skeptic.md` | `skeptic` | `hyperpower:skeptic` | opus | Try to refute one finding. CONFIRMED, PLAUSIBLE, or REFUTED |
@@ -23,6 +26,10 @@ output the pipeline cannot read. That failure is silent.
 
 `hyperpower:builder`, `hyperpower:reviewer`, and `hyperpower:skeptic` run inside the
 pipeline. They are on the critical path and use `models.judgment`.
+
+`hyperpower:mapper`, `hyperpower:planner`, and `hyperpower:designer` are on the critical
+path too, and set `model: inherit`. They run on the tier the route contract picked for
+their stage, which `task-classes.yml` sets per class. A pinned model would ignore it.
 
 `hyperpower:archivist`, `hyperpower:promoter`, and `hyperpower:gardener` run off the
 critical path. They cost a normal run nothing. Two more background agents ship as skills

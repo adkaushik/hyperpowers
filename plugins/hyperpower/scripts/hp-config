@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""hp-config - print the effective hyperpower config as JSON.
+
+Reads hyperpower.yml at the repo root, then merges hyperpower.local.yml over it field by
+field. A field in neither file falls back to the built-in default in SCHEMA.
+
+Python 3 standard library only. No third-party imports, no network access.
+
+Exit codes: 0 printed, 1 bad input or unparseable file, 78 no hyperpower.yml.
+"""
+
+import argparse
+import copy
+import hashlib
+import json
+import os
+import sys
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_NO_CONFIG = 78
+
+CONFIG_NAME = "hyperpower.yml"
+LOCAL_NAME = "hyperpower.local.yml"
+DEFAULT_SOURCE = "default"
+
+NO_CONFIG_MESSAGE = (
+    "No {} found. Run /hyperpower:init to create one. "
+    "The harness does not guess a config.".format(CONFIG_NAME)
+)
+
+# The whole config surface. docs/configuration.md is the authority for this table.
+# A key absent from here is not in the schema and is reported, never merged.
+SCHEMA = {
+    "version": 1,
+    "project": {
+        "name": None,
+        "type": "other",
+        "languages": [],
+        "package_manager": None,
+    },
+    "paths": {
+        "source": [],
+        "tests": [],
+        "docs": [],
+        "ignore": [],
+    },
+    "commands": {
+        "install": None,
+        "typecheck": None,
+        "test": None,
+        "test_scoped": None,
+        "lint": None,
+        "build": None,
+        "dev_server": None,
+        "dev_url": None,
+        "e2e": None,
+    },
+    "gates": {
+        "types": {"enabled": True, "blocking": True, "reason": None},
+        "unit": {"enabled": True, "blocking": True, "reason": None},
+        "lint": {"enabled": True, "blocking": False, "reason": None},
+        "build": {"enabled": True, "blocking": True, "reason": None},
+        "slop": {"enabled": True, "blocking": True, "profile": "core", "reason": None},
+        "e2e": {"enabled": False, "blocking": False, "reason": None},
+        "browser": {"enabled": False, "blocking": False, "reason": None},
+        "a11y": {"enabled": False, "blocking": False, "reason": None},
+        "visual": {"enabled": False, "blocking": False, "reason": None},
+    },
+    "models": {
+        "judgment": "claude-opus-5",
+        "mechanical": "claude-haiku-4-5",
+    },
+    "limits": {
+        "rulebook_max_rules": 30,
+        "fix_loop_max_rounds": 5,
+        "scout_max_new_per_run": 3,
+        "janitor_max_new_per_run": 5,
+        "gate_timeout_seconds": 600,
+    },
+    "memory": {
+        "decisions_dir": "decisions/",
+        "archivist": True,
+        "promoter": True,
+    },
+    "telemetry": {
+        "enabled": True,
+        "destination": "local",
+        "redact_paths": True,
+    },
+    "voice": {
+        "adhd_shaping": True,
+        "plain_english": True,
+    },
+}
+
+
+class ConfigError(Exception):
+    """A config file could not be read, parsed, or trusted."""
+
+    def __init__(self, message, path=None, line=None):
+        Exception.__init__(self, message)
+        self.message = message
+        self.path = path
+        self.line = line
+
+    def render(self):
+        where = ""
+        if self.path is not None:
+            where = str(self.path)
+            if self.line is not None:
+                where = "{}:{}".format(where, self.line)
+            where = where + ": "
+        return where + self.message
+
+
+# ------------------------------------------------------------------ yaml subset
+
+
+def _strip_comment(line):
+    """Drop a trailing # comment. A # inside quotes, or not preceded by space, stays."""
+    quote = None
+    for index, char in enumerate(line):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            continue
+        if char == "#" and (index == 0 or line[index - 1] in " \t"):
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def _unquote(text, path, line):
+    quote = text[0]
+    if len(text) < 2 or text[-1] != quote:
+        raise ConfigError(
+            "unterminated quoted string: {}".format(text), path=path, line=line
+        )
+    body = text[1:-1]
+    if quote == "'":
+        return body.replace("''", "'")
+    escapes = {
+        "n": "\n",
+        "t": "\t",
+        "r": "\r",
+        "\\": "\\",
+        '"': '"',
+        "/": "/",
+        " ": " ",
+    }
+    out = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(body):
+            raise ConfigError(
+                "trailing backslash in a double-quoted string", path=path, line=line
+            )
+        nxt = body[index + 1]
+        if nxt not in escapes:
+            raise ConfigError(
+                "unsupported escape \\{} in a double-quoted string".format(nxt),
+                path=path,
+                line=line,
+            )
+        out.append(escapes[nxt])
+        index += 2
+    return "".join(out)
+
+
+def _is_int(text):
+    body = text[1:] if text[:1] in "+-" else text
+    return bool(body) and body.isdigit()
+
+
+def _is_float(text):
+    body = text[1:] if text[:1] in "+-" else text
+    if body.count(".") != 1:
+        return False
+    whole, _, rest = body.partition(".")
+    exponent = ""
+    for marker in ("e", "E"):
+        if marker in rest:
+            rest, _, exponent = rest.partition(marker)
+            break
+    if exponent[:1] in "+-":
+        exponent = exponent[1:]
+    if exponent and not exponent.isdigit():
+        return False
+    if not whole and not rest:
+        return False
+    return (not whole or whole.isdigit()) and (not rest or rest.isdigit())
+
+
+def _scalar(text, path, line):
+    body = text.strip()
+    if body == "":
+        return None
+    first = body[0]
+    if first in "&*!":
+        raise ConfigError(
+            "anchors, aliases and tags are not supported. Quote the value if it is a "
+            "string: {}".format(body),
+            path=path,
+            line=line,
+        )
+    if first in "|>":
+        raise ConfigError(
+            "block scalars are not supported. Put the value on one line: {}".format(body),
+            path=path,
+            line=line,
+        )
+    if first in "\"'":
+        return _unquote(body, path, line)
+    lowered = body.lower()
+    if lowered in ("null", "~"):
+        return None
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if _is_int(body):
+        return int(body)
+    if _is_float(body):
+        return float(body)
+    return body
+
+
+def _split_flow(body, path, line):
+    """Split a flow body on top-level commas. Quotes and nested brackets are respected."""
+    parts = []
+    current = []
+    depth = 0
+    quote = None
+    for char in body:
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+            continue
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth < 0:
+                raise ConfigError(
+                    "unbalanced brackets in an inline value", path=path, line=line
+                )
+        if char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    if quote is not None:
+        raise ConfigError("unterminated quoted string", path=path, line=line)
+    if depth != 0:
+        raise ConfigError("unbalanced brackets in an inline value", path=path, line=line)
+    tail = "".join(current)
+    if tail.strip():
+        parts.append(tail)
+    elif parts:
+        raise ConfigError(
+            "empty entry in an inline value. Remove the trailing comma.",
+            path=path,
+            line=line,
+        )
+    return parts
+
+
+def _split_key(text):
+    """Return (key, rest) for a 'key: value' line, or (None, None)."""
+    quote = None
+    depth = 0
+    for index, char in enumerate(text):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            continue
+        if char in "[{":
+            depth += 1
+            continue
+        if char in "]}":
+            depth -= 1
+            continue
+        if char == ":" and depth == 0:
+            if index + 1 == len(text) or text[index + 1] in " \t":
+                return text[:index].strip(), text[index + 1 :].strip()
+    return None, None
+
+
+def _key_name(raw, path, line):
+    if raw == "":
+        raise ConfigError("empty key", path=path, line=line)
+    if raw[0] in "\"'":
+        return _unquote(raw, path, line)
+    return raw
+
+
+def _parse_flow(text, path, line):
+    body = text.strip()
+    if body.startswith("{"):
+        if not body.endswith("}"):
+            raise ConfigError("unterminated inline map", path=path, line=line)
+        result = {}
+        for part in _split_flow(body[1:-1], path, line):
+            key, rest = _split_key(part.strip())
+            if key is None:
+                raise ConfigError(
+                    "inline map entry is not 'key: value': {}".format(part.strip()),
+                    path=path,
+                    line=line,
+                )
+            name = _key_name(key, path, line)
+            if name in result:
+                raise ConfigError(
+                    "duplicate key in inline map: {}".format(name), path=path, line=line
+                )
+            result[name] = _parse_value(rest, path, line)
+        return result
+    if body.startswith("["):
+        if not body.endswith("]"):
+            raise ConfigError("unterminated inline list", path=path, line=line)
+        return [
+            _parse_value(part.strip(), path, line)
+            for part in _split_flow(body[1:-1], path, line)
+        ]
+    return _scalar(body, path, line)
+
+
+def _parse_value(text, path, line):
+    body = text.strip()
+    if body.startswith("{") or body.startswith("["):
+        return _parse_flow(body, path, line)
+    return _scalar(body, path, line)
+
+
+def _scan(text, path):
+    lines = []
+    started = False
+    for number, raw in enumerate(text.splitlines(), 1):
+        stripped = _strip_comment(raw)
+        body = stripped.strip()
+        if body == "":
+            continue
+        if body in ("---", "..."):
+            if body == "---" and not lines and not started:
+                started = True
+                continue
+            raise ConfigError(
+                "multiple YAML documents are not supported", path=path, line=number
+            )
+        indent_text = stripped[: len(stripped) - len(stripped.lstrip(" \t"))]
+        if "\t" in indent_text:
+            raise ConfigError("tab in indentation. Use spaces.", path=path, line=number)
+        lines.append((len(indent_text), body, number))
+    return lines
+
+
+def _parse_sequence(lines, index, indent, path):
+    items = []
+    while index < len(lines):
+        line_indent, text, number = lines[index]
+        if line_indent != indent or not (text == "-" or text.startswith("- ")):
+            break
+        body = "" if text == "-" else text[2:].strip()
+        if body == "":
+            raise ConfigError(
+                "a list item with no value is not supported. Lists hold scalars.",
+                path=path,
+                line=number,
+            )
+        if not body.startswith("{") and not body.startswith("["):
+            key, _ = _split_key(body)
+            if key is not None:
+                raise ConfigError(
+                    "a list of maps is not supported: {}".format(body),
+                    path=path,
+                    line=number,
+                )
+        items.append(_parse_value(body, path, number))
+        index += 1
+    return items, index
+
+
+def _parse_block(lines, index, indent, path):
+    if index < len(lines):
+        text = lines[index][1]
+        if text == "-" or text.startswith("- "):
+            return _parse_sequence(lines, index, indent, path)
+
+    mapping = {}
+    while index < len(lines):
+        line_indent, text, number = lines[index]
+        if line_indent < indent:
+            break
+        if line_indent > indent:
+            raise ConfigError("unexpected indentation", path=path, line=number)
+        if text == "-" or text.startswith("- "):
+            raise ConfigError(
+                "list item where a 'key: value' line was expected", path=path, line=number
+            )
+        key, rest = _split_key(text)
+        if key is None:
+            raise ConfigError(
+                "expected 'key: value': {}".format(text), path=path, line=number
+            )
+        name = _key_name(key, path, number)
+        if name in mapping:
+            raise ConfigError("duplicate key: {}".format(name), path=path, line=number)
+        index += 1
+        if rest != "":
+            mapping[name] = _parse_value(rest, path, number)
+            continue
+        if index < len(lines) and lines[index][0] > line_indent:
+            child, index = _parse_block(lines, index, lines[index][0], path)
+            mapping[name] = child
+            continue
+        if index < len(lines) and lines[index][0] == line_indent:
+            nxt = lines[index][1]
+            if nxt == "-" or nxt.startswith("- "):
+                child, index = _parse_sequence(lines, index, line_indent, path)
+                mapping[name] = child
+                continue
+        mapping[name] = None
+    return mapping, index
+
+
+def parse_yaml(text, path=None):
+    """Parse the YAML subset hyperpower.yml uses. Raise ConfigError on anything else.
+
+    Supported: nested maps, block lists of scalars, inline maps, inline lists, quoted and
+    unquoted scalars, null, booleans, integers, floats, and # comments.
+
+    Not supported, and rejected with the line number: anchors, aliases, tags, block
+    scalars, lists of maps, multiple documents, and tabs in indentation.
+    """
+    lines = _scan(text, path)
+    if not lines:
+        return {}
+    parsed, index = _parse_block(lines, 0, lines[0][0], path)
+    if index != len(lines):
+        raise ConfigError("unexpected indentation", path=path, line=lines[index][2])
+    if not isinstance(parsed, dict):
+        raise ConfigError("the top level of the file must be a map", path=path, line=1)
+    return parsed
+
+
+def read_yaml_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise ConfigError("cannot read the file: {}".format(exc.strerror), path=path)
+    return parse_yaml(text, path=path)
+
+
+# --------------------------------------------------------------------- merging
+
+
+def _walk_leaves(node, prefix=""):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child = key if prefix == "" else "{}.{}".format(prefix, key)
+            for item in _walk_leaves(value, child):
+                yield item
+    else:
+        yield prefix, node
+
+
+def _lookup(tree, dotted):
+    node = tree
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False, None
+        node = node[part]
+    return True, node
+
+
+def _merge_into(target, incoming, schema, filename, prefix, unknown, type_errors):
+    """Merge one file's tree onto target, per field, guided by schema."""
+    for key, value in incoming.items():
+        dotted = key if prefix == "" else "{}.{}".format(prefix, key)
+        if key not in schema:
+            unknown.append({"path": dotted, "file": filename, "value": value})
+            continue
+        expected = schema[key]
+        if isinstance(expected, dict):
+            if isinstance(value, dict):
+                _merge_into(
+                    target[key], value, expected, filename, dotted, unknown, type_errors
+                )
+            else:
+                type_errors.append(
+                    {
+                        "path": dotted,
+                        "file": filename,
+                        "expected": "map",
+                        "found": _type_name(value),
+                        "detail": "the default map is kept",
+                    }
+                )
+            continue
+        if not _type_matches(expected, value):
+            type_errors.append(
+                {
+                    "path": dotted,
+                    "file": filename,
+                    "expected": _type_name(expected),
+                    "found": _type_name(value),
+                    "detail": "the value in the file is used as written",
+                }
+            )
+        target[key] = value
+
+
+def _type_name(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "map"
+    return "string"
+
+
+def _type_matches(expected, value):
+    if value is None:
+        return True
+    if expected is None:
+        return True
+    if isinstance(expected, bool):
+        return isinstance(value, bool)
+    if isinstance(expected, int):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(expected, list):
+        return isinstance(value, list)
+    return isinstance(value, str)
+
+
+def config_hash(config):
+    """Stable digest of an effective config. Key order does not change it."""
+    body = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def find_root(start=None):
+    """Nearest directory at or above start holding hyperpower.yml. None when there is none."""
+    current = os.path.abspath(start or os.getcwd())
+    while True:
+        if os.path.isfile(os.path.join(current, CONFIG_NAME)):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def load(root=None):
+    """Read both config files and return the effective config with its provenance.
+
+    Raise ConfigError when hyperpower.yml is absent or either file cannot be parsed.
+    """
+    if root is None:
+        found = find_root()
+        if found is None:
+            raise ConfigError(NO_CONFIG_MESSAGE)
+        root = found
+    root = os.path.abspath(root)
+    config_path = os.path.join(root, CONFIG_NAME)
+    if not os.path.isfile(config_path):
+        raise ConfigError(NO_CONFIG_MESSAGE, path=config_path)
+    local_path = os.path.join(root, LOCAL_NAME)
+
+    base = read_yaml_file(config_path)
+    local = read_yaml_file(local_path) if os.path.isfile(local_path) else None
+
+    effective = copy.deepcopy(SCHEMA)
+    unknown = []
+    type_errors = []
+    _merge_into(effective, base, SCHEMA, CONFIG_NAME, "", unknown, type_errors)
+    if local is not None:
+        _merge_into(effective, local, SCHEMA, LOCAL_NAME, "", unknown, type_errors)
+
+    sources = {}
+    for dotted, _value in _walk_leaves(effective):
+        if local is not None and _lookup(local, dotted)[0]:
+            sources[dotted] = LOCAL_NAME
+        elif _lookup(base, dotted)[0]:
+            sources[dotted] = CONFIG_NAME
+        else:
+            sources[dotted] = DEFAULT_SOURCE
+
+    overrides = []
+    if local is not None:
+        for dotted, value in _walk_leaves(effective):
+            if sources[dotted] != LOCAL_NAME:
+                continue
+            present, was = _lookup(base, dotted)
+            if not present:
+                _present_default, was = _lookup(SCHEMA, dotted)
+            if was != value:
+                overrides.append({"path": dotted, "from": was, "to": value})
+
+    return {
+        "root": root,
+        "files": {
+            "config": config_path,
+            "local": local_path if local is not None else None,
+        },
+        "config": effective,
+        "sources": sources,
+        "overrides": overrides,
+        "unknown_keys": unknown,
+        "type_errors": type_errors,
+        "hash": config_hash(effective),
+    }
+
+
+# ------------------------------------------------------------------------- cli
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="hp-config",
+        description=(
+            "Print the effective hyperpower config as JSON. Reads hyperpower.yml, then "
+            "merges hyperpower.local.yml over it field by field."
+        ),
+        epilog=(
+            "Exit 0 printed. Exit 1 bad input or an unparseable file, with the file name "
+            "and line number. Exit 78 no hyperpower.yml."
+        ),
+    )
+    parser.add_argument(
+        "--root",
+        default=None,
+        metavar="DIR",
+        help="repo root holding hyperpower.yml. Default: the nearest one at or above the "
+        "working directory",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print one compact line instead of indented JSON",
+    )
+    parser.add_argument(
+        "--source",
+        action="store_true",
+        help="print an envelope naming the file each field came from, plus unknown keys",
+    )
+    parser.add_argument(
+        "--hash",
+        action="store_true",
+        help="print the config hash alone. This is the value meta.json records.",
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        loaded = load(args.root)
+    except ConfigError as exc:
+        sys.stderr.write("hp-config: " + exc.render() + "\n")
+        if exc.message == NO_CONFIG_MESSAGE:
+            return EXIT_NO_CONFIG
+        return EXIT_ERROR
+
+    if args.hash:
+        sys.stdout.write(loaded["hash"] + "\n")
+        return EXIT_OK
+
+    payload = loaded if args.source else loaded["config"]
+    if args.json:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    else:
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3
+"""Gate runner for the hyperpower harness.
+
+Runs every enabled gate, writes the aggregate to the run journal, and exits non-zero when a
+blocking gate failed. Python 3.8 or newer, standard library only. No third-party imports.
+
+Config comes from `hp-config --json`. This script never parses YAML.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+PLUGIN_DIR = SCRIPTS_DIR.parent
+GATES_DIR = PLUGIN_DIR / "gates"
+
+EXIT_OK = 0
+EXIT_BLOCKED = 1
+EXIT_ERROR = 2
+EXIT_UNVERIFIED = 78
+
+GATE_DID_NOT_RUN = 78
+
+PASS = "pass"
+FAIL = "fail"
+DID_NOT_RUN = "did_not_run"
+
+RESULT_LABEL = {PASS: "pass", FAIL: "fail", DID_NOT_RUN: "did not run"}
+
+OUTCOME = {PASS: "ok", FAIL: "fail", DID_NOT_RUN: "did_not_run"}
+
+DISABLED = "gate disabled in hyperpower.yml"
+
+BLOCK_ROWS = 5
+
+DEFAULT_TIMEOUT = 600
+KILL_GRACE_SECONDS = 5
+EVIDENCE_LINES = 20
+EVIDENCE_COLUMNS = 200
+
+
+# ---------------------------------------------------------------- utilities
+
+
+def fail(message, code=EXIT_ERROR):
+    """Print the cause and the fix to stderr, then exit."""
+    sys.stderr.write("error: " + message.rstrip() + "\n")
+    raise SystemExit(code)
+
+
+def note(message):
+    sys.stderr.write("note: " + message.rstrip() + "\n")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def is_false(value):
+    """True only for a literal false. A missing value is not false."""
+    if value is False:
+        return True
+    return isinstance(value, str) and value.strip().lower() == "false"
+
+
+def shell_quote(path):
+    """Single-quote one path the way gates/_lib.sh does."""
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def fmt_duration(ms):
+    seconds = ms / 1000.0
+    if seconds < 60:
+        return "%.1fs" % seconds
+    minutes = int(seconds // 60)
+    return "%dm %02ds" % (minutes, int(round(seconds - minutes * 60)))
+
+
+def tail_text(blob, lines=EVIDENCE_LINES, columns=EVIDENCE_COLUMNS):
+    text = blob.decode("utf-8", "replace") if isinstance(blob, bytes) else (blob or "")
+    kept = [line[:columns] for line in text.splitlines() if line.strip()]
+    if not kept:
+        return ""
+    return "\n".join(kept[-lines:])
+
+
+def under(path, base):
+    """Path relative to base when it sits inside it. Absolute otherwise."""
+    try:
+        return str(Path(path).resolve().relative_to(Path(base).resolve()))
+    except ValueError:
+        return str(path)
+
+
+def one_line(text, limit=160):
+    flat = " ".join((text or "").split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 3] + "..."
+
+
+# ---------------------------------------------------------------- locate
+
+
+def resolve_root():
+    env_root = os.environ.get("HYPERPOWER_REPO_ROOT", "").strip()
+    if env_root:
+        candidate = Path(env_root).expanduser()
+        if candidate.is_dir():
+            return candidate.resolve()
+        fail("HYPERPOWER_REPO_ROOT is set to %s, which is not a directory." % env_root)
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        top = out.stdout.decode("utf-8", "replace").strip()
+        if out.returncode == 0 and top:
+            return Path(top).resolve()
+    except OSError:
+        pass
+    return Path.cwd().resolve()
+
+
+def find_helper(name):
+    """Find a sibling kernel script: next to this file, in the plugin, then on PATH."""
+    local = SCRIPTS_DIR / name
+    if local.is_file():
+        return local
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
+    if plugin_root:
+        candidate = Path(plugin_root) / "scripts" / name
+        if candidate.is_file():
+            return candidate
+    found = shutil.which(name)
+    if found:
+        return Path(found)
+    return None
+
+
+def interpreter_argv(path):
+    """Argv that runs a script whether or not its executable bit survived the checkout."""
+    path = Path(path)
+    if os.access(str(path), os.X_OK):
+        return [str(path)]
+    first = ""
+    try:
+        with open(str(path), "rb") as handle:
+            first = handle.readline().decode("utf-8", "replace")
+    except OSError:
+        return [str(path)]
+    if first.startswith("#!") and "python" in first:
+        return [sys.executable, str(path)]
+    return ["/bin/sh", str(path)]
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_config(args, root):
+    """Return the effective config as a dict. hp-config owns the YAML parsing."""
+    if args.config:
+        path = Path(args.config).expanduser()
+        if not path.is_file():
+            fail("--config %s does not exist." % args.config)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            fail("--config %s is not readable JSON: %s" % (args.config, exc))
+        return unwrap_config(raw, "--config %s" % args.config)
+
+    helper = find_helper("hp-config")
+    if helper is None:
+        fail(
+            "hp-config was not found next to this script, under CLAUDE_PLUGIN_ROOT, or on "
+            "PATH. Pass --config <file.json> to supply the config directly."
+        )
+    proc = subprocess.run(
+        interpreter_argv(helper) + ["--root", str(root), "--json"],
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode == GATE_DID_NOT_RUN:
+        fail("no hyperpower.yml at %s. Run /hyperpower:init." % root)
+    if proc.returncode != 0:
+        detail = tail_text(proc.stderr, lines=5) or "no stderr"
+        fail("hp-config exited %d in %s.\n%s" % (proc.returncode, root, detail))
+    try:
+        raw = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except ValueError as exc:
+        fail("hp-config --json did not print JSON: %s" % exc)
+    return unwrap_config(raw, "hp-config --json")
+
+
+def unwrap_config(raw, source):
+    if not isinstance(raw, dict):
+        fail("%s returned %s, not a JSON object." % (source, type(raw).__name__))
+    if "gates" in raw:
+        return raw
+    inner = raw.get("config")
+    if isinstance(inner, dict) and "gates" in inner:
+        note("%s nested the config under `config`. Reading that." % source)
+        return inner
+    fail(
+        "%s returned no `gates` map. Add a gates: section to hyperpower.yml, or run "
+        "/hyperpower:init." % source
+    )
+
+
+def section(cfg, name):
+    value = cfg.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        fail("config key `%s` is a %s. It must be a map." % (name, type(value).__name__))
+    return value
+
+
+def gate_timeout(cfg):
+    limits = section(cfg, "limits")
+    value = limits.get("gate_timeout_seconds", DEFAULT_TIMEOUT)
+    if value is None:
+        return DEFAULT_TIMEOUT
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        fail("limits.gate_timeout_seconds is %r. It must be a whole number of seconds." % value)
+    if seconds <= 0:
+        fail("limits.gate_timeout_seconds is %d. It must be greater than zero." % seconds)
+    return seconds
+
+
+def gate_entries(cfg, only):
+    """Ordered list of (name, entry map). Config order is run order."""
+    gates = section(cfg, "gates")
+    if not gates:
+        fail("hyperpower.yml has an empty gates map. Nothing to run.")
+    entries = []
+    for name, entry in gates.items():
+        if entry is None:
+            entry = {}
+        if not isinstance(entry, dict):
+            fail(
+                "gates.%s is a %s. Each gate is a map, such as "
+                "{ enabled: true, blocking: true }." % (name, type(entry).__name__)
+            )
+        entries.append((str(name), entry))
+    if only:
+        names = [name for name, _ in entries]
+        if only not in names:
+            if (GATES_DIR / ("%s.sh" % only)).is_file():
+                fail(
+                    "--only %s has a script at gates/%s.sh and no gates.%s entry in "
+                    "hyperpower.yml. Add one:\n  gates:\n    %s: { enabled: true, "
+                    "blocking: false }" % (only, only, only, only)
+                )
+            fail(
+                "--only %s is not configured. hyperpower.yml lists: %s"
+                % (only, ", ".join(names))
+            )
+        entries = [(name, entry) for name, entry in entries if name == only]
+    return entries
+
+
+# ---------------------------------------------------------------- file scope
+
+
+def raw_files(args, root):
+    if args.files:
+        return [part.strip() for part in args.files.split(",")]
+    listed = os.environ.get("HYPERPOWER_FILES_FILE", "").strip()
+    if listed and Path(listed).is_file():
+        return Path(listed).read_text(encoding="utf-8", errors="replace").splitlines()
+    inline = os.environ.get("HYPERPOWER_FILES", "").strip()
+    if inline:
+        return inline.split()
+    return git_files(root)
+
+
+def git_files(root):
+    out = []
+    for argv in (
+        ["git", "diff", "--name-only", "HEAD", "--"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ):
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=str(root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            return out
+        if proc.returncode == 0:
+            out.extend(proc.stdout.decode("utf-8", "replace").splitlines())
+    return out
+
+
+def ignore_patterns(cfg):
+    paths = section(cfg, "paths")
+    raw = paths.get("ignore") or []
+    if not isinstance(raw, list):
+        fail("paths.ignore is a %s. It must be a list." % type(raw).__name__)
+    patterns = []
+    for item in raw:
+        if item is None:
+            continue
+        text = str(item).rstrip("/")
+        if text.endswith("/*"):
+            text = text[:-2]
+        if text:
+            patterns.append(text)
+    return patterns
+
+
+def scope_files(args, cfg, root):
+    """Deduplicated, present on disk, not under paths.ignore. Same rule as gates/_lib.sh.
+
+    One addition: .hyperpower/ is dropped. It holds the run journal this command writes, so
+    a repo missing that gitignore entry would otherwise gate its own records.
+    """
+    patterns = ignore_patterns(cfg)
+    seen = set()
+    kept = []
+    for entry in raw_files(args, root):
+        path = entry.strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if path == ".hyperpower" or path.startswith(".hyperpower/"):
+            continue
+        if not (root / path).is_file():
+            continue
+        if any(
+            fnmatch.fnmatchcase(path, pat) or fnmatch.fnmatchcase(path, pat + "/*")
+            for pat in patterns
+        ):
+            continue
+        kept.append(path)
+    kept.sort()
+    return kept
+
+
+def substitute_commands(cfg, files, route):
+    """Replace {files} and {route} in commands. No other variable is substituted.
+
+    An empty value leaves its token in place, so the gate reports did_not_run instead of
+    running a command that lost its argument.
+    """
+    commands = section(cfg, "commands")
+    files_arg = " ".join(shell_quote(path) for path in files)
+    out = {}
+    for key, value in commands.items():
+        if not isinstance(value, str):
+            out[key] = value
+            continue
+        text = value
+        if "{files}" in text and files_arg:
+            text = text.replace("{files}", files_arg)
+        if "{route}" in text and route:
+            text = text.replace("{route}", route)
+        out[key] = text
+    merged = dict(cfg)
+    merged["commands"] = out
+    return merged
+
+
+def prompt_hash(cfg):
+    """Hash the gate plan: the raw commands and the gates map. Not the file scope."""
+    payload = {
+        "commands": section(cfg, "commands"),
+        "gates": section(cfg, "gates"),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------- run journal
+
+
+def finished(run_dir):
+    """True when meta.json records an outcome, so the run is over and its record is closed."""
+    try:
+        with open(str(run_dir / "meta.json"), encoding="utf-8") as handle:
+            return json.load(handle).get("outcome") is not None
+    except (OSError, ValueError):
+        return False
+
+
+def resolve_run(args, root):
+    """Return (run_id, run_dir). Both are None when this repo has no run to write into.
+
+    A named run is written to whatever its state. An unnamed one is only ever guessed at, so
+    the guess is refused in the two cases where it would destroy evidence: a --only probe,
+    which produces a one-gate aggregate that is not the run's gate result, and a run that
+    already finished, whose gates.json is what /hyperpower:why and the archivist read.
+    """
+    runs_dir = root / ".hyperpower" / "runs"
+    run_id = args.run or os.environ.get("HYPERPOWER_RUN_ID", "").strip()
+    if run_id:
+        return run_id, runs_dir / run_id
+    env_dir = os.environ.get("HYPERPOWER_RUN_DIR", "").strip()
+    if env_dir:
+        path = Path(env_dir).expanduser()
+        return path.name, path
+    if args.only:
+        note(
+            "--only with no --run is a probe. Its one-gate result is not the run's gate "
+            "aggregate, so nothing was recorded. Pass --run to record it."
+        )
+        return None, None
+    helper = find_helper("hp-journal")
+    if helper is not None:
+        proc = subprocess.run(
+            interpreter_argv(helper) + ["path", "latest", "--root", str(root)],
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        latest = proc.stdout.decode("utf-8", "replace").strip()
+        if proc.returncode == 0 and latest:
+            path = Path(latest)
+            if finished(path):
+                note(
+                    "the newest run %s already finished, so its gates.json was left alone. "
+                    "Nothing was recorded. Pass --run to write into it anyway." % path.name
+                )
+                return None, None
+            return path.name, path
+    if runs_dir.is_dir():
+        folders = [child for child in runs_dir.iterdir() if child.is_dir()]
+        if folders:
+            newest = max(folders, key=lambda child: child.stat().st_mtime)
+            if finished(newest):
+                note(
+                    "the newest run %s already finished, so its gates.json was left alone. "
+                    "Nothing was recorded. Pass --run to write into it anyway." % newest.name
+                )
+                return None, None
+            return newest.name, newest
+    return None, None
+
+
+class Journal:
+    """Records the gates step. hp-journal owns the format. Direct writes are the fallback.
+
+    The fallback exists so a gate result is never thrown away because a sibling script is
+    missing or changed its flags. It prints one note and then stops calling hp-journal.
+    """
+
+    def __init__(self, run_id, run_dir, root):
+        self.run_id = run_id
+        self.run_dir = run_dir
+        self.root = root
+        self.helper = find_helper("hp-journal")
+        if self.helper is None:
+            note("hp-journal was not found. Writing the run journal directly.")
+
+    def _call(self, argv, payload=None):
+        if self.helper is None:
+            return False
+        proc = subprocess.run(
+            interpreter_argv(self.helper) + argv + ["--root", str(self.root)],
+            cwd=str(self.root),
+            input=payload.encode("utf-8") if payload is not None else None,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        why = one_line(tail_text(proc.stderr, lines=3)) or "exit %d" % proc.returncode
+        note("hp-journal %s failed (%s). hp-gates writes the rest itself." % (argv[0], why))
+        self.helper = None
+        return False
+
+    def _mkdir(self):
+        try:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            return True
+        except OSError as exc:
+            note("could not create %s: %s" % (self.run_dir, exc))
+            return False
+
+    def write_step(self, name, payload):
+        if self._call(["step", self.run_id, name, "--stdin"], payload):
+            return True
+        if not self._mkdir():
+            return False
+        try:
+            (self.run_dir / ("%s.json" % name)).write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            note("could not write %s.json: %s" % (name, exc))
+            return False
+        return True
+
+    def write_cache_key(self, step, prompt_digest, scope_file):
+        """Store the step's cache key. Only hp-journal computes it. There is no fallback."""
+        stored = self._call(
+            [
+                "hash",
+                self.run_id,
+                step,
+                "--files-from",
+                str(scope_file),
+                "--prompt-hash",
+                prompt_digest,
+            ]
+        )
+        if not stored:
+            note(
+                "no cache key stored for the %s step. /hyperpower:resume cannot drift-check "
+                "it. prompt_hash and files_read are still in %s.json." % (step, step)
+            )
+
+    def append_usage(self, stage, duration_ms, outcome):
+        if self._call(
+            [
+                "usage",
+                self.run_id,
+                "--stage",
+                stage,
+                "--duration-ms",
+                str(duration_ms),
+                "--outcome",
+                outcome,
+            ]
+        ):
+            return True
+        if not self._mkdir():
+            return False
+        line = json.dumps(
+            {
+                "ts": now_iso(),
+                "stage": stage,
+                "duration_ms": duration_ms,
+                "outcome": outcome,
+            },
+            separators=(",", ":"),
+        )
+        try:
+            with open(str(self.run_dir / "usage.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            note("could not append to usage.jsonl: %s" % exc)
+            return False
+        return True
+
+
+# ---------------------------------------------------------------- execution
+
+
+def kill_group(proc, sig):
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def run_gate_script(script, payload, env, root, timeout):
+    """Run one gate. Returns (exit_code, stdout, stderr, duration_ms, timed_out)."""
+    started = time.time()
+    try:
+        proc = subprocess.Popen(
+            interpreter_argv(script),
+            cwd=str(root),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        elapsed = int((time.time() - started) * 1000)
+        return None, b"", str(exc).encode("utf-8"), elapsed, False
+    timed_out = False
+    try:
+        out, err = proc.communicate(input=payload.encode("utf-8"), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_group(proc, signal.SIGTERM)
+        try:
+            out, err = proc.communicate(timeout=KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            kill_group(proc, signal.SIGKILL)
+            try:
+                out, err = proc.communicate(timeout=KILL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                out, err = b"", b""
+    elapsed = int((time.time() - started) * 1000)
+    return proc.returncode, out, err, elapsed, timed_out
+
+
+def parse_result(stdout):
+    """Read the one JSON object a gate prints. Returns None when there is not one."""
+    text = stdout.decode("utf-8", "replace").strip() if isinstance(stdout, bytes) else stdout
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except ValueError:
+        pass
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def classify(exit_code, timed_out):
+    if timed_out:
+        return FAIL
+    if exit_code == 0:
+        return PASS
+    if exit_code == GATE_DID_NOT_RUN:
+        return DID_NOT_RUN
+    return FAIL
+
+
+def record_for(name, entry, script, timeout, exit_code, stdout, stderr, elapsed, timed_out):
+    """Build one journal record from what the gate script produced."""
+    blocking = not is_false(entry.get("blocking"))
+    parsed = parse_result(stdout)
+    result = classify(exit_code, timed_out)
+    detail = ""
+    evidence = ""
+    if parsed:
+        detail = str(parsed.get("detail") or "")
+        evidence = str(parsed.get("evidence") or "")
+        reported = str(parsed.get("result") or "").strip().lower()
+        if reported and reported != result and not timed_out:
+            if detail and detail[-1] not in ".!?":
+                detail += "."
+            if result == PASS:
+                # The gate exited 0 and reported something other than a pass. Its own word
+                # wins. An exit code never turns a gate's own non-pass into a pass, so a
+                # gate that could not run is never recorded as one that verified anything.
+                result = FAIL if reported == FAIL else DID_NOT_RUN
+                detail = (
+                    detail + " The gate exited 0 and reported result %s. hp-gates "
+                    "recorded %s, not a pass." % (reported, result)
+                ).strip()
+            else:
+                detail = (
+                    detail + " The gate reported result %s and exited %s. hp-gates used "
+                    "the exit code." % (reported, exit_code)
+                ).strip()
+
+    if timed_out:
+        detail = "timed out after %ds. hp-gates killed the gate." % timeout
+        evidence = tail_text(stderr) or evidence or "no output before the timeout"
+    elif exit_code is None:
+        result = DID_NOT_RUN
+        detail = "gate script could not be started"
+        evidence = tail_text(stderr) or str(script)
+    elif parsed and result == DID_NOT_RUN and "timed out after" in detail:
+        # The gate stopped its own command at limits.gate_timeout_seconds and reported 78.
+        # hp-gates records a timeout as a failure, whichever timer fired first, so one
+        # gate command never has two different results depending on a race.
+        result = FAIL
+        timed_out = True
+    elif not parsed:
+        stream = tail_text(stderr) or tail_text(stdout) or "no output"
+        if exit_code == 0:
+            result = DID_NOT_RUN
+            detail = (
+                "gate script exited 0 and printed no JSON result object, so its pass "
+                "could not be read"
+            )
+        elif exit_code == GATE_DID_NOT_RUN:
+            detail = "gate script exited 78 and printed no JSON result object"
+        elif exit_code < 0:
+            detail = "gate script was killed by signal %d" % -exit_code
+        else:
+            detail = "gate script exited %d and printed no JSON result object" % exit_code
+        evidence = stream
+
+    return {
+        "gate": name,
+        "result": result,
+        "detail": detail or "no detail reported",
+        "evidence": evidence,
+        "blocking": blocking,
+        "exit_code": exit_code,
+        "duration_ms": elapsed,
+        "timed_out": timed_out,
+        "script": under(script, PLUGIN_DIR),
+    }
+
+
+def skipped_record(name, entry, detail, evidence):
+    return {
+        "gate": name,
+        "result": DID_NOT_RUN,
+        "detail": detail,
+        "evidence": evidence,
+        "blocking": not is_false(entry.get("blocking")),
+        "exit_code": None,
+        "duration_ms": 0,
+        "timed_out": False,
+        "script": None,
+    }
+
+
+def log_mtime(run_dir, name):
+    """Modification time of this gate's log, or None when there is no log."""
+    if run_dir is None:
+        return None
+    try:
+        return (run_dir / "gates" / ("%s.log" % name)).stat().st_mtime
+    except OSError:
+        return None
+
+
+def with_log(evidence, path):
+    """Name the gate's log in the evidence. The gate names it itself when it got that far."""
+    line = "log: %s" % path
+    if not evidence:
+        return line
+    if line in evidence:
+        return evidence
+    return evidence + "\n" + line
+
+
+def one_gate(name, entry, cfg_json, timeout, env, root, run_dir):
+    """Run one gate, or say why it did not run. Never raises on a broken gate script."""
+    if is_false(entry.get("enabled")):
+        return skipped_record(name, entry, DISABLED, "gates.%s.enabled is false" % name)
+    script = GATES_DIR / ("%s.sh" % name)
+    if not script.is_file():
+        return skipped_record(
+            name,
+            entry,
+            "no gate script at gates/%s.sh" % name,
+            "write gates/%s.sh, or set gates.%s.enabled to false in hyperpower.yml"
+            % (name, name),
+        )
+    before = log_mtime(run_dir, name)
+    exit_code, out, err, elapsed, timed_out = run_gate_script(
+        script, cfg_json, env, root, timeout
+    )
+    record = record_for(
+        name, entry, script, timeout, exit_code, out, err, elapsed, timed_out
+    )
+    # A log an earlier attempt left behind is not evidence for this one, so the mtime has
+    # to have moved. A killed gate usually writes none, and then none is named.
+    after = log_mtime(run_dir, name)
+    if after is not None and (before is None or after > before):
+        record["evidence"] = with_log(
+            record["evidence"], under(run_dir / "gates" / ("%s.log" % name), root)
+        )
+    return record
+
+
+def run_gates(entries, cfg_json, timeout, env, root, run_dir):
+    """Every gate runs. One failure does not stop the next gate."""
+    records = []
+    for name, entry in entries:
+        stamp = now_iso()
+        record = one_gate(name, entry, cfg_json, timeout, env, root, run_dir)
+        record["ts"] = stamp
+        records.append(record)
+    return records
+
+
+# ---------------------------------------------------------------- output
+
+
+def summary_counts(records):
+    counts = {PASS: 0, FAIL: 0, DID_NOT_RUN: 0}
+    for record in records:
+        counts[record["result"]] += 1
+    counts["total"] = len(records)
+    return counts
+
+
+def blocking_failures(records):
+    return [r["gate"] for r in records if r["result"] == FAIL and r["blocking"]]
+
+
+def blocking_unverified(records):
+    """Blocking gates that could not run.
+
+    A gate that did not run is not a failure, but it is not a pass either. The exit
+    code is the only signal a shell caller, CI step or hook reads, so returning 0 here
+    would report a pass nobody verified. These get EXIT_UNVERIFIED instead.
+
+    A gate the user disabled is excluded. That is a deliberate choice, not an
+    unverified one.
+    """
+    return [
+        r["gate"]
+        for r in records
+        if r["result"] == DID_NOT_RUN and r["blocking"] and r["detail"] != DISABLED
+    ]
+
+
+def render_table(records, counts):
+    lines = []
+    headline = "Gates  %d passed, %d failed, %d did not run" % (
+        counts[PASS],
+        counts[FAIL],
+        counts[DID_NOT_RUN],
+    )
+    lines.append(headline)
+    lines.append("")
+    rows = [("gate", "result", "blocking", "duration")]
+    for record in records:
+        rows.append(
+            (
+                record["gate"],
+                RESULT_LABEL[record["result"]],
+                "blocking" if record["blocking"] else "warning",
+                fmt_duration(record["duration_ms"]),
+            )
+        )
+    widths = [max(len(row[i]) for row in rows) for i in range(3)]
+    duration_width = max(len(row[3]) for row in rows)
+    for row in rows:
+        lines.append(
+            "  %-*s  %-*s  %-*s  %*s"
+            % (
+                widths[0],
+                row[0],
+                widths[1],
+                row[1],
+                widths[2],
+                row[2],
+                duration_width,
+                row[3],
+            )
+        )
+    return lines
+
+
+def render_block(title, records, rest_at):
+    """One block of detail lines. Ranked, five shown, the remainder counted."""
+    if not records:
+        return []
+    width = max(len(record["gate"]) for record in records[:BLOCK_ROWS])
+    lines = ["", "%s  %d" % (title, len(records))]
+    for record in records[:BLOCK_ROWS]:
+        lines.append("  %-*s  %s" % (width, record["gate"], one_line(record["detail"])))
+    remainder = len(records) - BLOCK_ROWS
+    if remainder > 0:
+        lines.append("  +%d more in %s" % (remainder, rest_at))
+    return lines
+
+
+def rank_did_not_run(records):
+    """A gate that could not execute outranks one the config turned off on purpose."""
+    return sorted(records, key=lambda record: 1 if record["detail"] == DISABLED else 0)
+
+
+def render_next(records, blocked):
+    timed_out = [r["gate"] for r in records if r["timed_out"]]
+    lines = []
+    if blocked:
+        lines.append("  Fix %s, then run hp-gates again." % ", ".join(blocked))
+    if timed_out:
+        lines.append(
+            "  %s hit limits.gate_timeout_seconds. Raise it, or scope the command with "
+            "{files}." % ", ".join(timed_out)
+        )
+    absent = [
+        r["gate"]
+        for r in records
+        if r["result"] == DID_NOT_RUN and r["detail"] != DISABLED
+    ]
+    if absent and not blocked:
+        lines.append("  Run /hyperpower:doctor to see why %s did not run." % ", ".join(absent))
+    if not lines:
+        return []
+    return ["", "Next"] + lines
+
+
+def render(records, counts, blocked, rest_at):
+    lines = render_table(records, counts)
+    lines += render_block(
+        "Failed", [r for r in records if r["result"] == FAIL and r["blocking"]], rest_at
+    )
+    lines += render_block(
+        "Warned", [r for r in records if r["result"] == FAIL and not r["blocking"]], rest_at
+    )
+    lines += render_block(
+        "Did not run",
+        rank_did_not_run([r for r in records if r["result"] == DID_NOT_RUN]),
+        rest_at,
+    )
+    lines += render_next(records, blocked)
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------- main
+
+
+HELP_EPILOG = """\
+exit codes
+  0  no blocking gate failed
+  1  a blocking gate failed, or a blocking gate timed out
+  2  hp-gates could not run: bad flags, no config, or no gates configured
+
+results
+  pass          the gate script exited 0
+  fail          the gate script exited non-zero, or hp-gates killed it at the timeout
+  did not run   the gate script exited 78, is missing, or is disabled in config
+
+A did-not-run gate is never counted as a pass and never fails the run. A timeout is a
+failure: the gate is named in the Failed block with the timeout in seconds.
+
+selection
+  A gate runs when hyperpower.yml lists it under `gates:` and its `enabled` is not false.
+  Gates run in config order. A script in gates/ with no config entry never runs, and
+  --only on that name says how to register it.
+
+journal
+  hp-journal step <run> gates --stdin     writes .hyperpower/runs/<run>/gates.json
+  hp-journal hash <run> gates             stores the cache key resume drift-checks
+  hp-journal usage <run> --stage gate:<name>   one usage record per gate
+  the gate itself writes .hyperpower/runs/<run>/gates/<gate>.log
+
+hp-gates writes those files directly when hp-journal is missing or rejects a call. It says
+so once and carries on, because a gate result is evidence and is not thrown away.
+
+The run is --run, then HYPERPOWER_RUN_ID, then HYPERPOWER_RUN_DIR, then hp-journal path
+latest, then the newest folder under .hyperpower/runs. With none of those the gates still
+run and nothing is recorded. telemetry.enabled false suppresses the usage records only.
+gates.json is a step contract, so it is written whenever a run resolved.
+
+A run named by --run or by either variable is written to whatever its state. The last two
+fallbacks are guesses, and a guess is refused where it would destroy evidence:
+
+  --only with no --run   a one-gate aggregate is a probe, not the run's gate result
+  the newest run finished  its meta.json has an outcome, and gates.json is what
+                           /hyperpower:why and the archivist read
+
+Both print one note, record nothing, and still run the gates and print the report. Pass
+--run to write into either on purpose. /hyperpower:doctor probes with --only and no --run,
+which is why the first case exists.
+
+file scope
+  --files, then HYPERPOWER_FILES_FILE, then HYPERPOWER_FILES, then git diff against HEAD
+  plus untracked files. Paths that no longer exist, paths under paths.ignore, and paths
+  under .hyperpower/ are dropped. The scope is handed to every gate, so the gate counts the
+  files hp-gates substituted. An empty scope leaves {files} in the command, which makes the
+  gate report did_not_run instead of running against the whole repo.
+
+environment
+  HYPERPOWER_REPO_ROOT   directory the gates run in. Default: git rev-parse --show-toplevel
+  HYPERPOWER_FILES_FILE  one path per line. Read when --files is absent.
+  HYPERPOWER_FILES       whitespace-separated paths. Read when the two above are absent.
+  HYPERPOWER_ROUTE       value for {route}. Read when --route is absent.
+"""
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="hp-gates",
+        description=(
+            "Run every enabled hyperpower gate, record the aggregate in the run journal, "
+            "and exit non-zero when a blocking gate failed."
+        ),
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--run", metavar="RUN_ID", help="run journal folder to write into")
+    parser.add_argument(
+        "--files", metavar="F1,F2", help="comma-separated scope for {files}"
+    )
+    parser.add_argument("--route", metavar="R", help="value for {route}")
+    parser.add_argument("--only", metavar="GATE", help="run this one configured gate")
+    parser.add_argument(
+        "--json", action="store_true", help="print the aggregate JSON instead of the table"
+    )
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="read config from this JSON file instead of calling hp-config",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    root = resolve_root()
+    cfg = load_config(args, root)
+
+    timeout = gate_timeout(cfg)
+    entries = gate_entries(cfg, args.only)
+    files = scope_files(args, cfg, root)
+    route = args.route or os.environ.get("HYPERPOWER_ROUTE", "").strip()
+
+    run_id, run_dir = resolve_run(args, root)
+    if run_dir is None:
+        note(
+            "no run journal: pass --run <run-id>, or create one with hp-journal new. "
+            "The gates still run and nothing is recorded."
+        )
+
+    payload = json.dumps(substitute_commands(cfg, files, route), separators=(",", ":"))
+
+    env = dict(os.environ)
+    env["HYPERPOWER_REPO_ROOT"] = str(root)
+    env.pop("HYPERPOWER_FILES", None)
+    if run_dir is not None:
+        env["HYPERPOWER_RUN_DIR"] = under(run_dir, root)
+    if route:
+        env["HYPERPOWER_ROUTE"] = route
+    else:
+        # Same rule as HYPERPOWER_FILES: the route has one source. hp-gates left {route}
+        # unsubstituted and recorded route null, so a gate must not read a different route
+        # out of the environment and report a pass for a check it did not run.
+        env.pop("HYPERPOWER_ROUTE", None)
+
+    tmpdir = tempfile.mkdtemp(prefix="hp-gates-")
+    try:
+        scope_file = write_scope_file(files, tmpdir)
+        env["HYPERPOWER_FILES_FILE"] = str(scope_file)
+        started = time.time()
+        records = run_gates(entries, payload, timeout, env, root, run_dir)
+        elapsed = int((time.time() - started) * 1000)
+
+        counts = summary_counts(records)
+        blocked = blocking_failures(records)
+        unverified = blocking_unverified(records)
+        if blocked:
+            exit_code = EXIT_BLOCKED
+        elif unverified:
+            exit_code = EXIT_UNVERIFIED
+        else:
+            exit_code = EXIT_OK
+
+        aggregate = {
+            "step": "gates",
+            "run_id": run_id,
+            "ts": now_iso(),
+            "duration_ms": elapsed,
+            "exit_code": exit_code,
+            "counts": counts,
+            "blocking_failures": blocked,
+            "blocking_unverified": unverified,
+            "timeout_seconds": timeout,
+            "route": route or None,
+            "prompt_hash": prompt_hash(cfg),
+            "files_read": files,
+            "gates": records,
+            "assumptions": [],
+        }
+
+        rest_at = "hp-gates --json"
+        if run_dir is not None:
+            write_journal(aggregate, records, cfg, run_id, run_dir, root, scope_file)
+            rest_at = "%s/gates.json" % under(run_dir, root)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if args.json:
+        sys.stdout.write(json.dumps(aggregate, indent=2) + "\n")
+    else:
+        sys.stdout.write(render(records, counts, blocked, rest_at))
+    return exit_code
+
+
+def write_scope_file(files, tmpdir):
+    """Write the scope so every gate sees the exact list hp-gates substituted."""
+    path = Path(tmpdir) / "files.txt"
+    body = "\n".join(files)
+    path.write_text(body + "\n" if body else "", encoding="utf-8")
+    return path
+
+
+def write_journal(aggregate, records, cfg, run_id, run_dir, root, scope_file):
+    """Write gates.json, store the step's cache key, then append one usage record per gate."""
+    journal = Journal(run_id, run_dir, root)
+    journal.write_step("gates", json.dumps(aggregate, indent=2) + "\n")
+    journal.write_cache_key("gates", aggregate["prompt_hash"], scope_file)
+    if is_false(section(cfg, "telemetry").get("enabled")):
+        note("telemetry.enabled is false. No usage records were written.")
+        return
+    for record in records:
+        outcome = "timeout" if record["timed_out"] else OUTCOME[record["result"]]
+        journal.append_usage(
+            "gate:%s" % record["gate"], record["duration_ms"], outcome
+        )
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("error: interrupted. No gate result was recorded.\n")
+        raise SystemExit(EXIT_ERROR)

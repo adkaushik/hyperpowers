@@ -89,8 +89,13 @@ Write the contract to `.hyperpower/runs/<run_id>/review.json` when a run id reso
 {"step":"review","run_id":"4f2a","base_sha":"a3f19c2",
  "slices":[{"slice_id":"s1","files":["src/api/settings.ts"],"result":"ok"}],
  "left_out":[{"file":"pnpm-lock.yaml","reason":"generated, matched paths.ignore"}],
- "findings":[],"notes":[]}
+ "findings":[],"assumptions":[],"notes":[]}
 ```
+
+`assumptions` is required. Emit `[]` when this review declared none: `hp-validate review`
+rejects a contract without the array, and an absent array reads to `/hyperpower:why` as
+zero assumptions declared, which is a different fact. Carry an upstream assumption forward
+with its original `id`, `claim`, and `declared_at`.
 
 Rank the full list: CONFIRMED before PLAUSIBLE, then severity high to low, then slice order. Never sort by slice first.
 

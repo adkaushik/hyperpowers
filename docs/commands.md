@@ -1,6 +1,6 @@
 # Commands
 
-Eighteen commands in six groups. Everything is namespaced `hyperpower:`, so nothing
+Twenty commands in six groups. Everything is namespaced `hyperpower:`, so nothing
 collides with commands you already have.
 
 ## Setup
@@ -36,6 +36,33 @@ Show which directories the harness may edit. Pass a list to change it.
 ```
 
 ## Run
+
+### `/hyperpower:run "<requirement>"`
+
+Drive one requirement through the pipeline: route, understand, plan, design, build, gates,
+review, the bounded fix loop, render.
+
+Opens a run journal under `.hyperpower/runs/<run-id>/`, validates every stage contract
+before the next stage reads it, and stops hard on a blocking gate the fix loop cannot
+clear. About twelve minutes on a `feature`-class run with a ten-file diff, about ninety
+seconds on `trivial`.
+
+Design is the only stage that waits for you. Everything else runs to completion or stops.
+
+A blocking gate that could not run is a hard stop, not a pass.
+
+### `/hyperpower:route "<requirement>"`
+
+Classify a requirement into a task class and print the stages it would run.
+
+Read-only. It writes no run folder, so use it to see what `/hyperpower:run` would do before
+paying for it. When two classes fit it picks the heavier one and names both.
+
+```
+Route  ui-feature. The requirement adds a settings screen, which is rendered output a human reads.
+       feature also fit. Picked ui-feature, the heavier one.
+Stages understand, plan, design, build, gates, review, fix, render. Design waits for you.
+```
 
 ### `/hyperpower:resume <run-id> --from <step>`
 
@@ -197,3 +224,105 @@ Run the eval suite and print the release verdict.
 
 A prompt change ships only when it has no blockers, correctness and safety are within 0.1
 of baseline or better, and the weighted score beats baseline.
+
+## Scripts
+
+The commands above are what you type. Underneath, five executables in
+`plugins/hyperpower/scripts/` do the mechanical work: config merging, journal writing,
+contract validation, gate running. Skills and agents call them instead of reimplementing
+any of it, so `/hyperpower:config` reports the config a run actually used and
+`/hyperpower:resume` re-derives the cache key `/hyperpower:run` wrote.
+
+Python 3, standard library only. No third-party imports and no network access. You rarely
+run them by hand, but they are the contract, so they are documented here.
+
+### `hp-config`
+
+Merge `hyperpower.yml` and `hyperpower.local.yml` and print the result.
+
+```sh
+hp-config              # the effective config, indented
+hp-config --json       # the same, on one line
+hp-config --source     # config, sources, overrides, unknown_keys, type_errors, hash
+hp-config --hash       # the config hash alone, which is what meta.json records
+```
+
+Exit 0 printed, 1 a file did not parse, 78 no `hyperpower.yml`. It never guesses a config.
+
+`--source` maps every dotted leaf to `hyperpower.yml`, `hyperpower.local.yml`, or
+`default`. A list is one leaf, so a local list replaces the committed one whole.
+
+### `hp-journal`
+
+Write and read the run journal under `.hyperpower/runs/<run-id>/`. Every append is atomic,
+so parallel agents can write the same run.
+
+```sh
+hp-journal new --task-class feature            # creates the folder, prints the run id
+hp-journal step <run> plan --file plan.json    # write a step's output contract
+hp-journal hash <run> plan --files a.ts,b.ts --prompt-file p.txt
+hp-journal usage <run> --stage plan --model claude-opus-5 --input 900 --output 120
+hp-journal mistake <run> --kind gate_failed --key generated-import-drift
+hp-journal drift <run> --from gates            # per-step drift, in resume's format
+hp-journal finish <run> --outcome ok
+hp-journal list                                # recorded runs, newest first
+hp-journal path latest                         # the folder for a run id
+```
+
+Exit 0 written, 1 bad input or a refused write, 78 no `hyperpower.yml`. `latest` is a valid
+run id everywhere. Record shapes are in `plugins/hyperpower/scripts/JOURNAL.md`.
+
+### `hp-validate`
+
+Check a stage contract against its JSON Schema.
+
+```sh
+hp-validate build --file .hyperpower/runs/4f2a/build.json
+hp-validate plan --stdin < plan.json
+hp-validate --list      # the nine stages and their required fields
+```
+
+Exit 0 valid, 1 invalid, 2 usage error, 78 no schema for that stage. Anything but 0 is a
+hard stop: the next stage never runs on an unvalidated contract. Every violation prints
+with its JSON path, not just the first one.
+
+### `hp-gates`
+
+Run every enabled gate and record the aggregate.
+
+```sh
+hp-gates --run <run> --files src/a.ts,src/b.ts --config config.json --json
+hp-gates --only types --files src/a.ts --config config.json --json    # probe one gate
+```
+
+Exit 0 no blocking gate failed, 1 a blocking gate failed or timed out, 2 hp-gates could not
+run at all. Results are `pass`, `fail`, and `did not run`; a did-not-run gate is never
+counted as a pass and never fails the run, and the caller stops on it.
+
+`--only` with no `--run` is a probe: it runs the gate, prints the result, and records
+nothing, because a one-gate aggregate is not the run's gate result. A run that already
+finished is never adopted by the fallback either. Pass `--run` to write into one anyway.
+
+### `hp-selfcheck`
+
+Check the plugin against its own documentation. This is a contributor tool, not something a
+user of the harness runs.
+
+```sh
+hp-selfcheck                    # 13 checks
+hp-selfcheck --strict           # warnings are errors. This is what CI runs.
+hp-selfcheck --only task-classes
+hp-selfcheck --fix              # repairs frontmatter, agent names, gate file modes only
+hp-selfcheck --list-checks
+```
+
+Exit 0 clean, 1 findings. Each finding names the file, the line, and the repair. Checks
+cover frontmatter, agent naming and dispatch, `docs/commands.md` against `skills/` in both
+directions, gate scripts and their schema entries, placeholder markers, config fields
+against the schema, the eval suite, model pricing, the agent index, and the task-class
+vocabulary.
+
+### `run_evals.py`
+
+Validate, run, and score the eval suite. Documented in full in
+`plugins/hyperpower/scripts/README.md`.

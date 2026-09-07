@@ -62,13 +62,27 @@ Write a record only where an alternative was actually available. Five sources:
 A typical run yields zero to three records. Do not write a record for a mechanical step
 that had one option.
 
-Before writing, grep `memory.decisions_dir` for `run: <run-id>`. If a record for the same
-question already exists, stop. Re-running the archivist must not duplicate records.
+Check each decision on its own before writing it. Compute its slug the way Step 3 does, then
+look in `memory.decisions_dir` for a record whose frontmatter `run` is this run id **and**
+whose `id` is `<date>-<slug>`, or `<date>-<slug>` plus a `-<n>` collision suffix. If one
+exists, skip that decision and move to the next one.
+
+Compare the whole `id`. A suffix test would let the slug `masking` match an existing
+`2026-09-07-preview-masking`, and that decision would never get a record.
+
+Key the check on the question slug. A grep for `run: <run-id>` alone matches the first record
+this run wrote, so decisions two and three of the same run would be dropped. A run with three
+decisions ends with three records.
+
+Re-running the archivist on the same run adds nothing and removes nothing.
 
 ## Step 3 — write one file per decision
 
 Path: `<memory.decisions_dir>/<YYYY-MM-DD>-<slug>.md`. The date comes from `meta.json`, not
 from today. The slug is a kebab-case form of the question. On collision, append `-2`.
+
+A collision here is a different question landing on the same slug and date. The same
+question in the same run was already skipped in Step 2, so never resolve that one with `-2`.
 
 Frontmatter, exactly these keys, in this order:
 
