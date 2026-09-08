@@ -106,11 +106,18 @@ hp-journal step <run> <step> --stdin < contract.json
 ```
 
 1. `hash` computes `prompt_hash` and the cache key from the prompt, the upstream contract,
-   and the blob hash of every file the stage read. Put the `prompt_hash` it prints on the
+   and the blob hash of every file the stage read, and stamps all three on the step file.
+   With `--json` it prints that whole block; take the `prompt_hash` key out of it for the
    contract. Use `--files-from <file>` when a path holds a comma, and pass an empty file
    when the stage read nothing.
 2. `hp-validate` checks the contract against `schemas/<step>.json`.
 3. `step` writes the contract and keeps the `cache_key` already on disk.
+
+Keep the `--json`. Without it `hash` prints the cache key on one line, not the prompt hash,
+and a contract carrying the cache key in `prompt_hash` still validates, still records, and
+makes `/hyperpower:resume` report drift on a step that never moved. `route` and `gates`
+require `prompt_hash`; the other seven schemas do not, and a contract that omits it keeps
+what `hash` already stamped.
 
 Do not put `cache_key` on the contract you validate. `hp-journal hash` writes that field as
 an object, and the schema does not accept it there. Do not compute the cache key yourself:
@@ -199,8 +206,30 @@ A timeout and a missing tool are both environment faults. Sending either to a bu
 it chase a defect that may not exist.
 
 Then run the assumption-stamping pass on `tiers.gates`. Re-read each declared assumption's
-`checkable` target and move `status` to `verified`, `refuted`, or `unresolved`. Append one
-mistake per refuted assumption:
+`checkable` target and move `status` to `verified`, `refuted`, or `unresolved`.
+
+The stamped statuses go in the `assumptions` array of `gates.json`. `hp-gates` writes that
+array empty, because it runs commands and adjudicates nothing. Record the stamped array by
+reading `gates.json` back, dropping `recorded_at` and `cache_key`, putting every stamped
+assumption in `assumptions`, and passing the whole aggregate through the usual two calls:
+
+```sh
+hp-validate gates --stdin < stamped.json
+hp-journal step <run> gates --stdin < stamped.json
+```
+
+`hp-journal step` keeps the `prompt_hash`, `files_read` and `cache_key` `hp-gates` already
+wrote, so the step stays hashed and `/hyperpower:resume` still sees it. Change nothing else:
+the gate results, the counts and the exit code are `hp-gates` output, and this pass only
+fills the array it left empty. This is the one write to `gates.json` that is not `hp-gates`,
+and it is why "do not write `gates.json` yourself" above means do not compose the aggregate,
+not do not stamp it.
+
+`/hyperpower:why --assumptions` and `/hyperpower:usage` take an assumption's status from the
+latest step in pipeline order. An assumption stamped nowhere reads as still `declared`, so a
+refuted one never reaches the human.
+
+Append one mistake per refuted assumption:
 
 ```sh
 hp-journal mistake <run> --kind assumption_refuted --key settings-api-shape \
@@ -220,12 +249,15 @@ finding. A `PLAUSIBLE` finding goes to Render for a human to decide.
 
 | Round | Builder | Input carries |
 |---|---|---|
-| 1 through max minus 2 | the same builder, resumed | the failure from the previous round only |
-| the last two rounds | a fresh `hyperpower:builder` | `round`, and `prior_attempts` with one entry per earlier round |
+| 1 through max minus 2 | the same builder, resumed. `builder: "same"` | the failure from the previous round only |
+| the last two rounds | a fresh `hyperpower:builder`. `builder: "fresh"` | `round`, and `prior_attempts` with one entry per earlier round |
 | after max | nothing. Hard stop. | |
 
 At the default ceiling of 5 that is rounds 1 to 3 resumed, and rounds 4 and 5 fresh. At a
 ceiling of 2 or less, every round is fresh.
+
+The round's `builder` field takes `same` or `fresh` and nothing else. `resumed` is the
+English for the first row, not a value the schema accepts.
 
 Each round, in order:
 

@@ -28,21 +28,11 @@ them reads as far more spend than happened, and hides which stage is actually ex
 
 ## Step 1 - read pricing
 
-Read `${CLAUDE_PLUGIN_ROOT}/pricing.yml`.
+Read `${CLAUDE_PLUGIN_ROOT}/pricing.yml`. Its own header documents every field and the
+derived cache rates. Read them there. A second copy here drifts from the file it describes.
 
-| Field | Holds |
-|---|---|
-| `currency`, `unit` | `USD`, `per_million_tokens` |
-| `models.<id>.input` | price per million fresh input tokens |
-| `models.<id>.output` | price per million output tokens |
-| `models.<id>.last_verified` | the date that rate was checked |
-| `cache_multipliers.read` | multiplier on the input rate for a cached read |
-
-Cache rates are derived, not stored. A cached read costs `input x cache_multipliers.read`.
-
-The file also carries `write_5m` and `write_1h` multipliers, and `usage.jsonl` records no
-cache-write count. Cache writes are therefore not priced. State that once in the footer.
-Do not estimate them.
+One fact that header does not carry: `usage.jsonl` records no cache-write count, so cache
+writes are never priced. State that once in the footer and do not estimate them.
 
 If `pricing.yml` is missing or unreadable, report token counts for everything and no money
 at all. Say the file could not be read and name the path.
@@ -97,12 +87,8 @@ table is easy to miss.
 
 ## Step 5 - group and total
 
-| `--by` | Group column holds |
-|---|---|
-| `stage` | the `stage` field |
-| `agent` | the `agent` field |
-| `model` | the `model` field, one row per model id |
-| `run` | the run id, newest first |
+`--by` selects the group column: `stage`, `agent`, `model` one row per model id, or `run`
+newest first.
 
 Sort rows by cost descending. Rows with no money sort last, by total tokens descending.
 Print a totals row.
@@ -128,24 +114,29 @@ Cost - last 30 days, 14 runs, by stage
   Cache writes are not recorded, so the total is a lower bound.
 ```
 
-Format of the stale label, shown with an example date:
-
-```
-  claude-opus-5     44      301.2k        2.80M    22.4k     $2.41   stale, verified 2026-01-14 (236 days)
-```
+A stale row carries its label in place, after the cost column:
+`stale, verified 2026-01-14 (236 days)`.
 
 ## Redaction
+
+Per-run journals keep real paths, by design. They already live inside the repo they
+describe. This is a read-side transform: it protects the view, not the file on disk.
 
 A cost table groups by stage, agent, model, or run, and none of those is a path. Paths
 arrive in the free-text `outcome` string of a failed call, so the pipe in Step 2 is what
 keeps them out of the footer and out of any row you quote.
 
-`hp-redact` hashes a path-shaped value, a path inside free text, and a map key that is a
-path. It misses a bare name with no extension, such as `Makefile`, and free text can carry
-a path in a form nothing recognises. Call the report redacted. Never call it clean.
+Call the report redacted. Never call it clean. Three things survive it:
 
-Per-run journals keep real paths, by design. They already live inside the repo they
-describe. This is a read-side transform: it protects the view, not the file on disk.
+1. A name with no extension and no slash is not a path here. `Makefile` and `my notes`
+   print as written.
+2. A path splits at any character that cannot appear in one, and each piece is redacted only
+   if that piece is path-shaped alone. `src\api\settings.ts` prints as
+   `src\api\path:567e5738`, so part of the name stays while the line reads as redacted.
+3. `outcome` is free text. It can name a file in words, which redaction never touches.
+
+A collision between two 8-hex tokens cannot merge a cost row, because a cost table groups by
+stage, agent, model, or run and never by file. `/hyperpower:usage` carries that caveat.
 
 When `telemetry.redact_paths` is false, `hp-redact` passes the records through and says so
 on stderr. Print that line above the table. `/hyperpower:telemetry` holds the full rule.

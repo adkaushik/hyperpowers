@@ -9,9 +9,10 @@
 # baseline.
 #
 # Exit 78 when the gate is disabled, when no mock exists for the route, when the mock is not
-# locked, when commands.dev_server or commands.dev_url is null, when no headless browser is
-# installed, when neither curl nor wget is on PATH, or when no image diff tool is available.
-# An unlocked route is not a failure. It is a route nobody has drawn yet.
+# locked, when the mock changed after the lock, when commands.dev_server or commands.dev_url
+# is null, when no headless browser is installed, when neither curl nor wget is on PATH, or
+# when no image diff tool is available. An unlocked route is not a failure. It is a route
+# nobody has drawn yet.
 #
 # Two numbers are hardcoded, because the hyperpower.yml schema in docs/configuration.md has no
 # field for either and this gate never reads a field that is not in the schema:
@@ -44,7 +45,8 @@ Fails when more than 1% of pixels differ by more than 8 per channel. Both number
 hardcoded because the config schema has no field for either.
 
 Finding the mock, in order:
-  1. mock.path in <HYPERPOWER_RUN_DIR>/design.json, which must have locked: true
+  1. mock.path in <HYPERPOWER_RUN_DIR>/design.json, which must have locked: true, must not
+     have verification.baseline_valid false, and must still hash to its recorded mock.sha
   2. <docs>/mocks/<slug>.html, where <slug> comes from the route
 
 Environment:
@@ -68,11 +70,23 @@ HP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 hp_init visual
 
+# hp-gates stops this script at limits.gate_timeout_seconds and gives it five seconds to die.
+# The gate keeps this many seconds back so its own timer fires first: it then reports the
+# timeout in its own words and stops the dev server before the outer killer arrives. A gate
+# killed part way through teardown leaves the dev server running, because the server sits in
+# its own session and hp-gates only signals this script's process group.
+TEARDOWN_RESERVE=8
+WORK_TIMEOUT=$((HP_TIMEOUT - TEARDOWN_RESERVE))
+# A budget smaller than the reserve is not a real configuration. Use it whole rather than
+# reduce it to nothing.
+if [ "$WORK_TIMEOUT" -lt 1 ]; then WORK_TIMEOUT=$HP_TIMEOUT; fi
+
 # A pixel differing by this much or less on every channel counts as equal. It absorbs
 # antialiasing, not a changed colour.
 DIFF_TOLERANCE=8
 # More than this share of differing pixels fails the gate. One percent of a 1280x800 frame is
-# a block about 100 pixels square, which is a moved control rather than a soft edge.
+# a block about 100 pixels square, which is a moved control rather than a soft edge. This is
+# the number docs/gates.md publishes. Change both or neither.
 DIFF_MAX_PERCENT=1
 # Both screenshots are taken at this size, so the diff compares the same viewport.
 SHOT_WIDTH=1280
@@ -102,7 +116,7 @@ descendants() {
   while [ -n "$d_list" ] && [ "$d_depth" -lt 6 ]; do
     d_next=$(ps -Ao pid=,ppid= 2>/dev/null | awk -v list="$d_list" '
       BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
-      $2 in want { print $1 }
+      $2 in want { printf "%s ", $1 }
     ' || true)
     if [ -z "$d_next" ]; then break; fi
     d_all="$d_all $d_next"
@@ -112,7 +126,9 @@ descendants() {
   printf '%s' "$d_all"
 }
 
-# stop_pid <pid> <in-own-group> — TERM, then KILL after five seconds. Never leaves a child.
+# stop_pid <pid> <in-own-group> — TERM, then KILL after three seconds. Never leaves a child.
+# Three, not more: hp-gates gives this script five seconds between its TERM and its KILL, and
+# a teardown that overruns that window is killed part way through.
 stop_pid() {
   sp_pid=$1
   sp_group=$2
@@ -124,7 +140,7 @@ stop_pid() {
     kill -TERM $sp_kids "$sp_pid" 2>/dev/null || true
   fi
   sp_i=0
-  while [ "$sp_i" -lt 5 ]; do
+  while [ "$sp_i" -lt 3 ]; do
     if ! kill -0 "$sp_pid" 2>/dev/null; then break; fi
     sleep 1
     sp_i=$((sp_i + 1))
@@ -183,6 +199,75 @@ os.execvp(sys.argv[1], sys.argv[1:])' "$@" >"$lg_out" 2>"$lg_err" </dev/null &
   return 0
 }
 
+# start_server <command> <log> — boots the dev server under a supervisor in its own session,
+# and sets SERVER_PID and SERVER_GROUP to it.
+#
+# The supervisor owns the server as its child, so one signal to its own process group stops
+# the whole tree, however many processes the command forked. It stops on TERM, when this
+# gate's pid disappears, and at a hard deadline. Those last two are the point: hp-gates kills
+# a gate that overruns by signalling the gate's process group, the supervisor is not in that
+# group, and a supervisor that only listened for TERM would then keep the server alive for
+# ever. It watches the gate instead of trusting it.
+#
+# The supervisor exits with the dev server's own status, so the caller still reads 127 as a
+# missing dependency rather than as a crash.
+start_server() {
+  ss_cmd=$1
+  ss_log=$2
+  ss_deadline=$((HP_TIMEOUT + 30))
+  # The supervisor stops the server with `kill 0`, which signals its whole process group.
+  # That group is the server's own only when launch_group can isolate it. With neither
+  # python3 nor setsid the supervisor shares this gate's process group, and the group signal
+  # would kill the gate and whatever called the gate. Start the server without a supervisor
+  # there, and let stop_pid signal it and its children by pid.
+  if [ -z "$PYTHON_BIN" ] && ! command -v setsid >/dev/null 2>&1; then
+    launch_group "$ss_log" "$ss_log" sh -c "$ss_cmd"
+    SERVER_PID=$LAUNCH_PID
+    SERVER_GROUP=$LAUNCH_GROUP
+    return 0
+  fi
+  launch_group "$ss_log" "$ss_log" sh -c '
+    gate=$1
+    budget=$2
+    cmd=$3
+    stop_tree() {
+      trap "" TERM
+      kill -TERM 0 2>/dev/null || true
+      sleep 2
+      kill -KILL 0 2>/dev/null || true
+      exit 143
+    }
+    trap stop_tree TERM INT HUP
+    (
+      while [ "$budget" -gt 0 ]; do
+        # Two questions, because one is not enough. kill -0 answers for a zombie, and a gate
+        # that was killed stays a zombie until its own caller reaps it, so read the state as
+        # well. A supervisor whose parent is no longer the gate has been reparented, which
+        # says the same thing and survives pid reuse.
+        parent=$(ps -o ppid= -p $$ 2>/dev/null | tr -d " " 2>/dev/null)
+        [ "$parent" = "$gate" ] || break
+        state=$(ps -o stat= -p "$gate" 2>/dev/null | tr -d " " 2>/dev/null)
+        case ${state:-gone} in
+          gone|Z*) break ;;
+        esac
+        sleep 1
+        budget=$((budget - 1))
+      done
+      kill -TERM 0 2>/dev/null || true
+    ) &
+    ss_watch=$!
+    sh -c "$cmd" &
+    ss_kid=$!
+    ss_status=0
+    wait "$ss_kid" || ss_status=$?
+    kill -TERM "$ss_watch" 2>/dev/null || true
+    exit "$ss_status"
+  ' hyperpower-dev-server "$$" "$ss_deadline" "$ss_cmd"
+  SERVER_PID=$LAUNCH_PID
+  SERVER_GROUP=$LAUNCH_GROUP
+  return 0
+}
+
 # True while the pid is alive and not yet a zombie. A finished child stays a zombie until it
 # is waited for, and kill -0 still answers for one, so the state has to be read as well.
 proc_running() {
@@ -208,7 +293,7 @@ elapsed() {
 }
 
 remaining() {
-  rm_v=$(( HP_TIMEOUT - $(elapsed) ))
+  rm_v=$(( WORK_TIMEOUT - $(elapsed) ))
   if [ "$rm_v" -lt 0 ]; then rm_v=0; fi
   printf '%s' "$rm_v"
 }
@@ -317,13 +402,22 @@ wait_artifact() {
   return 1
 }
 
+SHOT_SEQ=0
+SHOT_ERR=$HP_TMPDIR/browser-stderr.log
+
 # screenshot <url> <png> <budget> — 0 written, 1 budget spent, 2 the browser produced nothing.
+# Each shot gets its own profile directory. Two runs sharing one directory can find the
+# singleton lock of the run before, and the second browser then attaches to the first instead
+# of painting, which reads here as a browser that produced no screenshot.
 screenshot() {
   sc_url=$1
   sc_png=$2
   sc_budget=$3
+  SHOT_SEQ=$((SHOT_SEQ + 1))
+  sc_profile=$HP_TMPDIR/browser-profile-$SHOT_SEQ
+  SHOT_ERR=$HP_TMPDIR/browser-stderr-$SHOT_SEQ.log
   rm -f "$sc_png"
-  launch_group "$HP_TMPDIR/browser-stdout.log" "$HP_TMPDIR/browser-stderr.log" "$browser_bin" \
+  launch_group "$HP_TMPDIR/browser-stdout-$SHOT_SEQ.log" "$SHOT_ERR" "$browser_bin" \
     --headless \
     --disable-gpu \
     --no-sandbox \
@@ -337,7 +431,7 @@ screenshot() {
     --hide-scrollbars \
     --force-device-scale-factor=1 \
     --window-size="$SHOT_WIDTH,$SHOT_HEIGHT" \
-    --user-data-dir="$HP_TMPDIR/browser-profile" \
+    --user-data-dir="$sc_profile" \
     --virtual-time-budget=5000 \
     --screenshot="$sc_png" \
     "$sc_url"
@@ -387,6 +481,7 @@ docs_dir=${docs_dir%/}
 mock=""
 mock_source=""
 design=""
+sha_note=""
 if [ -n "${HYPERPOWER_RUN_DIR:-}" ] && [ -f "$HYPERPOWER_RUN_DIR/design.json" ]; then
   design=$HYPERPOWER_RUN_DIR/design.json
   flat_design=$HP_TMPDIR/design.tsv
@@ -395,6 +490,7 @@ if [ -n "${HYPERPOWER_RUN_DIR:-}" ] && [ -f "$HYPERPOWER_RUN_DIR/design.json" ];
     awk -F "$TAB" -v k="$1" '$1 == k { print substr($0, length(k) + 2); exit }' "$flat_design"
   }
   design_mock=$(design_field mock.path)
+  design_sha=$(design_field mock.sha)
   design_locked=$(design_field locked)
   design_baseline=$(design_field verification.baseline_valid)
   if [ -n "$design_mock" ] && [ "$design_mock" != "null" ]; then
@@ -409,6 +505,19 @@ if [ -n "${HYPERPOWER_RUN_DIR:-}" ] && [ -f "$HYPERPOWER_RUN_DIR/design.json" ];
     if [ "$design_baseline" = "false" ]; then
       hp_did_not_run "design.json records verification.baseline_valid false for $design_mock" \
         "the designer built this mock without a human in the run. Lock it, then rerun the gate."
+    fi
+    # The designer records git hash-object of the mock so a later stage can tell whether the
+    # file changed after the lock. This is that stage. A mock edited after the lock is a
+    # different mock, and the lock covers the file the human saw. Without git the hash cannot
+    # be recomputed, so the check is skipped and the log says so. It never becomes a pass.
+    if [ -n "$design_sha" ] && [ "$design_sha" != "null" ]; then
+      disk_sha=$(git hash-object "$design_mock" 2>/dev/null) || disk_sha=""
+      if [ -z "$disk_sha" ]; then
+        sha_note="git hash-object could not read $design_mock, so mock.sha was not checked"
+      elif [ "$disk_sha" != "$design_sha" ]; then
+        hp_did_not_run "the mock at $design_mock changed after it was locked" \
+          "design.json records mock.sha $design_sha and the file now hashes to $disk_sha. The lock covers the file the human saw. Lock the current mock, then rerun the gate."
+      fi
     fi
     mock=$design_mock
     mock_source="design.json"
@@ -491,6 +600,9 @@ mock_png=$HP_TMPDIR/mock.png
 diff_png=$HP_TMPDIR/diff.png
 : > "$log"
 printf '=== mock: %s (from %s) ===\n' "$mock" "$mock_source" >> "$log"
+if [ -n "$sha_note" ]; then
+  printf '=== %s ===\n' "$sha_note" >> "$log"
+fi
 
 booted=0
 preboot=$(probe_url "$dev_url")
@@ -499,9 +611,7 @@ case $preboot in
     printf '=== boot: %s ===\n' "$dev_server" >> "$log"
     SERVER_LOG=$HP_TMPDIR/dev-server.log
     : > "$SERVER_LOG"
-    launch_group "$SERVER_LOG" "$SERVER_LOG" sh -c "$dev_server"
-    SERVER_PID=$LAUNCH_PID
-    SERVER_GROUP=$LAUNCH_GROUP
+    start_server "$dev_server" "$SERVER_LOG"
     booted=1
     ;;
   *)
@@ -515,7 +625,7 @@ if [ "$booted" -eq 1 ]; then
   if [ "$budget" -le 0 ]; then
     cat "$SERVER_LOG" >> "$log"
     HP_OUT=$log
-    hp_fail "visual gate ran out of its ${HP_TIMEOUT}s budget before the dev server answered.$(hp_advisory_note)" \
+    hp_fail "visual gate ran out of its ${WORK_TIMEOUT}s working budget before the dev server answered.$(hp_advisory_note)" \
       "$(hp_evidence)"
   fi
   ready=0
@@ -535,7 +645,7 @@ if [ "$booted" -eq 1 ]; then
   fi
   if [ "$ready" -ne 0 ]; then
     HP_OUT=$log
-    hp_fail "$dev_url did not answer within ${HP_TIMEOUT}s.$(hp_advisory_note)" "$(hp_evidence)"
+    hp_fail "$dev_url did not answer within ${WORK_TIMEOUT}s of the ${HP_TIMEOUT}s budget.$(hp_advisory_note)" "$(hp_evidence)"
   fi
 fi
 
@@ -553,18 +663,18 @@ for pair in "route${TAB}$target${TAB}$live_png" "mock${TAB}file://$mock_abs${TAB
   png=${rest#*"$TAB"}
   budget=$(remaining)
   if [ "$budget" -le 0 ]; then
-    shot_failed="the ${HP_TIMEOUT}s budget ran out before the $what screenshot"
+    shot_failed="the ${WORK_TIMEOUT}s working budget ran out before the $what screenshot"
     break
   fi
   shot=0
   screenshot "$url" "$png" "$budget" || shot=$?
   printf '=== %s screenshot: %s ===\n' "$what" "$url" >> "$log"
   if [ "$shot" -eq 1 ]; then
-    shot_failed="the $what screenshot of $url did not arrive within ${HP_TIMEOUT}s"
+    shot_failed="the $what screenshot of $url did not arrive within ${WORK_TIMEOUT}s of the ${HP_TIMEOUT}s budget"
     break
   fi
   if [ "$shot" -eq 2 ]; then
-    tail -n 10 "$HP_TMPDIR/browser-stderr.log" >> "$log" 2>/dev/null || true
+    tail -n 10 "$SHOT_ERR" >> "$log" 2>/dev/null || true
     HP_OUT=$log
     hp_did_not_run "the headless browser produced no $what screenshot of $url" "$(hp_evidence)"
   fi
@@ -839,9 +949,11 @@ if [ -n "${HYPERPOWER_RUN_DIR:-}" ] && mkdir -p "$HYPERPOWER_RUN_DIR/gates" 2>/d
   live_out=$HYPERPOWER_RUN_DIR/gates/visual-live-$slug.png
   mock_out=$HYPERPOWER_RUN_DIR/gates/visual-mock-$slug.png
 else
-  diff_out=${TMPDIR:-/tmp}/hyperpower-visual-diff-$slug.png
-  live_out=${TMPDIR:-/tmp}/hyperpower-visual-live-$slug.png
-  mock_out=${TMPDIR:-/tmp}/hyperpower-visual-mock-$slug.png
+  tmp_root=${TMPDIR:-/tmp}
+  tmp_root=${tmp_root%/}
+  diff_out=$tmp_root/hyperpower-visual-diff-$slug.png
+  live_out=$tmp_root/hyperpower-visual-live-$slug.png
+  mock_out=$tmp_root/hyperpower-visual-mock-$slug.png
 fi
 cp "$diff_png" "$diff_out" 2>/dev/null || diff_out="not written"
 cp "$live_png" "$live_out" 2>/dev/null || live_out="not written"

@@ -53,6 +53,31 @@ POLLUTION_PATHS = (
     "plugins/hyperpower/tests/.hyperpower",
 )
 
+# Bytecode a case leaves behind when it imports a kernel script without turning caching
+# off. It is gitignored, so git status never shows it. The runner has to look itself.
+POLLUTION_GLOBS = ("**/__pycache__", "**/*.pyc")
+
+# Git plumbing variables that name a repository other than the directory git runs in. A
+# hook, `git rebase --exec` and `git bisect run` all export them. Left in place they point
+# the scratch repo's own `git init`, `git add -A` and `git commit` at the caller's
+# repository, and the caller's uncommitted work lands there in a commit named scratch.
+# They are dropped from every environment this runner builds.
+GIT_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_INDEX_VERSION",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+)
+
 # The scratch repository every case starts from. Every gate is off, so a case turns on the
 # one gate it is about and nothing else runs.
 SCRATCH_CONFIG = """version: 1
@@ -320,6 +345,7 @@ YAML is parsed by the kernel's own hp-config, never by a second parser, so a cas
 reads task-classes.yml exercises the parser the harness ships.
 """
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -454,6 +480,72 @@ def yaml_blocks(text):
     return blocks
 
 
+def section_jsonl(text, section):
+    """Every jsonl record fenced under one `## ` heading, in document order.
+
+    The heading is matched on its text with backticks stripped, so `## usage.jsonl` is
+    named as usage.jsonl. This is how a case reads the record shape out of JOURNAL.md
+    rather than restating it.
+    """
+    wanted = section.strip().strip("`")
+    records = []
+    inside = False
+    fenced = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            if fenced:
+                die("the %s section ends inside an unclosed fence" % wanted)
+            inside = stripped[3:].strip().strip("`") == wanted
+            continue
+        if not inside:
+            continue
+        if stripped.startswith("```"):
+            if fenced:
+                fenced = False
+            else:
+                fenced = stripped[3:].strip() == "jsonl"
+            continue
+        if fenced and stripped:
+            records.append(stripped)
+    if not records:
+        die("no fenced jsonl record under the %s heading" % wanted)
+    return records
+
+
+def documented_record(argv):
+    """One record from a markdown section, by 1-based position within that section."""
+    if len(argv) < 3:
+        die("md-jsonl-keys needs a document, a section heading and a record number")
+    with open(argv[0], "r", encoding="utf-8") as handle:
+        records = section_jsonl(handle.read(), argv[1])
+    number = int(argv[2])
+    if number < 1 or number > len(records):
+        die(
+            "the %s section of %s documents %d records, so record %d does not exist"
+            % (argv[1], argv[0], len(records), number)
+        )
+    try:
+        return json.loads(records[number - 1])
+    except ValueError as error:
+        die("record %d under %s is not JSON: %s" % (number, argv[1], error))
+
+
+def cache_key_of(digests):
+    """The cache key JOURNAL.md specifies, computed here rather than read from hp-journal.
+
+    Three digests, each on its own line, each line terminated. A digest that is null or
+    empty is the literal string none. A second implementation that joins the three and
+    stops computes a different key, which is what this reproduces to catch.
+    """
+    body = ""
+    for digest in digests:
+        if digest in ("", "null", "none", "<missing>"):
+            digest = "none"
+        body += digest + "\n"
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 def minimal(node):
     """The smallest instance a schema node accepts. Empty arrays and empty strings."""
     if "const" in node:
@@ -491,7 +583,13 @@ def build_contract(argv):
     if not argv:
         die("contract needs a schema path")
     schema = read_json(argv[0])
-    options = {"run-id": None, "drop": None, "extra": None, "enum-break": None}
+    options = {
+        "run-id": None,
+        "drop": None,
+        "extra": None,
+        "enum-break": None,
+        "assumption": None,
+    }
     rest = argv[1:]
     index = 0
     while index < len(rest):
@@ -506,6 +604,14 @@ def build_contract(argv):
     instance = minimal(schema)
     if options["run-id"] and "run_id" in schema.get("properties", {}):
         instance["run_id"] = options["run-id"]
+    if options["assumption"]:
+        items = schema["properties"]["assumptions"]["items"]
+        record = minimal(items)
+        record["id"] = options["assumption"]
+        record["claim"] = "an assumption this contract declares"
+        if "declared_at" in record and isinstance(instance.get("step"), str):
+            record["declared_at"] = instance["step"]
+        instance["assumptions"] = [record]
     if options["drop"]:
         if options["drop"] not in instance:
             die("--drop %s is not a required field of this schema" % options["drop"])
@@ -533,7 +639,10 @@ USAGE = """hptool <command> [args]
   jsonl-count FILE            non-empty lines
   gate-field FILE GATE FIELD  one field of one gate record in an hp-gates aggregate
   yaml-blocks DOC OUTDIR      write every fenced yaml block, print the count
-  contract SCHEMA [--run-id R] [--drop F] [--extra F] [--enum-break F]
+  md-jsonl-keys DOC SECTION N sorted keys of the Nth jsonl record fenced under a heading
+  md-jsonl-get DOC SECTION N PATH   one value from that record
+  cache-key PROMPT UPSTREAM FILES   the key JOURNAL.md specifies, computed here
+  contract SCHEMA [--run-id R] [--drop F] [--extra F] [--enum-break F] [--assumption ID]
 """
 
 
@@ -615,6 +724,22 @@ def main(argv):
         sys.stdout.write(str(len(blocks)) + "\n")
         return 0
 
+    if command == "md-jsonl-keys":
+        sys.stdout.write(keys_of(documented_record(rest), rest[1]) + "\n")
+        return 0
+
+    if command == "md-jsonl-get":
+        if len(rest) < 4:
+            die("md-jsonl-get needs a document, a section, a record number and a path")
+        sys.stdout.write(render(walk(documented_record(rest), rest[3])) + "\n")
+        return 0
+
+    if command == "cache-key":
+        if len(rest) < 3:
+            die("cache-key needs the prompt, upstream and files digests, in that order")
+        sys.stdout.write(cache_key_of(rest[:3]) + "\n")
+        return 0
+
     if command == "contract":
         sys.stdout.write(build_contract(rest))
         return 0
@@ -673,7 +798,9 @@ def case_env(case_dir, repo):
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("HYPERPOWER_") and not key.startswith("HP_")
+        if not key.startswith("HYPERPOWER_")
+        and not key.startswith("HP_")
+        and key not in GIT_ENV_VARS
     }
     home = case_dir / "home"
     env.update(
@@ -740,8 +867,15 @@ def discover(only):
     return [case for case in cases if fnmatch.fnmatch(case.stem, pattern)]
 
 
-def pollution_before():
-    return {name for name in POLLUTION_PATHS if (REPO_ROOT / name).exists()}
+def polluted():
+    """Every path in this repository that a stray case would have created."""
+    found = {name for name in POLLUTION_PATHS if (REPO_ROOT / name).exists()}
+    for pattern in POLLUTION_GLOBS:
+        for path in REPO_ROOT.glob(pattern):
+            if ".git" in path.parts:
+                continue
+            found.add(str(path.relative_to(REPO_ROOT)))
+    return found
 
 
 def run_case(case, root, keep, verbose):
@@ -749,8 +883,10 @@ def run_case(case, root, keep, verbose):
     case_dir = root / case.stem
     case_dir.mkdir(parents=True)
     try:
-        repo = build_scratch(case_dir, dict(os.environ))
-        env = case_env(case_dir, repo)
+        # The scratch repo is built with the case's own environment, not the caller's, so
+        # a GIT_DIR exported by a hook or `git rebase --exec` cannot redirect its commit.
+        env = case_env(case_dir, case_dir / "repo")
+        repo = build_scratch(case_dir, env)
         (case_dir / "tmp" / "lib.sh").write_text(LIB_SH, encoding="utf-8")
         (case_dir / "tmp" / "hptool.py").write_text(HPTOOL_PY, encoding="utf-8")
 
@@ -869,7 +1005,7 @@ def main(argv=None):
             sys.stdout.write(case.stem + "\n")
         return EXIT_OK
 
-    before = pollution_before()
+    before = polluted()
     root = Path(tempfile.mkdtemp(prefix="hp-tests-"))
     totals = [0, 0, 0]
     errors = 0
@@ -888,7 +1024,7 @@ def main(argv=None):
         else:
             shutil.rmtree(str(root), ignore_errors=True)
 
-    leaked = sorted({name for name in POLLUTION_PATHS if (REPO_ROOT / name).exists()} - before)
+    leaked = sorted(polluted() - before)
     if leaked:
         sys.stdout.write(
             "POLLUTION  a case wrote inside %s: %s\n" % (REPO_ROOT, ", ".join(leaked))

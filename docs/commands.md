@@ -261,7 +261,7 @@ Exit 0 printed, 1 a file did not parse, 78 no `hyperpower.yml`. It never guesses
 ### `hp-journal`
 
 Write and read the run journal under `.hyperpower/runs/<run-id>/`. Every append is atomic,
-so parallel agents can write the same run.
+so parallel agents can write the same run. Thirteen subcommands.
 
 ```sh
 hp-journal new --task-class feature            # creates the folder, prints the run id
@@ -274,6 +274,21 @@ hp-journal finish <run> --outcome ok
 hp-journal list                                # recorded runs, newest first
 hp-journal path latest                         # the folder for a run id
 ```
+
+Four more write and read the two files `/hyperpower:correct` and `/hyperpower:resume` own:
+
+```sh
+hp-journal correction <run> --step plan --assumption a1 \
+  --text "it returns { items: [] }" --scope run   # appends corrections.jsonl, prints the key
+hp-journal corrections <run> --step plan --pending  # once entries no replay has used
+hp-journal correction-applied <run> --step plan     # stamps applied: true, after the replay
+hp-journal resume-event <run> --from gates --decision build --drifted build,review
+```
+
+`correction` writes `corrections.jsonl` and nothing else. Setting the assumption's own
+`status` and appending the `mistakes.jsonl` line are two further writes, and
+`/hyperpower:correct` step 3 makes them. `correction-applied` is the one writer of
+`applied`, and it runs after the replay wrote that step's contract, never before.
 
 Exit 0 written, 1 bad input or a refused write, 78 no `hyperpower.yml`. `latest` is a valid
 run id everywhere. Record shapes are in `plugins/hyperpower/scripts/JOURNAL.md`.
@@ -385,3 +400,31 @@ temporary directory with its own `HOME`, so a case never touches the repo it is 
 
 Run it with `hp-selfcheck --strict` before opening a pull request. Selfcheck compares the
 tree against the documentation. The suite runs the code.
+
+## Hooks
+
+Two hooks ship with the plugin, and neither is a command you type. They are listed here
+because one of them can refuse an action you asked for.
+
+| Hook | Fires | Default | Does |
+|---|---|---|---|
+| `session-start.sh` | session start, resume, clear, compact | on | injects the harness protocol into the main agent |
+| `require-commit-prep.sh` | before a Bash tool call | inert | denies a bare `git commit` until the change has been through the gates |
+
+The commit gate does nothing until you create a flag file:
+
+```sh
+mkdir -p .hyperpower && touch .hyperpower/commit-gate
+```
+
+Commit that file to turn it on for the team. Gitignore it to keep it yours. Remove it to
+turn it off. To commit once without it, prefix the command with `HYPERPOWER_COMMIT_GATE=off`.
+
+It judges gate evidence and nothing else: a run journal exists, the newest run reached
+Gates, no gate failed, at least one passed, no `did_not_run` blames a missing tool or a
+timeout, and no changed file is newer than `gates.json`. It never reads your diff or your
+commit message.
+
+It fails open, and it matches `git commit` in the command string, so a script that commits
+is never seen. Do not treat it as enforcement. Full behaviour is in
+`plugins/hyperpower/hooks/README.md`.

@@ -17,6 +17,7 @@ esac
 RUNS=$HP_TEST_REPO/.hyperpower/runs
 BASE=1111111111111111111111111111111111111111
 STEPS="route understand plan design build gates review fix render"
+JOURNAL=$HP_SCRIPTS/JOURNAL.md
 
 j() { t_hp_journal "$@" --root "$HP_TEST_REPO"; }
 
@@ -166,15 +167,18 @@ t_eq "a file under paths.ignore is not compared" "ok" "$(t_json_get "$T_OUT" ste
 
 # ---------------------------------------------------------------------------
 # 4. usage.jsonl and mistakes.jsonl carry the shapes JOURNAL.md documents.
+#
+# The expected key sets are read out of JOURNAL.md at test time rather than restated here.
+# A field added to the writer and not to the document fails, and so does the reverse. A
+# restated list would pass while the two drifted apart.
 
 usage=$RUNS/$run/usage.jsonl
 
 j usage "$run" --stage review --agent reviewer --model claude-opus-5 \
   --input 18422 --output 1130 --cache-read 16000 --duration-ms 9400 --outcome ok
 t_status "hp-journal usage records a model call" 0
-t_eq "a model call carries the nine documented fields" \
-  "agent,cache_read,duration_ms,input_tokens,model,outcome,output_tokens,stage,ts" \
-  "$(t_tool jsonl-keys "$usage" 1)"
+t_eq "a model call carries the keys JOURNAL.md documents" \
+  "$(t_tool md-jsonl-keys "$JOURNAL" usage.jsonl 1)" "$(t_tool jsonl-keys "$usage" 1)"
 t_eq "input_tokens holds the fresh input only" "18422" \
   "$(t_tool jsonl-get "$usage" 1 input_tokens)"
 t_eq "cache_read is recorded apart from input_tokens" "16000" \
@@ -183,8 +187,10 @@ t_eq "the stage is written as given" "review" "$(t_tool jsonl-get "$usage" 1 sta
 
 j usage "$run" --stage gate:types --duration-ms 3200 --outcome ok
 t_status "hp-journal usage records a gate result" 0
-t_eq "a gate record carries no model, agent or token counts" \
-  "duration_ms,outcome,stage,ts" "$(t_tool jsonl-keys "$usage" 2)"
+t_eq "a gate record carries the keys JOURNAL.md documents for one" \
+  "$(t_tool md-jsonl-keys "$JOURNAL" usage.jsonl 2)" "$(t_tool jsonl-keys "$usage" 2)"
+t_eq "a gate record names no model" "gate:types" \
+  "$(t_tool md-jsonl-get "$JOURNAL" usage.jsonl 2 stage)"
 
 j usage "$run" --stage gate:types --model claude-opus-5 --input 1 --output 1
 t_status "a gate record naming a model is refused" 1
@@ -198,8 +204,9 @@ mistakes=$RUNS/$run/mistakes.jsonl
 j mistake "$run" --kind assumption_refuted --key settings-api-shape \
   --ref decisions/2026-09-07-settings.md
 t_status "hp-journal mistake records a failure event" 0
-t_eq "a mistake line carries exactly run, kind, key and ref" "key,kind,ref,run" \
-  "$(t_tool jsonl-keys "$mistakes" 1)"
+t_eq "a mistake line carries the keys JOURNAL.md documents" \
+  "$(t_tool md-jsonl-keys "$JOURNAL" mistakes.jsonl 1)" "$(t_tool jsonl-keys "$mistakes" 1)"
+t_file_lacks "a mistake line carries no timestamp" "$mistakes" '"ts"'
 t_eq "the mistake names the run the promoter counts" "$run" \
   "$(t_tool jsonl-get "$mistakes" 1 run)"
 
@@ -222,3 +229,194 @@ t_ne "meta.json records when the run finished" "null" "$(t_json_get "$meta" fini
 
 j finish "$run" --outcome shipped
 t_status "an outcome outside the four is refused" 1
+
+# ---------------------------------------------------------------------------
+# 6. The cache key is the digest JOURNAL.md specifies, byte for byte.
+#
+# Three digests, one per line, each line terminated, with the literal none for a digest
+# that is null. hptool computes that here from the stored inputs, so this compares
+# hp-journal against the document rather than against itself. An implementation that drops
+# the sentinel or the trailing newline computes a different key for an unchanged step, and
+# every resume then replays work that had not moved.
+
+j new --base "$BASE"
+krun=$(t_out)
+t_tool contract "$HP_SCHEMAS/understand.json" --run-id "$krun" > "$HP_TEST_TMP/ku.json"
+t_tool contract "$HP_SCHEMAS/plan.json" --run-id "$krun" > "$HP_TEST_TMP/kp.json"
+j step "$krun" understand --file "$HP_TEST_TMP/ku.json"
+j hash "$krun" understand --files src/a.txt --prompt "understand prompt"
+
+ku=$RUNS/$krun/understand.json
+t_eq "the first recorded step has no upstream to hash" "null" \
+  "$(t_json_get "$ku" cache_key.upstream_hash)"
+t_eq "the first step's key is the documented digest of its three inputs" \
+  "$(t_tool cache-key "$(t_json_get "$ku" cache_key.prompt_hash)" \
+    "$(t_json_get "$ku" cache_key.upstream_hash)" \
+    "$(t_json_get "$ku" cache_key.files_hash)")" \
+  "$(t_json_get "$ku" cache_key.key)"
+
+j step "$krun" plan --file "$HP_TEST_TMP/kp.json"
+j hash "$krun" plan --files src/a.txt,src/b.txt --prompt "plan prompt"
+kp=$RUNS/$krun/plan.json
+t_ne "a later step hashes the step recorded before it" "null" \
+  "$(t_json_get "$kp" cache_key.upstream_hash)"
+t_eq "a later step's key is the documented digest too" \
+  "$(t_tool cache-key "$(t_json_get "$kp" cache_key.prompt_hash)" \
+    "$(t_json_get "$kp" cache_key.upstream_hash)" \
+    "$(t_json_get "$kp" cache_key.files_hash)")" \
+  "$(t_json_get "$kp" cache_key.key)"
+t_ne "the key is not the prompt hash alone" "$(t_json_get "$kp" cache_key.prompt_hash)" \
+  "$(t_json_get "$kp" cache_key.key)"
+t_eq "the blob hash is the value git hash-object prints" \
+  "$(git -C "$HP_TEST_REPO" hash-object src/b.txt)" \
+  "$(t_json_get "$kp" cache_key.blobs.'src/b.txt')"
+
+# ---------------------------------------------------------------------------
+# 7. step validates the record before it writes it.
+#
+# The check lives in hp-journal and not only in the skill that calls it, so a shell loop
+# calling hp-journal step gets the same refusal.
+
+j new --base "$BASE"
+vrun=$(t_out)
+t_tool contract "$HP_SCHEMAS/plan.json" --run-id "$vrun" \
+  --drop approach --enum-break status > "$HP_TEST_TMP/vbad.json"
+
+j step "$vrun" plan --file "$HP_TEST_TMP/vbad.json"
+t_status "a contract the schema rejects is refused" 1
+t_no_file "the refused contract left no plan.json behind" "$RUNS/$vrun/plan.json"
+t_stderr_has "the refusal reports the missing field" '$.approach'
+t_stderr_has "the refusal reports the value outside the enum" '$.status'
+t_stderr_has "the refusal names the escape hatch" "--no-validate"
+
+j step "$vrun" plan --file "$HP_TEST_TMP/vbad.json" --no-validate
+t_status "--no-validate records the contract unchecked" 0
+t_file "--no-validate wrote the file the check refused" "$RUNS/$vrun/plan.json"
+
+# ---------------------------------------------------------------------------
+# 8. corrections.jsonl, and the once lifecycle.
+#
+# A once correction applies to the next replay of its own step and then retires. Three
+# commands own one step each, and correction-applied is the only writer of applied.
+
+j new --base "$BASE"
+crun=$(t_out)
+t_tool contract "$HP_SCHEMAS/plan.json" --run-id "$crun" --assumption a1 \
+  > "$HP_TEST_TMP/cplan.json"
+j step "$crun" plan --file "$HP_TEST_TMP/cplan.json"
+t_status "a contract declaring an assumption is recorded" 0
+
+corrections=$RUNS/$crun/corrections.jsonl
+
+j correction "$crun" --step plan --assumption a1 \
+  --text "settings API returns { items: [] }" --scope once
+t_status "hp-journal correction records a correction" 0
+t_eq "a correction line carries the keys JOURNAL.md documents" \
+  "$(t_tool md-jsonl-keys "$JOURNAL" corrections.jsonl 1)" \
+  "$(t_tool jsonl-keys "$corrections" 1)"
+t_eq "the correction names the assumption it corrects" "a1" \
+  "$(t_tool jsonl-get "$corrections" 1 assumption)"
+t_eq "the scope is written as given" "once" "$(t_tool jsonl-get "$corrections" 1 scope)"
+t_eq "a new correction is not stamped applied" "<missing>" \
+  "$(t_tool jsonl-get "$corrections" 1 applied)"
+
+j correction "$crun" --step plan --assumption a9 --text "no such assumption" --scope once
+t_status "a correction against an assumption the step never declared is refused" 1
+t_stderr_has "the refusal names the ids the step did declare" "a1"
+
+j corrections "$crun" --step plan --pending --json
+t_status "hp-journal corrections --pending exits 0" 0
+t_eq "the once correction is pending before a replay uses it" "a1" \
+  "$(t_json_get "$T_OUT" 0.assumption)"
+
+j correction-applied "$crun" --step plan
+t_status "hp-journal correction-applied exits 0" 0
+t_eq "the replay stamps the correction it used" "true" \
+  "$(t_tool jsonl-get "$corrections" 1 applied)"
+
+j corrections "$crun" --step plan --pending --json
+t_eq "an applied once correction is no longer pending" "[]" "$(t_out)"
+
+j correction "$crun" --step plan --assumption a1 --text "and this one stands" --scope run
+j correction-applied "$crun" --step plan
+t_eq "a run correction is never stamped applied" "<missing>" \
+  "$(t_tool jsonl-get "$corrections" 2 applied)"
+
+# ---------------------------------------------------------------------------
+# 9. resume.jsonl carries the step names, not a count.
+
+resume=$RUNS/$crun/resume.jsonl
+
+j resume-event "$crun" --from gates --decision build --drifted build
+t_status "hp-journal resume-event records a replay" 0
+t_eq "a replay line carries the keys JOURNAL.md documents" \
+  "$(t_tool md-jsonl-keys "$JOURNAL" resume.jsonl 1)" "$(t_tool jsonl-keys "$resume" 1)"
+t_eq "drifted holds the step name a reader can act on" "build" \
+  "$(t_tool jsonl-get "$resume" 1 drifted.0)"
+t_eq "the decision is written as given" "build" "$(t_tool jsonl-get "$resume" 1 decision)"
+
+j resume-event "$crun" --from gates --decision gates-anyway
+t_status "the anyway decision is part of the vocabulary" 0
+j resume-event "$crun" --from gates --decision maybe
+t_status "a decision outside the vocabulary is refused" 1
+
+# ---------------------------------------------------------------------------
+# 10. UNRECORDED, and a config hash that moved.
+#
+# hash writes <step>.json before the stage returns, which is the order skills/run uses. A
+# file holding only a cache key is a placeholder. Reporting it as ok would replay over a
+# stage that never produced a contract.
+
+j hash "$crun" review --files src/b.txt --prompt "review prompt"
+t_status "hash writes a placeholder for a step no stage has recorded" 0
+t_file "the placeholder is a file on disk" "$RUNS/$crun/review.json"
+
+j drift "$crun" --from review
+t_stdout_has "a cache key with no contract reports UNRECORDED" \
+  "UNRECORDED — cache key only, no step contract recorded"
+j drift "$crun" --from review --json
+t_eq "an unrecorded step is never ok" "no_contract" "$(t_json_get "$T_OUT" steps.1.state)"
+
+cat > "$HP_TEST_REPO/hyperpower.local.yml" <<'EOF'
+limits:
+  gate_timeout_seconds: 61
+EOF
+
+j drift "$crun" --from plan
+t_stdout_has "a config hash that moved drifts every step" \
+  "Config hash changed since this run. Treat every step as drifted."
+j drift "$crun" --from plan --json
+t_eq "drift --json records that the config moved" "true" \
+  "$(t_json_get "$T_OUT" config_drifted)"
+t_eq "a moved config drifts every step, not one" "true" "$(t_json_get "$T_OUT" all_drifted)"
+
+rm -f "$HP_TEST_REPO/hyperpower.local.yml"
+j drift "$crun" --from plan --json
+t_eq "restoring the config clears the config drift" "false" \
+  "$(t_json_get "$T_OUT" config_drifted)"
+
+# ---------------------------------------------------------------------------
+# 11. list, path, and the repo root order JOURNAL.md fixes.
+#
+# HYPERPOWER_REPO_ROOT is how a worktree, a sandbox and a gate subprocess name a root that
+# is not the working directory. hp-config, hp-journal and gates/_lib.sh all honour it. A
+# script that ignores it reads a different journal, and nothing in the output shows it.
+
+j list --json
+t_status "hp-journal list exits 0" 0
+t_ne "list names a recorded run" "<missing>" "$(t_json_get "$T_OUT" 0.run)"
+t_ne "list names a second recorded run" "<missing>" "$(t_json_get "$T_OUT" 1.run)"
+
+j list --limit 1 --json
+t_ne "--limit 1 prints a row" "<missing>" "$(t_json_get "$T_OUT" 0.run)"
+t_eq "--limit 1 prints no second row" "<missing>" "$(t_json_get "$T_OUT" 1.run)"
+
+T_CWD=$HP_TEST_TMP
+t_run env HYPERPOWER_REPO_ROOT="$HP_TEST_REPO" "$HP_PYTHON" "$HP_JOURNAL" list --json
+t_status "HYPERPOWER_REPO_ROOT names the root for hp-journal too" 0
+t_ne "a journal read from outside the repo still finds its runs" "<missing>" \
+  "$(t_json_get "$T_OUT" 0.run)"
+
+T_CWD=$HP_TEST_TMP
+t_run env HYPERPOWER_REPO_ROOT="$HP_TEST_REPO" "$HP_PYTHON" "$HP_JOURNAL" path "$crun"
+t_eq "path resolves against the same root" "$RUNS/$crun" "$(t_out)"

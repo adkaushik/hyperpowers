@@ -220,6 +220,10 @@ When `telemetry.redact_paths` is on, file paths are hashed before they reach an 
 view, so a report you paste somewhere carries digests instead of your directory names. The
 per-run journal keeps the real paths, because it already lives in the repo it describes.
 
+Redaction is not anonymity. The hash is salted from `.hyperpower/redact-salt`, so anyone
+holding both the repo and that file can hash a path and match it. Add it to `.gitignore`
+yourself — `init` does not.
+
 ```
 /hyperpower:telemetry purge
 ```

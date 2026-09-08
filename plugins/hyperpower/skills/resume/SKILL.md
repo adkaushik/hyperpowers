@@ -89,7 +89,13 @@ It is never the silent default. Do not choose it because the drift is one file, 
 Re-entering at step N invalidates step N and everything downstream. Never partial.
 
 1. Move each invalidated `<step>.json` into `.hyperpower/runs/<run-id>/superseded/<timestamp>/`. Do not delete it.
-2. Append one line to `.hyperpower/runs/<run-id>/resume.jsonl` with the timestamp, the `--from` step, the answer taken, and the drifted step names.
+2. Append one line to `.hyperpower/runs/<run-id>/resume.jsonl`. `hp-journal resume-event` is the writer, and it stamps the timestamp itself. Never append with a shell redirect.
+
+```sh
+hp-journal resume-event <run> --from gates --decision build --drifted build,review
+```
+
+`--decision` takes the answer Step 4 got: a step name, `<step>-anyway`, or `abort`. Anything else is refused with the vocabulary. `--drifted` takes the drifted step names, not a count. Record an `abort` too: a run aborted over drift is the fact the log exists to hold.
 3. Leave `meta.json`, `mistakes.jsonl`, `usage.jsonl`, and `corrections.jsonl` in place. They are the run's history. Step 6 stamps `applied: true` on every `once` entry in `corrections.jsonl` that it applies, which is one per replayed step that carried one. That is the only edit this command makes to any of them.
 
 Never keep `review.json` when `build.json` was invalidated. A review of a superseded build is the exact failure this command exists to prevent.
@@ -98,19 +104,23 @@ Never keep `review.json` when `build.json` was invalidated. A review of a supers
 
 Replay the invalidated steps in pipeline order. Each writes a fresh `<step>.json` with a newly computed cache key.
 
-Corrections in `corrections.jsonl` apply during the replay.
+Corrections in `corrections.jsonl` apply during the replay. Read them with `hp-journal corrections`, never off disk, so a malformed line is reported rather than silently skipped.
+
+```sh
+hp-journal corrections <run> --step plan --pending    # the once entries no replay has used
+```
 
 | Scope | Applies to | Then |
 |---|---|---|
-| `once` | the next replay of its own step, and only when the entry has no `applied: true` | set `applied: true` on that entry |
+| `once` | the next replay of its own step, and only when the entry has no `applied: true` | stamp it with `hp-journal correction-applied <run> --step <step>` |
 | `run` | every step replayed after it in this run | nothing. It stands for the life of the run |
 | `forever` | every step replayed after it, and every future run through the rulebook | nothing. The rulebook carries it |
 
-This command owns the `applied` field. `/hyperpower:correct` writes the entry without it and never touches it. Nothing else writes it, so an unstamped `once` entry means the correction has not been used yet.
+This command owns the `applied` field, and `hp-journal correction-applied` is the one writer of it. `/hyperpower:correct` writes the entry without it and never touches it. Nothing else writes it, so an unstamped `once` entry means the correction has not been used yet.
 
-Order matters. Write the step's fresh `<step>.json` first, then stamp `applied: true`. A replay that fails, aborts, or is interrupted before the contract lands leaves the entry unstamped, so the next replay applies the correction again. Stamping first drops the correction silently.
+Order matters. Write the step's fresh `<step>.json` first, then call `correction-applied`. A replay that fails, aborts, or is interrupted before the contract lands leaves the entry unstamped, so the next replay applies the correction again. Stamping first drops the correction silently.
 
-Rewrite that one line in place and leave every other line byte for byte as it was. Skip a `once` entry that already carries `applied: true`: do not apply it, and do not report it as applied a second time.
+Do not rewrite `corrections.jsonl` by hand. `correction-applied` rewrites the one line under the same lock the append takes, keeps every other line byte for byte including one that does not parse, and skips an entry that already carries `applied: true`. A second implementation of that rewrite loses a correction appended while it runs.
 
 Use the model tiers in the current `models` config, not the tiers recorded in `meta.json`. When they differ, say so in the output.
 

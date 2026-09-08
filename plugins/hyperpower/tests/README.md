@@ -28,12 +28,26 @@ against its own documentation. `run-tests` runs the scripts and reads what they 
 | Case | Checks |
 |---|---|
 | `cases/hp-config.sh` | every yaml block in `docs/configuration.md` parses, exit 78 with no config, `HYPERPOWER_REPO_ROOT`, local overrides, the config hash |
-| `cases/hp-journal.sh` | reproducible run ids, the step contract round trip, drift, `usage.jsonl` and `mistakes.jsonl` shapes |
+| `cases/hp-journal.sh` | reproducible run ids, the step contract round trip, the cache key byte for byte, drift, and every record shape in `JOURNAL.md` |
 | `cases/hp-gates.sh` | the three exit codes, disabled gates, the run journal it writes |
 | `cases/gates.sh` | every gate script exits 78, not 0, when it cannot run |
 | `cases/hp-validate.sh` | a valid contract passes, an invalid one reports every violation |
+| `cases/hp-redact.sh` | paths are removed, the fields an aggregate groups by survive, the token is stable |
+| `cases/hp-selfcheck.sh` | the shipped tree passes, and each planted fault is caught by its check |
 | `cases/task-classes.sh` | `task-classes.yml`, `schemas/route.json` and `schemas/plan.json` name the same classes |
 | `cases/run_evals.sh` | `validate` passes, `score` refuses unpaired rows |
+
+### Assert against the document, not against a copy of it
+
+Three things are read out of the documentation at test time rather than restated in a case:
+the yaml blocks in `docs/configuration.md`, the record shapes in `scripts/JOURNAL.md`, and
+the check count in `docs/architecture.md`.
+
+The reason is drift. A restated key list passes while the writer and the document disagree,
+which is the failure the case existed to catch. Read the document with `yaml-blocks`,
+`md-jsonl-keys`, or a `grep`, and the case fails when either side moves.
+
+Do not restate a documented shape in a case. Read it.
 
 ## The rule
 
@@ -43,11 +57,26 @@ tree it was launched from.
 Every case gets its own git repository under a temporary directory, its own `HOME`, and its
 own `TMPDIR`. Write there, through `$HP_TEST_REPO` and `$HP_TEST_TMP`. The runner removes
 both when the case ends, and checks this repository afterwards for the paths a stray case
-would leave: `hyperpower.yml`, `.hyperpower/`, `CODEBASE_RULEBOOK.md`, `decisions/`. Any of
-them appearing fails the run with `POLLUTION`.
+would leave: `hyperpower.yml`, `.hyperpower/`, `CODEBASE_RULEBOOK.md`, `decisions/`, and any
+`__pycache__/` or `.pyc` an import left behind. Any of them appearing fails the run with
+`POLLUTION`.
+
+Bytecode is on that list because it is gitignored. `git status` stays clean while the
+plugin directory fills up, so the runner looks for it directly.
+
+The runner also drops `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and the rest of the git
+plumbing variables before it builds anything. A hook, `git rebase --exec` and `git bisect
+run` all export them. Left in place they aim the scratch repo's own `git init`, `git add
+-A` and `git commit` at the caller's repository, and the caller's uncommitted work lands
+there in a commit named `scratch`. `POLLUTION` does not catch that: it reads paths, not
+commits.
 
 Read from the plugin freely. `$HP_PLUGIN`, `$HP_SCRIPTS`, `$HP_SCHEMAS`, `$HP_GATES_DIR`
 and `$HP_DOCS` are read-only inputs. Never write to them, and never pass one as a `--root`.
+
+A case that needs to break the plugin copies `$HP_DOCS` and `$HP_REPO/plugins` into
+`$HP_TEST_TMP` and breaks the copy. `cases/hp-selfcheck.sh` is the worked example. Never
+plant a fault in the tree the suite is running from.
 
 ## Adding a case
 
@@ -103,6 +132,7 @@ Rules:
 | `HP_GATES_DIR` | `plugins/hyperpower/gates` |
 | `HP_PLUGIN` | `plugins/hyperpower` |
 | `HP_DOCS` | `docs/` |
+| `HP_REPO` | the repository root. Read only, and never a `--root`. |
 
 The scratch repo starts with every gate disabled, `src/a.txt`, `src/b.txt`, and one commit.
 A case that needs a gate turns that one on.
@@ -156,7 +186,10 @@ each call.
 | `jsonl-count FILE` | non-empty lines |
 | `gate-field FILE GATE FIELD` | one field of one gate record in an `hp-gates` aggregate |
 | `yaml-blocks DOC OUTDIR` | writes every fenced yaml block, prints the count |
-| `contract SCHEMA [--run-id R] [--drop F] [--extra F] [--enum-break F]` | the smallest instance a schema accepts, optionally broken three ways |
+| `md-jsonl-keys DOC SECTION N` | sorted keys of the Nth jsonl record fenced under a `##` heading |
+| `md-jsonl-get DOC SECTION N PATH` | one value from that record |
+| `cache-key PROMPT UPSTREAM FILES` | the cache key `JOURNAL.md` specifies, computed here |
+| `contract SCHEMA [--run-id R] [--drop F] [--extra F] [--enum-break F] [--assumption ID]` | the smallest instance a schema accepts, optionally broken three ways |
 
 A missing value prints `<missing>`. Compare against that rather than against an empty
 string.

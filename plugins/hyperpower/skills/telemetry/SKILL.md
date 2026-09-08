@@ -24,18 +24,15 @@ delete it.
 
 ## What is recorded
 
-| Path | Holds | Committed |
+Every file under `.hyperpower/runs/<id>/` that `scripts/JOURNAL.md` lists: `meta.json`, the
+step contracts, `usage.jsonl`, `mistakes.jsonl`, `corrections.jsonl`, `resume.jsonl`, and
+the `gates/` logs. None of it is committed. Read the record shapes there, not here.
+
+| Also under `.hyperpower/` | Holds | Committed |
 |---|---|---|
-| `.hyperpower/runs/<id>/meta.json` | base sha, task class, model tiers, config hash | no |
-| `.hyperpower/runs/<id>/<step>.json` | that step's contract and its assumptions | no |
-| `.hyperpower/runs/<id>/usage.jsonl` | one line per model call, plus gate results | no |
-| `.hyperpower/runs/<id>/mistakes.jsonl` | failure events from that run | no |
-| `.hyperpower/runs/<id>/corrections.jsonl` | corrections applied by `/hyperpower:correct` | no |
-| `.hyperpower/runs/<id>/resume.jsonl` | one line per `/hyperpower:resume` replay | no |
-| `.hyperpower/runs/<id>/gates/<gate>.log` | full output of each gate command | no |
-| `.hyperpower/backlog.jsonl`, `.hyperpower/hygiene.jsonl` | scout and janitor sheets | yes |
-| `.hyperpower/promotions.jsonl` | one line per promoter action | yes |
-| `.hyperpower/redact-salt` | the salt that path tokens are derived from | no, and never |
+| `backlog.jsonl`, `hygiene.jsonl` | scout and janitor sheets | yes |
+| `promotions.jsonl` | one line per promoter action | yes |
+| `redact-salt` | the salt that path tokens are derived from | no, and never |
 
 The sheets and the promotion log are committed because people review them. They are not
 telemetry, and `purge` does not touch them.
@@ -86,11 +83,8 @@ Do not edit the committed `hyperpower.yml`, which would change it for everyone o
 2. Set that one field. Leave every other field untouched.
 3. Print the effective value and the file it came from.
 
-`off` deletes nothing. `on` backfills nothing. The gap stays a gap, and
-`/hyperpower:usage` reports the window as it is.
-
-The harness still runs with telemetry off. `usage` and `cost` then report only what was
-recorded before it was turned off.
+`off` deletes nothing. `on` backfills nothing. The gap stays a gap, `/hyperpower:usage`
+reports the window as it is, and the harness still runs with telemetry off.
 
 If `hyperpower.local.yml` is not gitignored, say so and print the line to add. Do not edit
 `.gitignore` from this command.
@@ -105,11 +99,9 @@ Deleting is irreversible here. Run folders are gitignored, so git cannot restore
 4. Delete `.hyperpower/runs/` and recreate nothing.
 5. Report the file count and the run folder count removed.
 
-Never delete before step 3. Never delete anything outside `.hyperpower/runs/`.
-
-| Removed | Kept |
-|---|---|
-| every run folder, including `meta.json`, step contracts, `usage.jsonl`, `mistakes.jsonl`, `corrections.jsonl`, `resume.jsonl`, and the `gates/` logs | `decisions/`, `CODEBASE_RULEBOOK.md`, `backlog.jsonl`, `hygiene.jsonl`, `promotions.jsonl`, `redact-salt`, the config files |
+Never delete before step 3. Never delete anything outside `.hyperpower/runs/`. Every run
+folder goes. Everything else stays: the committed rows above, `redact-salt`, `decisions/`,
+`CODEBASE_RULEBOOK.md`, and the config files.
 
 Say the consequence before asking. The mistakes log lives inside the run folders, so purging
 removes the evidence the promoter counts toward a rulebook rule. Rules already promoted stay
@@ -147,7 +139,7 @@ lining up.
 | Redacted | Left alone |
 |---|---|
 | a value that is a file path | a gate, step, stage, agent, or model name |
-| a path inside a free-text `detail`, `evidence`, or `outcome` string | a git sha, a run id, a config hash |
+| a path inside a free-text `detail`, `evidence`, `result`, or `outcome` string | a git sha, a run id, a config hash |
 | a map key that is a path, such as the `blobs` map | a URL, a version number, a timestamp |
 | a `file:line` citation, keeping the line number | `hyperpower.yml`, `pricing.yml`, and anything under `.hyperpower/` |
 
@@ -156,16 +148,23 @@ hashing them removes usefulness and adds no privacy.
 
 What still leaks, stated plainly rather than implied away:
 
-1. A bare name with no extension, such as `Makefile` or `Dockerfile`, is not recognised as a
-   path and prints as written.
-2. A free-text field carries anything. A path written with spaces, or described in prose as
-   "the settings module", survives the transform.
-3. `.hyperpower/runs/<id>/gates/<gate>.log` holds the raw output of a gate command, paths
+1. A name with no extension and no slash is not a path here. `Makefile`, `Dockerfile`, and
+   `my notes` print as written.
+2. A path splits at any character that cannot appear in one, and each piece is redacted only
+   if that piece is path-shaped alone. `src\api\settings.ts` prints as
+   `src\api\path:567e5738`, and `my file.md` prints as `my path:c5d64625`. Part of the name
+   stays while the line reads as redacted.
+3. Splitting breaks grouping too. `src/my components/List.tsx` becomes two tokens, so one
+   file appears as two rows.
+4. The token is 8 hex characters, so two paths can collide onto one. A view grouped by file
+   then shows one row where there were two, and nothing in the row says so.
+5. `.hyperpower/runs/<id>/gates/<gate>.log` holds the raw output of a gate command, paths
    included. It is a journal file, not an aggregate. Do not paste one.
 
 Redaction is not anonymity. Anyone holding the repo and the salt can hash a path and
-compare. It stops a path leaking through a view that gets pasted elsewhere. Say that when
-asked, rather than implying more.
+compare, and a free-text field that names a file in words discloses it without ever looking
+like a path. Redaction stops a path leaking through a view that gets pasted elsewhere. Say
+that when asked, rather than implying more.
 
 ## Do not
 

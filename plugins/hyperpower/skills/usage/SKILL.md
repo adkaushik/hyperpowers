@@ -27,7 +27,7 @@ guess between them.
 `--since` filters on the record `ts`, not on the run folder mtime. A run that started
 before the window keeps the records that fall inside it.
 
-## Step 1 - read the records
+## Step 1 - read the records through hp-redact
 
 One JSON object per line. Read every file through `hp-redact`, never straight off disk, one
 run folder at a time:
@@ -43,19 +43,12 @@ A record carries no run id. `cat .hyperpower/runs/*/usage.jsonl` into one pipe l
 boundary, and with it run count, fix-loop rounds per run, median run duration, and `--by
 run`. The folder name is the only run id there is.
 
-It hashes file paths and passes everything else through. Group what it prints. Redacting
-the finished table instead misses every path folded into a group label. Pipe each
-`<step>.json` through it too, before reading `checkable` or a file list out of one.
+Group what `hp-redact` prints. Redacting the finished table instead misses every path
+already folded into a group label. Pipe each `<step>.json` through it too, before reading
+`checkable` or a file list out of one.
 
-| Field | Holds |
-|---|---|
-| `ts` | ISO 8601 UTC timestamp of the call |
-| `stage` | pipeline stage, or `gate:<name>` for a gate result |
-| `agent` | agent role that made the call |
-| `model` | model id |
-| `input_tokens`, `output_tokens`, `cache_read` | token counts. Absent on gate records. |
-| `duration_ms` | wall clock for that call |
-| `outcome` | `ok`, or a failure string |
+The record fields are the ones `scripts/JOURNAL.md` documents under `usage.jsonl`. Read
+them there. A second copy here drifts from the writer and nothing in the report shows it.
 
 A record whose `stage` starts with `gate:` is a gate result. It carries no token counts.
 Never count it as a model call.
@@ -113,12 +106,10 @@ Fix-loop rounds per task
   0 rounds    8 runs
   1 round     4 runs
   2 rounds    1 run
-  3 rounds    1 run
 
 Gate failures
   gate:unit     6 of 14
   gate:types    3 of 14
-  gate:lint     2 of 14
 ```
 
 Print the assumption line even when every assumption verified. Its absence reads as zero
@@ -142,40 +133,45 @@ sample is small.
 | Case | Do |
 |---|---|
 | `.hyperpower/runs/` missing | report that no runs are recorded. Stop. Do not create it. |
-| run folder with no `usage.jsonl` | count the folder, report it as unrecorded, exclude it from every rate |
+| run folder with no `usage.jsonl` | count it, report it as unrecorded, exclude it from every rate |
 | `telemetry.enabled` is false | say recording is off, then report what was recorded before it was |
 | window has no records | report zero runs and the date of the newest record on disk |
-| no `hyperpower.yml` | use the defaults below. Do not ask the user to create one. |
+| no `hyperpower.yml` | use 5 for the histogram width. Do not ask the user to create one. |
+
+With a config, read `limits.fix_loop_max_rounds` for that width. `hp-redact` reads
+`telemetry.redact_paths` itself, so do not read it here.
 
 ## Redaction
-
-`hp-redact` hashes a path-shaped value, a path inside a free-text `outcome` string, and a
-map key that is a path. A `file:line` citation keeps its line number, so
-`src/api/settings.ts:42` prints as `path:9f2a1c04:42`. The same path always gives the same
-token in this repo, so grouping by file still works.
-
-It does not catch every path. A bare name with no extension, such as `Makefile`, stays, and
-an `outcome` string is free text that can carry a path in a form nothing recognises. Call
-the report redacted. Never call it clean.
 
 Per-run journals keep real paths, by design. They already live inside the repo they
 describe. This is a read-side transform: it protects the view, not the file on disk.
 
+`hp-redact` hashes a path-shaped value, a path inside a free-text `outcome`, and a map key
+that is a path. `src/api/settings.ts:42` prints as `path:9f2a1c04:42`, keeping the line
+number, and the same path gives the same token here, so grouping by file still works.
+
+Call the report redacted. Never call it clean. Five things survive it:
+
+1. A name with no extension and no slash is not a path here. `Makefile` and `my notes`
+   print as written.
+2. A path splits at any character that cannot appear in one, and each piece is redacted only
+   if that piece is path-shaped alone. `src\api\settings.ts` prints as
+   `src\api\path:567e5738`, so part of the name stays while the line reads as redacted.
+3. Splitting breaks grouping too. `src/my components/List.tsx` becomes two tokens, so one
+   file appears as two rows.
+4. The token is 8 hex characters, so two files can collide onto one row in a grouping by
+   file, and the row does not say so.
+5. `outcome` is free text. It can name a file in words, which redaction never touches.
+
 When `telemetry.redact_paths` is false, `hp-redact` passes the records through and says so
 on stderr. Print that line above the report. `/hyperpower:telemetry` holds the full rule.
-
-## Config
-
-If `hyperpower.yml` exists at the repo root, read `limits.fix_loop_max_rounds` for the
-histogram width. Without it, use 5 rounds. `hp-redact` reads `telemetry.redact_paths`
-itself, so do not read it here and do not hash a path yourself.
 
 ## Do not
 
 - Do not print money or token prices. That is `/hyperpower:cost`.
 - Do not read source files, git history, or the diff. The journal is the only input.
 - Do not write to `.hyperpower/`. This command records nothing.
-- Do not report a stage as passing when it has no records.
-- Do not report a gate as run when only the model calls around it were recorded.
+- Do not report a stage as passing when it has no records, or a gate as run when only the
+  model calls around it were recorded.
 - Do not print a real file path in the report, and do not hash one by hand. `hp-redact` is
   the one implementation, and a second one gives a different token for the same file.

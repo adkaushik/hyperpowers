@@ -79,6 +79,22 @@ KEEP_PREFIXES = (".hyperpower/",)
 
 # Keys whose value is never a path, whatever it looks like. These are the columns an
 # aggregate groups by. Redacting one destroys the analysis redaction is meant to protect.
+#
+# The admission rule, because this list is the one place redaction can be switched off by
+# accident: a name belongs here only when its value is a closed vocabulary or an opaque id
+# in every schema that uses it. Check the name against all nine schemas, not against the
+# one you have open.
+#
+# Do not add a name that is an enum in one schema and free text in another. `source` and
+# `result` were both here and both leaked. `source` is the assumption enum in eight
+# schemas and a token file path in design.json. `result` is pass/fail in three schemas and
+# a free-text sentence in build.json real_path_check and review.json slices. A name-only
+# keep list cannot tell those apart, so it kept the path. Their enum values carry no slash
+# and no known extension, so leaving them out costs nothing and closes the leak.
+#
+# Do not add a name nothing writes. `outcome_class` was here and no schema, script, or
+# skill in the tree produces it, so it protected nothing and would have shielded whatever
+# claimed the name next.
 KEEP_KEYS = frozenset(
     (
         "agent",
@@ -93,14 +109,11 @@ KEEP_KEYS = frozenset(
         "key",
         "kind",
         "model",
-        "outcome_class",
         "prompt_hash",
-        "result",
         "run",
         "run_id",
         "severity",
         "slice_id",
-        "source",
         "stage",
         "status",
         "step",
@@ -582,10 +595,19 @@ the salt
 
 limits
   Redaction is not anonymity. Anyone holding the repo and the salt can hash a path and
-  compare. The digest is 8 hex characters, so two paths can collide in a large repo. A
-  free-text field can carry a path this script does not recognise: a bare name with no
-  extension such as Makefile, a path written with spaces in it, a Windows path spelled
-  with backslashes, or a file named in prose.
+  compare. Four gaps, stated rather than implied away.
+
+  1. A name with no extension and no slash is not a path here. Makefile, Dockerfile and
+     "my notes" print as written. A file named in prose, as "the settings module", is not
+     a path either and is never touched.
+  2. A candidate ends at any character that cannot appear in a path, and each piece is
+     redacted only when that piece is path-shaped alone. Backslash and space both end
+     one, so src\\api\\settings.ts prints as src\\api\\path:<hex> and "my file.md" prints
+     as my path:<hex>. Part of the name stays while the line reads as redacted.
+  3. Splitting also breaks grouping. "src/my components/List.tsx" becomes two tokens, so
+     one file appears as two rows, and a glob keeps the * and / between its pieces.
+  4. The digest is 8 hex characters, so two paths can collide. A view grouped by file
+     then shows one row where there were two, and nothing in the row says so.
 """
 
 

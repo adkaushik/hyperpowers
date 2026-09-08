@@ -740,14 +740,26 @@ hyperpower.local.yml           gitignored
 CODEBASE_RULEBOOK.md           committed
 decisions/                     committed
 .hyperpower/                   runs gitignored, sheets committed
-  runs/<run-id>/
-  backlog.jsonl
+  runs/<run-id>/               gitignored
+  evals/                       gitignored. run_evals.py writes run directories here.
+  backlog.jsonl                the scout's sheet
   backlog.md
-  hygiene.jsonl
+  hygiene.jsonl                the janitor's sheet
   hygiene.md
+  promotions.jsonl             one line per promoter action
+  redact-salt                  do not commit. See below.
+  commit-gate                  optional. Its presence arms the commit hook.
 ```
 
-`init` writes the `.gitignore` entries it needs.
+`init` writes three `.gitignore` entries: `.hyperpower/runs/`, `.hyperpower/evals/`, and
+`hyperpower.local.yml`. It never ignores `.hyperpower/` whole, because the three sheets are
+meant to be committed.
+
+`redact-salt` is the one file here that must not be committed, and `init` does not ignore
+it. Add it yourself. It is derived from the repo's root commit on first use, so a committed
+salt lets anyone holding the repo hash a path and match it against a redacted aggregate,
+which is the whole point of redacting. Deleting it changes every token, and aggregates from
+before the change stop lining up with aggregates after.
 
 ## Build order
 
@@ -766,27 +778,47 @@ Scout and janitor already exist as standalone skills and gain run-journal input 
 Product and business harnesses come after the kernel is proven. They add stages before
 Route; they add no new kernel.
 
+This is dependency order, not a status list, and it is not maintained as one. Steps 6 and 7
+name gates that now ship inert: `browser.sh`, `a11y.sh` and `visual.sh` are in the tree and
+report did-not-run until the repo supplies a dev server, a route, and the tooling each
+needs. Read [gates.md](gates.md) and [architecture.md](architecture.md) for what exists.
+Do not read a numbered step here as work outstanding.
+
 ## Known deviations
 
 Where the tree does not match a rule this project states. Each one is a decision on record.
 
 ### Skill length
 
-`docs/contributing.md` says a skill past 150 lines is doing two jobs. Four driver skills are
-past it. At the time of writing: `run` 408 lines, `init` 251, `eval` 214, `route` 160. Count
-the current set with `wc -l plugins/hyperpower/skills/*/SKILL.md`. Anything on that list
-that is not one of the four is debt against the rule, not an exception to it.
+`docs/contributing.md` says a skill past 150 lines is doing two jobs. Seven are past it:
+`run`, `init`, `eval`, `telemetry`, `usage`, `cost`, and `route`. `run` is the longest by a
+wide margin.
 
-The rule takes an exception, and those four are not split. `init` is one procedure of six
-ordered steps with one exit, so splitting it would publish a half that runs without the half
-it depends on, which is the failure the rule exists to prevent.
+Do not trust that list. Line counts move. Count the current set:
+
+```sh
+wc -l plugins/hyperpower/skills/*/SKILL.md | sort -rn
+```
+
+A skill over the line and not among the seven above is new debt, not a new exception.
+
+The rule takes an exception, and `init` is not split: it is one procedure of six ordered
+steps with one exit, so splitting it would publish a half that runs without the half it
+depends on, which is the failure the rule exists to prevent.
 
 A driver skill runs a fixed sequence end to end, and no section of it is worth invoking on
-its own. That is the whole exception.
+its own. That is the whole exception. Six of the seven are drivers: `run`, `init`, `eval`,
+`route`, `usage`, and `cost` are each numbered steps to one output.
 
-Do not read it as a raised cap. A skill that is not a driver and is past 150 lines is doing
-two jobs, and the repair is a shorter skill rather than a wider exception. The test is
-whether a section could be a command by itself, not the line count.
+`telemetry` is the seventh, and it is not a driver. It is four subcommands — `status`, `off`,
+`on`, `purge` — and each could be a command by itself, so it fails the test above. It stays
+one skill because `/hyperpower:telemetry` is one command in the surface above, so its length
+is debt and not structure. Shorten it. Do not split it into four skills, and do not widen the
+exception to cover it.
+
+Do not read the exception as a raised cap. The test is whether a section could be a command
+by itself, not the line count. A skill that is not a driver and is past 150 lines is doing
+two jobs, and the repair is a shorter skill.
 
 ## Open questions
 

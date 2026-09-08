@@ -54,16 +54,33 @@ Applying anyway. Scope: run.
 
 ## Step 3 - apply
 
-Every scope does these three, in order.
+Every scope does these three, in order. The first and the third are `hp-journal` calls.
+Never append to a `.jsonl` with a shell redirect: two writers interleave a partial record
+and the file stops parsing.
 
-1. Append to `.hyperpower/runs/<run>/corrections.jsonl`. Create the file if missing.
+1. Append to `.hyperpower/runs/<run>/corrections.jsonl`.
+
+```sh
+hp-journal correction <run> --step plan --assumption a1 \
+  --text "settings API returns { items: [] }" --scope run --challenged
+```
+
+It refuses an assumption the step never declared and names the ids the step did declare, so
+Step 1's check and this write agree. It prints the `key` it recorded; pass `--key` to set one
+yourself when the promoter must count one cause across runs that word it differently. Pass
+`--challenged` only when Step 2 actually printed a challenge.
 
 ```json
 {"run":"4f2a","step":"plan","assumption":"a1","key":"settings-api-shape","text":"settings API returns { items: [] }","scope":"run","challenged":true,"ts":"2026-09-07T11:04:12Z"}
 ```
 
-2. Set that assumption's `status` to `refuted` in `<step>.json`. A human correction means the recorded claim was wrong.
-3. Append to `.hyperpower/runs/<run>/mistakes.jsonl`, so the promoter can count the repeat.
+2. Set that assumption's `status` to `refuted` in `<step>.json`. A human correction means the recorded claim was wrong. Edit that one field. `hp-journal correction` writes `corrections.jsonl` and nothing else, so this write and the next one are yours.
+3. Append to `.hyperpower/runs/<run>/mistakes.jsonl`, so the promoter can count the repeat. Use the `key` step 1 printed, not the assumption id.
+
+```sh
+hp-journal mistake <run> --kind assumption_refuted --key settings-api-shape \
+  --ref .hyperpower/runs/<run>/corrections.jsonl
+```
 
 ```jsonl
 {"run":"4f2a","kind":"assumption_refuted","key":"settings-api-shape","ref":".hyperpower/runs/4f2a/corrections.jsonl"}

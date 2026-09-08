@@ -146,6 +146,44 @@ if [ -f "$BROWSER" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# The a11y gate drives axe through a browser. Both are tools it cannot install, so a
+# missing one is did-not-run and never a pass. An accessibility check that did not happen
+# must never report as one that found nothing.
+
+A11Y=$HP_GATES_DIR/a11y.sh
+if [ -f "$A11Y" ]; then
+  cfg=$HP_TEST_TMP/a11y-no-binary.json
+  printf '{"gates":{"a11y":{"enabled":true,"blocking":true}},' > "$cfg"
+  printf '"commands":{"dev_server":"true","dev_url":"http://127.0.0.1:1"},' >> "$cfg"
+  printf '"limits":{"gate_timeout_seconds":30}}\n' >> "$cfg"
+  T_STDIN=$cfg
+  t_run env HYPERPOWER_REPO_ROOT="$HP_TEST_REPO" \
+    HYPERPOWER_BROWSER_BIN="$HP_TEST_TMP/no-such-browser" /bin/sh "$A11Y"
+  t_status "gates/a11y.sh exits 78 when the browser axe drives is missing" 78
+  t_eq "gates/a11y.sh reports did_not_run rather than a pass" "did_not_run" \
+    "$(t_json_get "$T_OUT" result)"
+fi
+
+# ---------------------------------------------------------------------------
+# The visual gate diffs a route against a locked mock. It checks the mock before it boots
+# anything, so a route nobody drew is did-not-run even with a working dev server. A diff
+# against a proposal is a number nobody asked for.
+
+VISUAL=$HP_GATES_DIR/visual.sh
+if [ -f "$VISUAL" ]; then
+  cfg=$HP_TEST_TMP/visual-no-mock.json
+  printf '{"gates":{"visual":{"enabled":true,"blocking":true}},' > "$cfg"
+  printf '"commands":{"dev_server":"true","dev_url":"http://127.0.0.1:1"},' >> "$cfg"
+  printf '"limits":{"gate_timeout_seconds":30}}\n' >> "$cfg"
+  T_STDIN=$cfg
+  t_run env HYPERPOWER_REPO_ROOT="$HP_TEST_REPO" HYPERPOWER_ROUTE=/settings \
+    /bin/sh "$VISUAL"
+  t_status "gates/visual.sh exits 78 when no mock is locked for the route" 78
+  t_eq "gates/visual.sh reports did_not_run for an undrawn route" "did_not_run" \
+    "$(t_json_get "$T_OUT" result)"
+fi
+
+# ---------------------------------------------------------------------------
 # Empty config on stdin is what hp-selfcheck probes each gate with. Still a could-not-run.
 
 printf '' > "$HP_TEST_TMP/empty.json"

@@ -50,6 +50,17 @@ HP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 hp_init browser
 
+# hp-gates stops this script at limits.gate_timeout_seconds and gives it five seconds to die.
+# The gate keeps this many seconds back so its own timer fires first: it then reports the
+# timeout in its own words and stops the dev server before the outer killer arrives. A gate
+# killed part way through teardown leaves the dev server running, because the server sits in
+# its own session and hp-gates only signals this script's process group.
+TEARDOWN_RESERVE=8
+WORK_TIMEOUT=$((HP_TIMEOUT - TEARDOWN_RESERVE))
+# A budget smaller than the reserve is not a real configuration. Use it whole rather than
+# reduce it to nothing.
+if [ "$WORK_TIMEOUT" -lt 1 ]; then WORK_TIMEOUT=$HP_TIMEOUT; fi
+
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then PYTHON_BIN=python3; fi
 
@@ -73,7 +84,7 @@ descendants() {
   while [ -n "$d_list" ] && [ "$d_depth" -lt 6 ]; do
     d_next=$(ps -Ao pid=,ppid= 2>/dev/null | awk -v list="$d_list" '
       BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
-      $2 in want { print $1 }
+      $2 in want { printf "%s ", $1 }
     ' || true)
     if [ -z "$d_next" ]; then break; fi
     d_all="$d_all $d_next"
@@ -83,7 +94,9 @@ descendants() {
   printf '%s' "$d_all"
 }
 
-# stop_pid <pid> <in-own-group> — TERM, then KILL after five seconds. Never leaves a child.
+# stop_pid <pid> <in-own-group> — TERM, then KILL after three seconds. Never leaves a child.
+# Three, not more: hp-gates gives this script five seconds between its TERM and its KILL, and
+# a teardown that overruns that window is killed part way through.
 stop_pid() {
   sp_pid=$1
   sp_group=$2
@@ -95,7 +108,7 @@ stop_pid() {
     kill -TERM $sp_kids "$sp_pid" 2>/dev/null || true
   fi
   sp_i=0
-  while [ "$sp_i" -lt 5 ]; do
+  while [ "$sp_i" -lt 3 ]; do
     if ! kill -0 "$sp_pid" 2>/dev/null; then break; fi
     sleep 1
     sp_i=$((sp_i + 1))
@@ -154,6 +167,75 @@ os.execvp(sys.argv[1], sys.argv[1:])' "$@" >"$lg_out" 2>"$lg_err" </dev/null &
   return 0
 }
 
+# start_server <command> <log> — boots the dev server under a supervisor in its own session,
+# and sets SERVER_PID and SERVER_GROUP to it.
+#
+# The supervisor owns the server as its child, so one signal to its own process group stops
+# the whole tree, however many processes the command forked. It stops on TERM, when this
+# gate's pid disappears, and at a hard deadline. Those last two are the point: hp-gates kills
+# a gate that overruns by signalling the gate's process group, the supervisor is not in that
+# group, and a supervisor that only listened for TERM would then keep the server alive for
+# ever. It watches the gate instead of trusting it.
+#
+# The supervisor exits with the dev server's own status, so the caller still reads 127 as a
+# missing dependency rather than as a crash.
+start_server() {
+  ss_cmd=$1
+  ss_log=$2
+  ss_deadline=$((HP_TIMEOUT + 30))
+  # The supervisor stops the server with `kill 0`, which signals its whole process group.
+  # That group is the server's own only when launch_group can isolate it. With neither
+  # python3 nor setsid the supervisor shares this gate's process group, and the group signal
+  # would kill the gate and whatever called the gate. Start the server without a supervisor
+  # there, and let stop_pid signal it and its children by pid.
+  if [ -z "$PYTHON_BIN" ] && ! command -v setsid >/dev/null 2>&1; then
+    launch_group "$ss_log" "$ss_log" sh -c "$ss_cmd"
+    SERVER_PID=$LAUNCH_PID
+    SERVER_GROUP=$LAUNCH_GROUP
+    return 0
+  fi
+  launch_group "$ss_log" "$ss_log" sh -c '
+    gate=$1
+    budget=$2
+    cmd=$3
+    stop_tree() {
+      trap "" TERM
+      kill -TERM 0 2>/dev/null || true
+      sleep 2
+      kill -KILL 0 2>/dev/null || true
+      exit 143
+    }
+    trap stop_tree TERM INT HUP
+    (
+      while [ "$budget" -gt 0 ]; do
+        # Two questions, because one is not enough. kill -0 answers for a zombie, and a gate
+        # that was killed stays a zombie until its own caller reaps it, so read the state as
+        # well. A supervisor whose parent is no longer the gate has been reparented, which
+        # says the same thing and survives pid reuse.
+        parent=$(ps -o ppid= -p $$ 2>/dev/null | tr -d " " 2>/dev/null)
+        [ "$parent" = "$gate" ] || break
+        state=$(ps -o stat= -p "$gate" 2>/dev/null | tr -d " " 2>/dev/null)
+        case ${state:-gone} in
+          gone|Z*) break ;;
+        esac
+        sleep 1
+        budget=$((budget - 1))
+      done
+      kill -TERM 0 2>/dev/null || true
+    ) &
+    ss_watch=$!
+    sh -c "$cmd" &
+    ss_kid=$!
+    ss_status=0
+    wait "$ss_kid" || ss_status=$?
+    kill -TERM "$ss_watch" 2>/dev/null || true
+    exit "$ss_status"
+  ' hyperpower-dev-server "$$" "$ss_deadline" "$ss_cmd"
+  SERVER_PID=$LAUNCH_PID
+  SERVER_GROUP=$LAUNCH_GROUP
+  return 0
+}
+
 # ---------------------------------------------------------------- budget
 
 elapsed() {
@@ -163,7 +245,7 @@ elapsed() {
 }
 
 remaining() {
-  rm_v=$(( HP_TIMEOUT - $(elapsed) ))
+  rm_v=$(( WORK_TIMEOUT - $(elapsed) ))
   if [ "$rm_v" -lt 0 ]; then rm_v=0; fi
   printf '%s' "$rm_v"
 }
@@ -354,9 +436,7 @@ case $preboot in
     printf '=== boot: %s ===\n' "$dev_server" >> "$log"
     SERVER_LOG=$HP_TMPDIR/dev-server.log
     : > "$SERVER_LOG"
-    launch_group "$SERVER_LOG" "$SERVER_LOG" sh -c "$dev_server"
-    SERVER_PID=$LAUNCH_PID
-    SERVER_GROUP=$LAUNCH_GROUP
+    start_server "$dev_server" "$SERVER_LOG"
     booted=1
     ;;
   *)
@@ -370,7 +450,7 @@ if [ "$booted" -eq 1 ]; then
   if [ "$budget" -le 0 ]; then
     cat "$SERVER_LOG" >> "$log"
     HP_OUT=$log
-    hp_fail "browser gate ran out of its ${HP_TIMEOUT}s budget before the dev server answered.$(hp_advisory_note)" \
+    hp_fail "browser gate ran out of its ${WORK_TIMEOUT}s working budget before the dev server answered.$(hp_advisory_note)" \
       "$(hp_evidence)"
   fi
   ready=0
@@ -390,7 +470,7 @@ if [ "$booted" -eq 1 ]; then
   fi
   if [ "$ready" -ne 0 ]; then
     HP_OUT=$log
-    hp_fail "$dev_url did not answer within ${HP_TIMEOUT}s.$(hp_advisory_note)" "$(hp_evidence)"
+    hp_fail "$dev_url did not answer within ${WORK_TIMEOUT}s of the ${HP_TIMEOUT}s budget.$(hp_advisory_note)" "$(hp_evidence)"
   fi
 fi
 
@@ -402,7 +482,7 @@ mkdir -p "$profile"
 budget=$(remaining)
 if [ "$budget" -le 0 ]; then
   HP_OUT=$log
-  hp_fail "browser gate ran out of its ${HP_TIMEOUT}s budget before loading $target.$(hp_advisory_note)" \
+  hp_fail "browser gate ran out of its ${WORK_TIMEOUT}s working budget before loading $target.$(hp_advisory_note)" \
     "$(hp_evidence)"
 fi
 
@@ -442,7 +522,7 @@ fi
 HP_OUT=$log
 
 if [ "$loaded" -eq 1 ]; then
-  hp_fail "$target did not render within ${HP_TIMEOUT}s.$(hp_advisory_note)" "$(hp_evidence)"
+  hp_fail "$target did not render within ${WORK_TIMEOUT}s of the ${HP_TIMEOUT}s budget.$(hp_advisory_note)" "$(hp_evidence)"
 fi
 if [ "$loaded" -eq 2 ]; then
   hp_did_not_run "the headless browser exited without producing a DOM" \

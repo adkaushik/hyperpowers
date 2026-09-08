@@ -115,6 +115,30 @@ adjudicate; it spawns the agents that do, by their namespaced names. A bare agen
 resolves to a same-named agent in the user's own `~/.claude/agents/`, which returns a
 contract this pipeline cannot read.
 
+#### The agents it spawns
+
+Nine agents in `plugins/hyperpower/agents/`, one file per role. Six run inside the pipeline
+and are below. The other three — archivist, promoter, gardener — run off the critical path
+and are under Background agents. `plugins/hyperpower/agents/README.md` is the index.
+
+| Stage | Agent | Model | Produces |
+|---|---|---|---|
+| Understand | `hyperpower:mapper` | inherit | `understand.json` |
+| Plan | `hyperpower:planner` | inherit | `plan.json` |
+| Design | `hyperpower:designer` | inherit | `design.json`, and the mock a human locks |
+| Build | `hyperpower:builder` | inherit | `build.json`, one task at a time |
+| Review | `hyperpower:reviewer` | opus | one slice of `review.json` |
+| Review | `hyperpower:skeptic` | opus | one verdict per finding |
+
+`mapper`, `planner`, `designer` and `builder` set `model: inherit`, so they run on the tier
+`task-classes.yml` gave their stage. Pinning a model on those four would ignore the route.
+On `builder` it would also break the fix loop: rounds 4 and 5 rerun the build one tier up,
+and a pinned model cannot move.
+
+The frontmatter `name` is the bare role and the plugin supplies the namespace. Spawn
+`hyperpower:reviewer`, never `reviewer`. `hp-selfcheck` check 2 fails a prefixed name and
+check 3 fails a dispatch that resolves to no file.
+
 ### 6. Render
 
 The single boundary where machine output becomes human output. Every harness exits here.
@@ -158,10 +182,11 @@ the file stops parsing.
 | `<step>.json` | `hp-journal step`, `hp-journal hash` | why, resume, correct, usage, archivist |
 | `usage.jsonl` | `hp-journal usage`, `hp-gates` | usage, cost, telemetry |
 | `mistakes.jsonl` | `hp-journal mistake`, the archivist | promoter, why, telemetry |
-| `gates.json` | `hp-gates`, through `hp-journal step` | run, the fix loop, why, archivist |
+| `gates.json` | `hp-gates`, through `hp-journal step`. The stamping pass re-records it with the `assumptions` array filled. | run, the fix loop, why, usage, archivist |
 | `gates/<gate>.log` | `gates/_lib.sh` | the gate report, telemetry |
-| `corrections.jsonl` | `/hyperpower:correct` | why, resume, archivist |
-| `resume.jsonl`, `superseded/` | `/hyperpower:resume` | telemetry, history |
+| `corrections.jsonl` | `hp-journal correction` and `correction-applied` | why, resume, archivist |
+| `resume.jsonl` | `hp-journal resume-event` | telemetry, history |
+| `superseded/<ts>/` | `/hyperpower:resume`, by moving files | history |
 
 The run id is `sha256("<base_sha>:<counter>")` truncated to four hex characters. It comes
 from the base sha, not from a clock and not from randomness. `hp-journal new` claims the
@@ -200,7 +225,7 @@ nothing in the output shows it.
 | Script | Does | Exit codes |
 |---|---|---|
 | `hp-config` | merges `hyperpower.yml` and `hyperpower.local.yml` and prints the effective config, the per-field source, and the config hash | 0 ok, 1 parse error, 78 no config |
-| `hp-journal` | writes and reads `.hyperpower/runs/<run-id>/`: `new`, `step`, `hash`, `usage`, `mistake`, `drift`, `finish`, `list`, `path` | 0 written, 1 refused, 78 no config |
+| `hp-journal` | writes and reads `.hyperpower/runs/<run-id>/`. Thirteen subcommands: `new`, `step`, `usage`, `mistake`, `correction`, `corrections`, `correction-applied`, `resume-event`, `hash`, `drift`, `finish`, `list`, `path` | 0 written, 1 refused, 78 no config |
 | `hp-validate` | checks a stage contract against `schemas/<stage>.json` | 0 valid, 1 invalid, 2 usage, 78 no schema |
 | `hp-gates` | runs every enabled gate and records the aggregate | 0 all blocking passed, 1 blocking failure, 78 blocking gate could not run, 2 hp-gates could not run |
 | `hp-redact` | hashes file paths in run records before they reach an aggregate view | 0 emitted, 1 bad input, 2 usage |
@@ -244,11 +269,59 @@ Who calls what:
 |---|---|
 | `/hyperpower:run` | all four of `hp-config`, `hp-journal`, `hp-validate`, `hp-gates` |
 | `/hyperpower:route` | `hp-config`, `hp-validate`, and `hp-journal` only after route returns |
-| `/hyperpower:resume` | `hp-journal drift`, `hp-config`, `hp-gates` |
+| `/hyperpower:resume` | `hp-journal drift`, `corrections`, `resume-event`, `correction-applied`, then `hp-config` and `hp-gates` |
+| `/hyperpower:correct` | `hp-journal correction`, then `hp-journal mistake` |
 | `/hyperpower:config` | `hp-config --source` |
 | `/hyperpower:doctor` | `hp-config --source`, then `hp-gates --only <gate>` per gate |
+| `/hyperpower:usage`, `/hyperpower:cost`, `/hyperpower:telemetry` | `hp-redact`, and `hp-config --source` |
 | the mapper, planner, designer | `hp-validate` on their own contract before returning it |
 | CI | `hp-selfcheck`, then `run_evals.py validate` |
+
+## Hooks
+
+Two, wired in `plugins/hyperpower/hooks/hooks.json`. Both are POSIX `sh`, and both exit 0 on
+every failure path, so a broken hook never blocks a session and never traps a commit. Full
+behaviour is in `plugins/hyperpower/hooks/README.md`.
+
+| Hook | Event | Default | Does |
+|---|---|---|---|
+| `session-start.sh` | SessionStart | on | injects the harness protocol into the main agent, once per session |
+| `require-commit-prep.sh` | PreToolUse on Bash | inert | denies a bare `git commit` until the change has been through the gates |
+
+`session-start.sh` reads two config fields and no others: `voice.adhd_shaping` and
+`voice.plain_english`. With no `hyperpower.yml` it injects one line telling you to run
+`/hyperpower:init`. It does not infer a stack, a gate, or a command.
+
+The protocol reaches the main agent only. A subagent does not re-run the hook and does not
+inherit the injected text, so a rule a subagent needs goes in that subagent's prompt.
+
+`require-commit-prep.sh` does nothing until a flag file exists: `.hyperpower/commit-gate` in
+the repo, or `hyperpower-commit-gate` in the Claude config directory. It judges gate
+evidence and nothing else — a run journal exists, the newest run reached Gates, no gate
+failed, at least one passed, no `did_not_run` blames a missing tool or a timeout, and no
+changed file is newer than `gates.json`.
+
+It raises the cost of an unchecked commit. It does not prevent one. It matches `git commit`
+in the Bash command string, so a script that commits is never seen. Do not treat it as
+enforcement, and do not remove a gate because this hook is on.
+
+## Workflows
+
+Two deterministic orchestration scripts in `plugins/hyperpower/workflows/`, run with the
+`Workflow` tool. Control flow lives in JavaScript rather than a prompt, so fan-out, dedupe,
+and tallying happen the same way every run.
+
+| Script | Does | Agent calls |
+|---|---|---|
+| `review-sweep.js` | partition a diff, review each slice, adjudicate each finding | 1 + slices + findings |
+| `council-vote.js` | four independent votes on one decision, then a synthesis | 5, or 6 with grounding |
+
+Both are read-only. Neither edits a file, runs the test suite, installs anything, or writes
+to the run journal. The caller writes the journal.
+
+A workflow earns its cost when the structure changes the answer. Do not run `review-sweep`
+on a one-file change with a rulebook precedent, and do not run `council-vote` on a decision a
+later commit can undo cheaply. One agent reaches the same result for less.
 
 ## Assumptions
 
@@ -304,13 +377,16 @@ Never delete. Supersession only.
 
 Five. All off the critical path. Nothing here costs a normal run anything.
 
-| Agent | Trigger | Reads | Writes |
-|---|---|---|---|
-| Archivist | post-run | run journal | `decisions/`, `mistakes.jsonl` |
-| Promoter | post-run | mistakes log, archive on a hit | rulebook |
-| Gardener | on command | archive | archive (compacts) |
-| Scout | post-run or on command | run journal, or git diff | `backlog.jsonl` |
-| Janitor | post-run or on command | lockfiles, diff, repo tools | `hygiene.jsonl` |
+| Agent | Ships as | Trigger | Reads | Writes |
+|---|---|---|---|---|
+| Archivist | `agents/archivist.md` | post-run | run journal | `decisions/`, `mistakes.jsonl` |
+| Promoter | `agents/promoter.md` | post-run, after the archivist | mistakes log, archive on a hit | rulebook, `promotions.jsonl` |
+| Gardener | `agents/gardener.md` | `/hyperpower:gc` only | archive | archive (compacts) |
+| Scout | `skills/scout/` | post-run or on command | run journal, or git diff | `backlog.jsonl` |
+| Janitor | `skills/janitor/` | post-run or on command | lockfiles, diff, repo tools | `hygiene.jsonl` |
+
+Three ship as agent files and two ship as skills. The split is how each is invoked, not what
+it costs: all five are off the critical path.
 
 ### How the loop closes
 

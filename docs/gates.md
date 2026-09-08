@@ -193,9 +193,15 @@ Screenshot the route, screenshot the locked mock, and diff the two images.
 Set `HYPERPOWER_RUN_DIR` so the gate can read `design.json`, and so the diff image and both
 screenshots land in that run's `gates/` directory.
 
-It fails when more than 5 percent of pixels differ by more than 8 per channel. Both numbers
-are hardcoded in the script, for the same reason the a11y threshold is: the config schema
-has no field for either.
+It fails when more than 1 percent of pixels differ by more than 8 per channel, and both
+screenshots are taken at 1280x800 so the diff compares one viewport. All three numbers are
+hardcoded in the script, for the same reason the a11y threshold is: the config schema has no
+field for any of them. To change one, edit `DIFF_MAX_PERCENT`, `DIFF_TOLERANCE`, or
+`SHOT_WIDTH` and `SHOT_HEIGHT` in `gates/visual.sh`.
+
+The mock is checked before the dev server. A route nobody has drawn reports
+`no locked mock for route <route>` and boots nothing, so satisfy the mock rows first. A
+correct `dev_server` will not change that message.
 
 A mock nobody locked is not a baseline, and a diff against a proposal is a number nobody
 asked for. A route with no locked mock is did-not-run, not a failure: it is a route nobody
