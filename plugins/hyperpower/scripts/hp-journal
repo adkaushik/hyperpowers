@@ -1490,8 +1490,13 @@ def cmd_finish(args):
 
 def cmd_list(args):
     root = find_root(args.root)
-    rows = list_runs(root)[: args.limit]
+    all_rows = list_runs(root)
+    rows = all_rows[: args.limit]
+    hidden = len(all_rows) - len(rows)
     if args.json:
+        # --limit applies here too. A caller that asked for N rows knows it asked, and
+        # paging is legitimate. The remainder line below is for the human table, where
+        # a silent cut reads as complete coverage.
         sys.stdout.write(json.dumps(rows, separators=(",", ":")) + "\n")
         return EXIT_OK
     if not rows:
@@ -1508,6 +1513,13 @@ def cmd_list(args):
                 row["task_class"] or "-",
                 row["outcome"] or "-",
             )
+        )
+    if hidden:
+        # Rank, never cap. A list cut at the limit with no remainder count reads as
+        # complete coverage, which is the rule this repo states and hp-journal already
+        # follows in resolve_run.
+        out.append(
+            "and {} more. Raise --limit to see them.".format(hidden)
         )
     sys.stdout.write("\n".join(out) + "\n")
     return EXIT_OK

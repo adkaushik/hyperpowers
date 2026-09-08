@@ -502,9 +502,9 @@ if [ -n "${HYPERPOWER_RUN_DIR:-}" ] && [ -f "$HYPERPOWER_RUN_DIR/design.json" ];
       hp_did_not_run "the mock at $design_mock is not locked" \
         "design.json records locked: ${design_locked:-absent}. A mock nobody locked is a proposal, not a baseline. Lock it, then rerun the gate."
     fi
-    if [ "$design_baseline" = "false" ]; then
-      hp_did_not_run "design.json records verification.baseline_valid false for $design_mock" \
-        "the designer built this mock without a human in the run. Lock it, then rerun the gate."
+    if [ "$design_baseline" != "true" ]; then
+      hp_did_not_run "design.json does not record verification.baseline_valid true for $design_mock" \
+        "it records ${design_baseline:-no verification key}. A baseline is valid only when the design stage says so explicitly. Absent is not true."
     fi
     # The designer records git hash-object of the mock so a later stage can tell whether the
     # file changed after the lock. This is that stage. A mock edited after the lock is a
@@ -524,6 +524,10 @@ if [ -n "${HYPERPOWER_RUN_DIR:-}" ] && [ -f "$HYPERPOWER_RUN_DIR/design.json" ];
   fi
 fi
 
+# No route-slug fallback. A file sitting at docs/mocks/<slug>.html carries no lock
+# record, and a diff against a proposal is a number nobody asked for. The only baseline
+# this gate accepts is one design.json records as locked. Finding a plausible file and
+# calling the result a pass is the failure this whole gate exists to prevent.
 if [ -z "$mock" ]; then
   last_segment=$(printf '%s' "$route" | awk -F / '{ print $NF }')
   for candidate in \
@@ -531,9 +535,8 @@ if [ -z "$mock" ]; then
     "$docs_dir/mocks/$(printf '%s' "$slug" | tr '-' '_').html" \
     "$docs_dir/mocks/$(slug_of "$last_segment").html"; do
     if [ -f "$candidate" ]; then
-      mock=$candidate
-      mock_source="route slug"
-      break
+      hp_did_not_run "found $candidate for route $route, but nothing locked it" \
+        "a mock is a baseline only when design.json records it with locked: true and verification.baseline_valid: true. Lock it through the design stage, then rerun the gate."
     fi
   done
 fi

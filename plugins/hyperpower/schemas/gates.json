@@ -286,6 +286,10 @@
               "null"
             ],
             "description": "Path to the full gate output under the run journal."
+          },
+          "disabled": {
+            "type": "boolean",
+            "description": "True only when gates.<name>.enabled is false. Absent means not disabled, which fails closed. Exit 78 keys on this field, not on the detail text, so a gate script that prints the disabled sentence cannot escape it."
           }
         }
       }

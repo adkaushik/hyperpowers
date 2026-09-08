@@ -481,6 +481,12 @@ def resolve_run(args, root):
     env_dir = os.environ.get("HYPERPOWER_RUN_DIR", "").strip()
     if env_dir:
         path = Path(env_dir).expanduser()
+        if not path.is_absolute():
+            # Anchor to the repo root, never the working directory. hp-gates exports
+            # this as a repo-relative path, so running from a subdirectory would
+            # otherwise scatter gate logs into a stray .hyperpower tree that
+            # /hyperpower:why cannot see.
+            path = Path(root) / path
         return path.name, path
     if args.only:
         note(
@@ -779,12 +785,15 @@ def record_for(name, entry, script, timeout, exit_code, stdout, stderr, elapsed,
     }
 
 
-def skipped_record(name, entry, detail, evidence):
+def skipped_record(name, entry, detail, evidence, disabled=False):
     return {
         "gate": name,
         "result": DID_NOT_RUN,
         "detail": detail,
         "evidence": evidence,
+        # Structural, not the detail text. Exit 78 turns on this field, and a gate
+        # script that happens to print the disabled sentence must not escape it.
+        "disabled": bool(disabled),
         "blocking": not is_false(entry.get("blocking")),
         "exit_code": None,
         "duration_ms": 0,
@@ -816,7 +825,9 @@ def with_log(evidence, path):
 def one_gate(name, entry, cfg_json, timeout, env, root, run_dir):
     """Run one gate, or say why it did not run. Never raises on a broken gate script."""
     if is_false(entry.get("enabled")):
-        return skipped_record(name, entry, DISABLED, "gates.%s.enabled is false" % name)
+        return skipped_record(
+            name, entry, DISABLED, "gates.%s.enabled is false" % name, disabled=True
+        )
     script = GATES_DIR / ("%s.sh" % name)
     if not script.is_file():
         return skipped_record(
@@ -882,7 +893,7 @@ def blocking_unverified(records):
     return [
         r["gate"]
         for r in records
-        if r["result"] == DID_NOT_RUN and r["blocking"] and r["detail"] != DISABLED
+        if r["result"] == DID_NOT_RUN and r["blocking"] and not r.get("disabled")
     ]
 
 
@@ -977,7 +988,7 @@ def did_not_run_mark(record):
     warning   gates.<name>.blocking is false, so it does not hold the run
     disabled  gates.<name>.enabled is false, which is a deliberate choice and is excluded
     """
-    if record["detail"] == DISABLED:
+    if record.get("disabled"):
         return "disabled"
     return "blocking" if record["blocking"] else "warning"
 

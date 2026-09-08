@@ -420,3 +420,23 @@ t_ne "a journal read from outside the repo still finds its runs" "<missing>" \
 T_CWD=$HP_TEST_TMP
 t_run env HYPERPOWER_REPO_ROOT="$HP_TEST_REPO" "$HP_PYTHON" "$HP_JOURNAL" path "$crun"
 t_eq "path resolves against the same root" "$RUNS/$crun" "$(t_out)"
+
+# ---------------------------------------------------------------------------
+# Task class is checked against task-classes.yml, and the run folder is not created
+# when it fails. JOURNAL.md states this as normative: "A class outside that file is
+# refused with the valid list, and the run folder is not created." Without this case the
+# check can be deleted and every assertion still passes.
+
+before=$(ls "$RUNS" 2>/dev/null | wc -l | tr -d ' ')
+t_hp_journal new --root "$HP_TEST_REPO" --task-class totally-invented --base "$BASE"
+t_ne "an invented task class is refused" "0" "$T_STATUS"
+t_stderr_has "the refusal names the valid classes" "task-classes.yml"
+after=$(ls "$RUNS" 2>/dev/null | wc -l | tr -d ' ')
+t_eq "a refused class creates no run folder" "$before" "$after"
+
+# Every class the routing table defines is accepted, so the check cannot drift into
+# rejecting real work.
+for tc in trivial one-file-fix feature ui-feature refactor bug dependency; do
+  t_hp_journal new --root "$HP_TEST_REPO" --task-class "$tc" --base "$BASE"
+  t_status "task class $tc is accepted" 0
+done
