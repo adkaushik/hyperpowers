@@ -225,13 +225,19 @@ Run the eval suite and print the release verdict.
 A prompt change ships only when it has no blockers, correctness and safety are within 0.1
 of baseline or better, and the weighted score beats baseline.
 
+Fifteen stack-neutral cases ship. Add your own after a few real runs, written against work
+you have read, then record the baseline with `--baseline`. Neither `init` nor this command
+generates cases from your commit history: a case taken from a commit nobody reviewed is a
+baseline nobody trusts, and every later comparison inherits it.
+
 ## Scripts
 
-The commands above are what you type. Underneath, five executables in
+The commands above are what you type. Underneath, six executables in
 `plugins/hyperpower/scripts/` do the mechanical work: config merging, journal writing,
-contract validation, gate running. Skills and agents call them instead of reimplementing
-any of it, so `/hyperpower:config` reports the config a run actually used and
-`/hyperpower:resume` re-derives the cache key `/hyperpower:run` wrote.
+contract validation, gate running, path redaction, and the plugin self-check. Skills and
+agents call them instead of reimplementing any of it, so `/hyperpower:config` reports the
+config a run actually used and `/hyperpower:resume` re-derives the cache key
+`/hyperpower:run` wrote.
 
 Python 3, standard library only. No third-party imports and no network access. You rarely
 run them by hand, but they are the contract, so they are documented here.
@@ -286,6 +292,11 @@ Exit 0 valid, 1 invalid, 2 usage error, 78 no schema for that stage. Anything bu
 hard stop: the next stage never runs on an unvalidated contract. Every violation prints
 with its JSON path, not just the first one.
 
+The schemas are nine files in `plugins/hyperpower/schemas/`, one per stage boundary:
+`route`, `understand`, `plan`, `design`, `build`, `gates`, `review`, `fix`, `render`. Every
+one is Draft 2020-12 with `additionalProperties: false`, so a stage that invents a field
+fails validation. Field lists are in `plugins/hyperpower/schemas/README.md`.
+
 ### `hp-gates`
 
 Run every enabled gate and record the aggregate.
@@ -295,13 +306,42 @@ hp-gates --run <run> --files src/a.ts,src/b.ts --config config.json --json
 hp-gates --only types --files src/a.ts --config config.json --json    # probe one gate
 ```
 
-Exit 0 no blocking gate failed, 1 a blocking gate failed or timed out, 2 hp-gates could not
-run at all. Results are `pass`, `fail`, and `did not run`; a did-not-run gate is never
+Exit 0 every enabled blocking gate passed, 1 a blocking gate failed or timed out, 78 a
+blocking gate could not run, 2 hp-gates could not run at all. Results are `pass`, `fail`, and `did not run`; a did-not-run gate is never
 counted as a pass and never fails the run, and the caller stops on it.
 
 `--only` with no `--run` is a probe: it runs the gate, prints the result, and records
 nothing, because a one-gate aggregate is not the run's gate result. A run that already
 finished is never adopted by the fallback either. Pass `--run` to write into one anyway.
+
+### `hp-redact`
+
+Hash file paths in run records before they reach an aggregate view.
+
+```sh
+cat .hyperpower/runs/4f2a/usage.jsonl | hp-redact --stdin
+hp-journal drift latest --json | hp-redact --stdin --explain
+```
+
+Reads JSON or JSONL on stdin, writes the same shape on stdout. A path becomes
+`path:<8 hex>`, and a `file:line` citation keeps its line number: `src/a.ts:42` becomes
+`path:9f2a1c04:42`. Gate names, step names, agent names, model ids, git shas, run ids,
+config hashes, URLs and timestamps pass through whole.
+
+Use it wherever `telemetry.redact_paths` applies: the aggregate views behind
+`/hyperpower:usage` and `/hyperpower:cost`, and anything you paste elsewhere. It is a
+read-side transform. Per-run journals keep real paths, because they already live inside the
+repo they describe, so nothing here changes what `hp-journal` recorded.
+
+With `telemetry.redact_paths` set to `false` it passes the input through unchanged and says
+on stderr that every path in it is real. With no config it treats redaction as on.
+
+The salt is `.hyperpower/redact-salt`, derived from the repo's root commit the first time
+the script runs. Do not commit it. Deleting it changes every token, and aggregates from
+before the change stop lining up with aggregates after.
+
+Redaction is not anonymity. Anyone holding the repo and the salt can hash a path and
+compare it.
 
 ### `hp-selfcheck`
 
@@ -310,7 +350,7 @@ user of the harness runs.
 
 ```sh
 hp-selfcheck                    # 13 checks
-hp-selfcheck --strict           # warnings are errors. This is what CI runs.
+hp-selfcheck --strict           # warnings are errors. Run this before a pull request.
 hp-selfcheck --only task-classes
 hp-selfcheck --fix              # repairs frontmatter, agent names, gate file modes only
 hp-selfcheck --list-checks
@@ -326,3 +366,22 @@ vocabulary.
 
 Validate, run, and score the eval suite. Documented in full in
 `plugins/hyperpower/scripts/README.md`.
+
+## Tests
+
+`plugins/hyperpower/tests/run-tests` executes the kernel scripts and asserts on what they
+print, write, and exit. This is a contributor tool. Using the harness never runs it.
+
+```sh
+./run-tests                    # every case in tests/cases/
+./run-tests --only hp-gates    # the cases whose file name matches
+./run-tests --verbose          # every assertion, and each case's own output
+./run-tests --list             # the cases that would run, then stop
+```
+
+Exit 0 when every assertion passed. Exit 1 when any assertion failed, any case crashed, or
+a case wrote inside the plugin repository. Each case runs in a fresh git repository under a
+temporary directory with its own `HOME`, so a case never touches the repo it is testing.
+
+Run it with `hp-selfcheck --strict` before opening a pull request. Selfcheck compares the
+tree against the documentation. The suite runs the code.

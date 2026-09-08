@@ -172,7 +172,7 @@
     },
     "exit_code": {
       "type": "integer",
-      "description": "0 no blocking gate failed, 1 a blocking gate failed. A blocking gate that did not run does not change it, so the caller reads the per-gate results."
+      "description": "0 every enabled blocking gate passed. 1 a blocking gate failed. 78 a blocking gate could not run, which is not a pass and is listed in blocking_unverified. 2 hp-gates itself could not run. A gate disabled in config never produces 78."
     },
     "counts": {
       "type": "object",

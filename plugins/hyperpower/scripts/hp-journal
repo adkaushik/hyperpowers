@@ -33,6 +33,11 @@ EXIT_NO_CONFIG = 78
 JOURNAL_DIR = ".hyperpower"
 RUNS_DIR = os.path.join(JOURNAL_DIR, "runs")
 
+# The plugin ships hp-config, hp-validate and task-classes.yml beside this script.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.dirname(SCRIPT_DIR)
+TASK_CLASSES_FILE = os.path.join(PLUGIN_DIR, "task-classes.yml")
+
 # Pipeline order. A <step>.json outside this list is not a step, and is refused.
 STEPS = [
     "route",
@@ -60,6 +65,26 @@ RUN_ID_WIDTH = 4
 RUN_ID_MAX_COUNTER = 10000
 LATEST = "latest"
 
+# A correction from /hyperpower:correct carries one of these three scopes.
+CORRECTION_SCOPES = ["once", "run", "forever"]
+
+CORRECTIONS_FILE = "corrections.jsonl"
+RESUME_FILE = "resume.jsonl"
+
+# The answer /hyperpower:resume took. A step name replays from there, <step>-anyway
+# replays from the requested step over the drift, abort writes nothing else.
+RESUME_ABORT = "abort"
+RESUME_ANYWAY_SUFFIX = "-anyway"
+
+# A derived correction key is cut here. Long enough to name a cause, short enough to type.
+KEY_MAX_CHARS = 48
+
+# The fields hp-journal itself stamps on a <step>.json. A file carrying only these was
+# created by `hash` before the stage returned, so no stage output was ever recorded.
+ENVELOPE_FIELDS = frozenset(
+    ("step", "run_id", "recorded_at", "prompt_hash", "files_read", "cache_key")
+)
+
 # One line must fit in one write(). 4096 bytes is the smallest POSIX PIPE_BUF, and it is
 # the size below which an O_APPEND write is atomic in practice.
 MAX_LINE_BYTES = 4096
@@ -75,14 +100,17 @@ class JournalError(Exception):
 # ------------------------------------------------------------------- hp-config
 
 
+_CONFIG_MODULE = []
+
+
 def load_config_module():
-    """Import the sibling hp-config script. It has no .py suffix, so name the loader."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    """Import the sibling hp-config script once. It has no .py suffix, so name the loader."""
+    if _CONFIG_MODULE:
+        return _CONFIG_MODULE[0]
+    path = os.path.join(SCRIPT_DIR, "hp-config")
     if not os.path.isfile(path):
         raise JournalError(
-            "hp-config is missing from {}. Reinstall the plugin.".format(
-                os.path.dirname(path)
-            )
+            "hp-config is missing from {}. Reinstall the plugin.".format(SCRIPT_DIR)
         )
     loader = importlib.machinery.SourceFileLoader("hp_config", path)
     spec = importlib.util.spec_from_file_location("hp_config", path, loader=loader)
@@ -95,6 +123,7 @@ def load_config_module():
         loader.exec_module(module)
     finally:
         sys.dont_write_bytecode = cached
+    _CONFIG_MODULE.append(module)
     return module
 
 
@@ -111,6 +140,105 @@ def load_config(root):
         return None, exc.render(), exc.message == module.NO_CONFIG_MESSAGE
 
 
+def task_class_names():
+    """The classes task-classes.yml defines, in file order.
+
+    That file is the routing table and the whole vocabulary. meta.json records what route
+    picked, and /hyperpower:usage groups by it, so a class outside this list is a run that
+    no aggregate ever counts.
+    """
+    if not os.path.isfile(TASK_CLASSES_FILE):
+        raise JournalError(
+            "{} is missing. It is the task class vocabulary. Reinstall the "
+            "plugin.".format(TASK_CLASSES_FILE)
+        )
+    module = load_config_module()
+    reader = getattr(module, "read_yaml_file", None)
+    if reader is None:
+        raise JournalError(
+            "hp-config no longer exposes read_yaml_file, so {} cannot be read. Reinstall "
+            "the plugin.".format(TASK_CLASSES_FILE)
+        )
+    try:
+        parsed = reader(TASK_CLASSES_FILE)
+    except module.ConfigError as exc:
+        raise JournalError("cannot read the task classes: {}".format(exc.render()))
+    classes = parsed.get("classes") if isinstance(parsed, dict) else None
+    if not isinstance(classes, dict) or not classes:
+        raise JournalError(
+            "{} has no classes: map. It is the whole task class vocabulary, so no class "
+            "can be checked against it.".format(TASK_CLASSES_FILE)
+        )
+    return list(classes)
+
+
+def check_task_class(name):
+    """Refuse a class the router could never pick. None passes: the field is optional."""
+    if name is None:
+        return None
+    known = task_class_names()
+    if name not in known:
+        raise JournalError(
+            "{} is not a task class. task-classes.yml defines these: {}".format(
+                json.dumps(name), ", ".join(known)
+            )
+        )
+    return name
+
+
+# --------------------------------------------------------------------- validate
+
+
+def validate_contract(step, record, source):
+    """Refuse a contract schemas/<step>.json rejects, naming every violation.
+
+    hp-validate is the one implementation of the schema check. A second one here would
+    drift from it, and nothing in the output would show it, so this shells out.
+    """
+    path = os.path.join(SCRIPT_DIR, "hp-validate")
+    if not os.path.isfile(path):
+        raise JournalError(
+            "hp-validate is missing from {}, so the contract was not checked and was not "
+            "written. Reinstall the plugin, or pass --no-validate to record it "
+            "unchecked.".format(SCRIPT_DIR)
+        )
+    body = json.dumps(record, ensure_ascii=False).encode("utf-8")
+    try:
+        result = subprocess.run(
+            [sys.executable, path, step, "--stdin"],
+            input=body,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except (OSError, ValueError) as exc:
+        raise JournalError(
+            "cannot run hp-validate ({}), so the contract was not checked and was not "
+            "written. Pass --no-validate to record it unchecked.".format(exc)
+        )
+    if result.returncode == 0:
+        return
+    detail = result.stderr.decode("utf-8", "replace").strip()
+    if not detail:
+        detail = result.stdout.decode("utf-8", "replace").strip()
+    reason = {
+        1: "{} is not a valid {} contract, so it was not written.".format(source, step),
+        2: "hp-journal called hp-validate with flags it refused, so the contract was not "
+        "checked and was not written.",
+        EXIT_NO_CONFIG: "there is no usable schema for step {}, so the contract was not "
+        "checked and was not written.".format(step),
+    }.get(
+        result.returncode,
+        "hp-validate exited {}, so the contract was not checked and was not "
+        "written.".format(result.returncode),
+    )
+    raise JournalError(
+        "{}\n{}\nFix the contract, or pass --no-validate to record it unchecked.".format(
+            reason, detail
+        )
+    )
+
+
 # ----------------------------------------------------------------------- paths
 
 
@@ -118,9 +246,11 @@ def find_root(explicit=None):
     """Repo root: --root, then HYPERPOWER_REPO_ROOT, then git, then hyperpower.yml, then cwd."""
     if explicit:
         return os.path.abspath(explicit)
-    from_env = os.environ.get("HYPERPOWER_REPO_ROOT", "")
+    from_env = os.environ.get("HYPERPOWER_REPO_ROOT", "").strip()
     if from_env:
-        return os.path.abspath(from_env)
+        # Same normalisation as hp-config and hp-redact: strip, then expanduser.
+        # One variable must not give three components three different roots.
+        return os.path.abspath(os.path.expanduser(from_env))
     top = run_git(["rev-parse", "--show-toplevel"], os.getcwd())
     if top:
         return os.path.abspath(top)
@@ -268,10 +398,9 @@ def read_json(path, what):
         raise JournalError("{} is not valid JSON: {}".format(what, exc))
 
 
-def write_json(path, payload):
-    """Replace a JSON file atomically. A reader sees the old file or the new one."""
+def write_text(path, body):
+    """Replace a file atomically. A reader sees the old bytes or the new ones."""
     temp = "{}.{}.tmp".format(path, os.getpid())
-    body = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     try:
         with open(temp, "w", encoding="utf-8") as handle:
             handle.write(body)
@@ -284,6 +413,11 @@ def write_json(path, payload):
         except OSError:
             pass
         raise JournalError("cannot write {}: {}".format(path, exc.strerror))
+
+
+def write_json(path, payload):
+    """Replace a JSON file atomically."""
+    write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
 
 # ------------------------------------------------------------------- hashing
@@ -523,6 +657,9 @@ def cmd_new(args):
         sys.stderr.write("hp-journal: " + config_error + "\n")
         return EXIT_NO_CONFIG if config_missing else EXIT_ERROR
 
+    # Checked before the folder is claimed. A refused class leaves no run behind.
+    task_class = check_task_class(args.task_class)
+
     base_sha = args.base or run_git(["rev-parse", "HEAD"], root)
     if not base_sha:
         raise JournalError(
@@ -538,7 +675,7 @@ def cmd_new(args):
         "run": run_id,
         "schema": 1,
         "base_sha": base_sha,
-        "task_class": args.task_class,
+        "task_class": task_class,
         "models": {
             "judgment": models.get("judgment"),
             "mechanical": models.get("mechanical"),
@@ -627,6 +764,10 @@ def cmd_step(args):
         for key in ("prompt_hash", "files_read", "cache_key"):
             if key not in record and key in existing:
                 record[key] = existing[key]
+        # Checked as it will be written, stamped fields and all. Prose in a skill cannot
+        # stop a second caller from recording a contract the schema rejects.
+        if not args.no_validate:
+            validate_contract(step, record, source)
         write_json(target, record)
 
     sys.stdout.write(target + "\n")
@@ -732,6 +873,293 @@ def cmd_mistake(args):
 
     record = {"run": run_id, "kind": args.kind, "key": key, "ref": ref}
     append_record(os.path.join(run_dir, "mistakes.jsonl"), record)
+    return EXIT_OK
+
+
+# -------------------------------------------------------------- corrections
+
+
+def derive_key(text):
+    """A kebab-case key from the correction text. Same text, same key, every time.
+
+    Used only when the caller passed no --key. It is stable for one wording and changes
+    when the wording changes, so pass --key when the promoter must count the cause across
+    runs that word it differently.
+    """
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789")
+    flattened = "".join(char if char in allowed else "-" for char in text.lower())
+    slug = "-".join(part for part in flattened.split("-") if part)
+    if len(slug) > KEY_MAX_CHARS:
+        cut = slug[:KEY_MAX_CHARS]
+        slug = cut.rsplit("-", 1)[0] if "-" in cut else cut
+    if not slug:
+        raise JournalError(
+            "--text holds no ASCII letter or digit, so no key can be derived from it. "
+            "Pass --key with a kebab-case slug naming the cause."
+        )
+    return slug
+
+
+def declared_assumption_ids(run_dir, step):
+    """The assumption ids that step recorded. None when the step file is not there."""
+    path = step_path(run_dir, step)
+    if not os.path.isfile(path):
+        return None
+    contract = read_json(path, step + ".json")
+    if not isinstance(contract, dict):
+        return []
+    array = contract.get("assumptions")
+    if not isinstance(array, list):
+        return []
+    return [
+        entry["id"]
+        for entry in array
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    ]
+
+
+def check_assumption(run_dir, run_id, step, assumption):
+    """Refuse a correction against an assumption the step never declared."""
+    body = assumption.strip()
+    if body == "":
+        raise JournalError("--assumption must not be empty. Name the declared id, such as a1.")
+    ids = declared_assumption_ids(run_dir, step)
+    if ids is None:
+        recorded = recorded_steps(run_dir)
+        raise JournalError(
+            "run {} never recorded step {}. It recorded: {}. A correction names an "
+            "assumption an existing step declared.".format(
+                run_id, step, ", ".join(recorded) or "no steps"
+            )
+        )
+    if body not in ids:
+        raise JournalError(
+            "step {} declared no assumption {}. It declared: {}. Never correct an "
+            "assumption that was not declared.".format(
+                step, body, ", ".join(ids) or "none"
+            )
+        )
+    return body
+
+
+def corrections_path(run_dir):
+    return os.path.join(run_dir, CORRECTIONS_FILE)
+
+
+def read_corrections(path):
+    """Every line of corrections.jsonl as (number, raw line, record or None).
+
+    A line that does not parse keeps its bytes and its place. Dropping it would delete a
+    correction the human made.
+    """
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        raise JournalError("cannot read {}: {}".format(path, exc.strerror))
+    rows = []
+    for number, raw in enumerate(text.splitlines(True), 1):
+        if raw.strip() == "":
+            rows.append((number, raw, None))
+            continue
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            record = None
+        if not isinstance(record, dict):
+            record = None
+        rows.append((number, raw, record))
+    return rows
+
+
+def cmd_correction(args):
+    root = find_root(args.root)
+    run_id, run_dir = resolve_run(root, args.run)
+    step = check_step(args.step)
+    if args.scope not in CORRECTION_SCOPES:
+        raise JournalError(
+            "{} is not a correction scope. Use one of: {}".format(
+                args.scope, ", ".join(CORRECTION_SCOPES)
+            )
+        )
+    text = args.text.strip()
+    if text == "":
+        raise JournalError("--text must not be empty. It is the correction itself.")
+    assumption = check_assumption(run_dir, run_id, step, args.assumption)
+    key = check_key(args.key) if args.key is not None else check_key(derive_key(text))
+
+    record = {
+        "run": run_id,
+        "step": step,
+        "assumption": assumption,
+        "key": key,
+        "text": text,
+        "scope": args.scope,
+        "challenged": bool(args.challenged),
+        "ts": now_iso(),
+    }
+    # A once correction is written with no applied field. correction-applied is the one
+    # writer of that field, so an entry without it has not been used yet.
+    path = corrections_path(run_dir)
+    with FileLock(path + ".lock"):
+        append_record(path, record)
+    sys.stdout.write(key + "\n")
+    return EXIT_OK
+
+
+def cmd_corrections(args):
+    root = find_root(args.root)
+    _run_id, run_dir = resolve_run(root, args.run)
+    step = check_step(args.step) if args.step else None
+    if args.scope is not None and args.scope not in CORRECTION_SCOPES:
+        raise JournalError(
+            "{} is not a correction scope. Use one of: {}".format(
+                args.scope, ", ".join(CORRECTION_SCOPES)
+            )
+        )
+
+    rows = []
+    recorded = 0
+    for _number, _raw, record in read_corrections(corrections_path(run_dir)):
+        if record is None:
+            continue
+        recorded += 1
+        if step is not None and record.get("step") != step:
+            continue
+        if args.scope is not None and record.get("scope") != args.scope:
+            continue
+        if args.pending and not (
+            record.get("scope") == "once" and record.get("applied") is not True
+        ):
+            continue
+        rows.append(record)
+
+    if args.json:
+        sys.stdout.write(json.dumps(rows, separators=(",", ":")) + "\n")
+        return EXIT_OK
+    if not rows:
+        sys.stdout.write(
+            "no correction matches\n" if recorded else "no corrections recorded\n"
+        )
+        return EXIT_OK
+    out = []
+    for record in rows:
+        if record.get("scope") != "once":
+            # applied belongs to a once correction. run and forever never retire.
+            state = "-"
+        else:
+            state = "applied" if record.get("applied") is True else "pending"
+        out.append(
+            "{}  {}  {}  {}  {}  {}".format(
+                record.get("step") or "-",
+                record.get("assumption") or "-",
+                record.get("scope") or "-",
+                state,
+                record.get("key") or "-",
+                record.get("text") or "",
+            )
+        )
+    sys.stdout.write("\n".join(out) + "\n")
+    return EXIT_OK
+
+
+def cmd_correction_applied(args):
+    """Stamp applied: true on the once corrections a replay of one step just used."""
+    root = find_root(args.root)
+    run_id, run_dir = resolve_run(root, args.run)
+    step = check_step(args.step)
+    path = corrections_path(run_dir)
+    if not os.path.isfile(path):
+        raise JournalError(
+            "run {} has no {}. There is no correction to stamp.".format(
+                run_id, CORRECTIONS_FILE
+            )
+        )
+
+    stamped = []
+    with FileLock(path + ".lock"):
+        rows = read_corrections(path)
+        lines = []
+        for number, raw, record in rows:
+            if record is None:
+                if raw.strip() != "":
+                    sys.stderr.write(
+                        "hp-journal: {} line {} does not parse. It was kept "
+                        "unchanged.\n".format(path, number)
+                    )
+                lines.append(raw)
+                continue
+            wanted = (
+                record.get("scope") == "once"
+                and record.get("step") == step
+                and record.get("applied") is not True
+                and (
+                    args.assumption is None
+                    or record.get("assumption") == args.assumption
+                )
+            )
+            if not wanted:
+                lines.append(raw)
+                continue
+            record["applied"] = True
+            lines.append(
+                json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
+            )
+            stamped.append(record.get("assumption") or "-")
+        if stamped:
+            write_text(path, "".join(lines))
+
+    sys.stdout.write(
+        "stamped {} once correction{} on {}{}\n".format(
+            len(stamped),
+            "" if len(stamped) == 1 else "s",
+            step,
+            ": " + ", ".join(stamped) if stamped else "",
+        )
+    )
+    return EXIT_OK
+
+
+def check_decision(value):
+    """The three answers /hyperpower:resume offers, in the vocabulary it prints."""
+    if value == RESUME_ABORT or value in STEPS:
+        return value
+    if value.endswith(RESUME_ANYWAY_SUFFIX):
+        if value[: -len(RESUME_ANYWAY_SUFFIX)] in STEPS:
+            return value
+    raise JournalError(
+        "{} is not a resume answer. Use a step name to replay from it, <step>{} to replay "
+        "over the drift, or {}. Steps, in order: {}".format(
+            json.dumps(value), RESUME_ANYWAY_SUFFIX, RESUME_ABORT, ", ".join(STEPS)
+        )
+    )
+
+
+def cmd_resume_event(args):
+    root = find_root(args.root)
+    run_id, run_dir = resolve_run(root, args.run)
+    from_step = check_step(args.from_step)
+    decision = check_decision(args.decision)
+
+    given = []
+    for group in args.drifted or []:
+        for item in group.split(","):
+            body = item.strip()
+            if body:
+                given.append(check_step(body))
+    # Pipeline order, so two callers listing the same steps write the same line.
+    drifted = [step for step in STEPS if step in given]
+
+    record = {
+        "run": run_id,
+        "ts": now_iso(),
+        "from": from_step,
+        "decision": decision,
+        "drifted": drifted,
+    }
+    append_record(os.path.join(run_dir, RESUME_FILE), record)
     return EXIT_OK
 
 
@@ -863,6 +1291,18 @@ def measure_step(root, run_dir, step, patterns):
             "drifted": {"prompt": False, "upstream": False, "files": False},
             "upstream_step": None,
         }
+    # A cache key with no stage output is the placeholder `hash` writes when it runs
+    # before the stage returns. The files may all match, and the step is still not a
+    # recorded step. Reporting it ok would replay over a stage that never ran.
+    if not set(contract) - ENVELOPE_FIELDS:
+        return {
+            "step": step,
+            "state": "no_contract",
+            "changed_files": 0,
+            "files": [],
+            "drifted": {"prompt": False, "upstream": False, "files": False},
+            "upstream_step": cache.get("upstream_step"),
+        }
 
     prompt_now = contract.get("prompt_hash")
     prompt_drifted = bool(prompt_now) and prompt_now != cache.get("prompt_hash")
@@ -905,6 +1345,8 @@ def drift_lines(row):
     """The value column for one step. First line, then any extra detail lines."""
     if row["state"] == "unhashed":
         return ["UNHASHED — no cache key recorded for this step"]
+    if row["state"] == "no_contract":
+        return ["UNRECORDED — cache key only, no step contract recorded"]
     if row["state"] == "ok":
         return ["ok"]
     count = row["changed_files"]
@@ -1109,7 +1551,10 @@ def build_parser():
         "--task-class",
         default=None,
         metavar="C",
-        help="task class the router picked. Recorded as null when omitted.",
+        help=(
+            "task class the router picked, from task-classes.yml. A class outside that "
+            "file is refused. Recorded as null when omitted."
+        ),
     )
     new.add_argument(
         "--base",
@@ -1120,13 +1565,36 @@ def build_parser():
     new.add_argument("--json", action="store_true", help="print the id and path as JSON")
     new.set_defaults(handler=cmd_new)
 
-    step = subparsers.add_parser("step", help="write a step's output contract")
+    step = subparsers.add_parser(
+        "step",
+        help="write a step's output contract, after hp-validate accepts it",
+        description=(
+            "Write a step's output contract. hp-validate checks the record as it will be\n"
+            "written, and a contract the schema rejects is not recorded."
+        ),
+        epilog=(
+            "--no-validate records the contract unchecked. Two cases are legitimate:\n"
+            "  1. a stage whose schema does not exist yet, while it is being written\n"
+            "  2. importing a run folder recorded against an older schema, for forensics\n"
+            "\n"
+            "Never pass it to get past violations you have not read, and never pass it in\n"
+            "a pipeline run. /hyperpower:resume, /hyperpower:why and the archivist read\n"
+            "these files by their schema.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_root(step)
     step.add_argument("run", help="run id, or latest")
     step.add_argument("step", help="one of: " + ", ".join(STEPS))
     group = step.add_mutually_exclusive_group(required=True)
     group.add_argument("--file", metavar="F", help="JSON file holding the contract")
     group.add_argument("--stdin", action="store_true", help="read the contract from stdin")
+    step.add_argument(
+        "--no-validate",
+        action="store_true",
+        dest="no_validate",
+        help="record the contract without checking it against its schema",
+    )
     step.set_defaults(handler=cmd_step)
 
     usage = subparsers.add_parser("usage", help="append one usage record")
@@ -1184,6 +1652,126 @@ def build_parser():
         help="repo-relative path to the evidence. Default: the run's meta.json",
     )
     mistake.set_defaults(handler=cmd_mistake)
+
+    correction = subparsers.add_parser(
+        "correction",
+        help="append one correction to corrections.jsonl",
+        description=(
+            "Record a correction /hyperpower:correct made to a declared assumption. The "
+            "assumption must already exist in that step's contract."
+        ),
+    )
+    add_root(correction)
+    correction.add_argument("run", help="run id, or latest")
+    correction.add_argument(
+        "--step", required=True, metavar="S", help="step whose assumption is corrected"
+    )
+    correction.add_argument(
+        "--assumption",
+        required=True,
+        metavar="A",
+        help="assumption id the step declared, such as a1",
+    )
+    correction.add_argument(
+        "--text", required=True, metavar="T", help="the correction itself"
+    )
+    correction.add_argument(
+        "--scope",
+        required=True,
+        metavar="S",
+        help="one of: " + ", ".join(CORRECTION_SCOPES),
+    )
+    correction.add_argument(
+        "--key",
+        default=None,
+        metavar="K",
+        help=(
+            "stable kebab-case slug naming the cause. Derived from --text when omitted, "
+            "which is stable for one wording only."
+        ),
+    )
+    correction.add_argument(
+        "--challenged",
+        action="store_true",
+        help="the code contradicted the correction and the challenge was printed",
+    )
+    correction.set_defaults(handler=cmd_correction)
+
+    corrections = subparsers.add_parser(
+        "corrections", help="print the corrections recorded for a run"
+    )
+    add_root(corrections)
+    corrections.add_argument("run", help="run id, or latest")
+    corrections.add_argument(
+        "--step", default=None, metavar="S", help="only corrections for this step"
+    )
+    corrections.add_argument(
+        "--scope", default=None, metavar="S", help="one of: " + ", ".join(CORRECTION_SCOPES)
+    )
+    corrections.add_argument(
+        "--pending",
+        action="store_true",
+        help="only once corrections that no replay has applied yet",
+    )
+    corrections.add_argument("--json", action="store_true", help="print the records as JSON")
+    corrections.set_defaults(handler=cmd_corrections)
+
+    applied = subparsers.add_parser(
+        "correction-applied",
+        help="stamp applied: true on the once corrections a replay used",
+        description=(
+            "Stamp applied: true on every once correction for one step that no replay has "
+            "used yet. Call it after the replay wrote that step's contract, never before: "
+            "a replay that fails first must leave the correction to be applied again."
+        ),
+    )
+    add_root(applied)
+    applied.add_argument("run", help="run id, or latest")
+    applied.add_argument(
+        "--step", required=True, metavar="S", help="the step that was just replayed"
+    )
+    applied.add_argument(
+        "--assumption",
+        default=None,
+        metavar="A",
+        help="stamp only this assumption's correction. Default: every once entry for the step.",
+    )
+    applied.set_defaults(handler=cmd_correction_applied)
+
+    resume_event = subparsers.add_parser(
+        "resume-event",
+        help="append one replay record to resume.jsonl",
+        description=(
+            "Record one /hyperpower:resume replay: the step it was asked to replay from, "
+            "the answer the human gave, and the steps that had drifted."
+        ),
+    )
+    add_root(resume_event)
+    resume_event.add_argument("run", help="run id, or latest")
+    resume_event.add_argument(
+        "--from",
+        required=True,
+        metavar="STEP",
+        dest="from_step",
+        help="the step /hyperpower:resume was asked to replay from",
+    )
+    resume_event.add_argument(
+        "--decision",
+        required=True,
+        metavar="D",
+        help=(
+            "the answer taken: a step name, <step>" + RESUME_ANYWAY_SUFFIX + ", or "
+            + RESUME_ABORT
+        ),
+    )
+    resume_event.add_argument(
+        "--drifted",
+        action="append",
+        default=None,
+        metavar="S1,S2",
+        help="drifted step names, not a count. Repeatable, and comma-separated.",
+    )
+    resume_event.set_defaults(handler=cmd_resume_event)
 
     hashes = subparsers.add_parser("hash", help="compute and store a step's cache key")
     add_root(hashes)

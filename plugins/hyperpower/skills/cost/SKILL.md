@@ -1,6 +1,6 @@
 ---
 name: cost
-description: Report tokens and money by stage, agent, model, or run. Reads .hyperpower/runs/*/usage.jsonl and the plugin's pricing.yml. Cache reads are shown in their own column because they dominate the token count and cost a tenth of fresh input. A price older than 90 days is labelled stale and still shown. A model with no price entry reports token counts and no money. Use /hyperpower:cost, with --since <7d|30d|all> and --by <stage|agent|model|run>.
+description: Report tokens and money by stage, agent, model, or run. Reads .hyperpower/runs/*/usage.jsonl through scripts/hp-redact, which hashes file paths before anything is grouped, and prices it from the plugin's pricing.yml. Cache reads are shown in their own column because they dominate the token count and cost a tenth of fresh input. A price older than 90 days is labelled stale and still shown. A model with no price entry reports token counts and no money. Use /hyperpower:cost, with --since <7d|30d|all> and --by <stage|agent|model|run>.
 ---
 
 # Cost
@@ -47,7 +47,24 @@ Do not estimate them.
 If `pricing.yml` is missing or unreadable, report token counts for everything and no money
 at all. Say the file could not be read and name the path.
 
-## Step 2 - price each record
+## Step 2 - read the records through hp-redact
+
+Read one run folder at a time. A record carries no run id, so `cat` into one pipe loses the
+run boundary and `--by run` has nothing to group on. The folder name is the only run id
+there is.
+
+```sh
+for f in .hyperpower/runs/*/usage.jsonl; do
+  echo "== run $(basename "$(dirname "$f")")"
+  ${CLAUDE_PLUGIN_ROOT}/scripts/hp-redact --stdin < "$f"
+done
+```
+
+Price what it prints. It hashes file paths and leaves `stage`, `agent`, `model`, the token
+counts, and `ts` untouched, so every number below is computed from the same values as
+before. Redacting the finished table instead misses every path folded into a group label.
+
+## Step 3 - price each record
 
 Three counters, three rates. Per record:
 
@@ -60,7 +77,7 @@ from the other.
 
 Gate records carry no token counts and cost nothing. Exclude them from every total.
 
-## Step 3 - handle prices that cannot be trusted
+## Step 4 - handle prices that cannot be trusted
 
 Two cases. Both still show the tokens.
 
@@ -78,7 +95,7 @@ one with the same context size, not from the tier above or below. Tokens only.
 Repeat every stale or unpriced row as a footer line under the table. A label inside a wide
 table is easy to miss.
 
-## Step 4 - group and total
+## Step 5 - group and total
 
 | `--by` | Group column holds |
 |---|---|
@@ -117,6 +134,22 @@ Format of the stale label, shown with an example date:
   claude-opus-5     44      301.2k        2.80M    22.4k     $2.41   stale, verified 2026-01-14 (236 days)
 ```
 
+## Redaction
+
+A cost table groups by stage, agent, model, or run, and none of those is a path. Paths
+arrive in the free-text `outcome` string of a failed call, so the pipe in Step 2 is what
+keeps them out of the footer and out of any row you quote.
+
+`hp-redact` hashes a path-shaped value, a path inside free text, and a map key that is a
+path. It misses a bare name with no extension, such as `Makefile`, and free text can carry
+a path in a form nothing recognises. Call the report redacted. Never call it clean.
+
+Per-run journals keep real paths, by design. They already live inside the repo they
+describe. This is a read-side transform: it protects the view, not the file on disk.
+
+When `telemetry.redact_paths` is false, `hp-redact` passes the records through and says so
+on stderr. Print that line above the table. `/hyperpower:telemetry` holds the full rule.
+
 ## Config
 
 If `hyperpower.yml` exists, read `models.judgment` and `models.mechanical`. Report any
@@ -141,4 +174,8 @@ create a config.
 - Do not hide a stale price, and do not silently refresh `pricing.yml`. Editing rates is a
   separate change with a new `last_verified`.
 - Do not price gate records. They carry no tokens.
-- Do not fetch prices from the network. This command reads two local files and nothing else.
+- Do not fetch prices from the network. This command reads local files, runs `hp-redact`,
+  and does nothing else.
+- Do not read `usage.jsonl` straight off disk to save a pipe, and do not hash a path by
+  hand. `hp-redact` is the one implementation, and a second one gives a different token for
+  the same file.

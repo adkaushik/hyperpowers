@@ -30,12 +30,21 @@ hp-gates --only types --files src/a.ts --config config.json --json
 
 | Exit | Means |
 |---|---|
-| 0 | no blocking gate failed. Did-not-run gates do not change this. |
+| 0 | every enabled blocking gate passed |
 | 1 | a blocking gate failed, or a blocking gate timed out |
-| 2 | hp-gates itself could not run: bad flags, no config, or no gates configured |
+| 78 | a blocking gate could not run. Not a failure, but not a pass either. |
+| 2 | hp-gates itself could not run: bad flags, no config, no gates configured, or the aggregate failed validation |
 
-Read the per-gate `result` values, not the exit code alone. Exit 0 with every gate reporting
-`did not run` is a repo with no toolchain installed, not a repo that passed. A blocking gate
+A timeout is a failure, whichever timer fired. The gate script stops its own command at
+`limits.gate_timeout_seconds` and exits 78 with a timeout detail; `hp-gates` records that
+as a failure rather than a did-not-run, so one timeout has one meaning in `gates.json`.
+
+Exit 78 exists because the exit code is the only signal a shell caller, CI step or hook
+reads. Returning 0 for a blocking gate that never ran would report a pass nobody verified.
+A gate you disabled in config is excluded — that is a deliberate choice, not an unverified
+one. The gates that triggered 78 are listed in `blocking_unverified` in `gates.json`.
+
+Read the per-gate `result` values, not the exit code alone. A blocking gate
 that could not run is a hard stop for the caller, and that is what "fail closed" means here.
 
 `--only` with no `--run` is a probe: it runs one gate, prints the result, and records
@@ -58,14 +67,21 @@ repo.
 | build | `commands.build` | any repo that builds | `gates/build.sh` |
 | slop | `antislop --profile core`, `ai-slop-detector` | any repo | `gates/slop.sh` |
 | e2e | `commands.e2e` | any repo with an end-to-end suite | `gates/e2e.sh` |
-| browser | boot `dev_server`, load `{route}`, assert it renders | web only | not shipped yet |
-| a11y | axe assertions on `{route}` | web only | not shipped yet |
-| visual | screenshot diff against the locked mock | web with a mock | not shipped yet |
+| browser | boot `dev_server`, load `{route}`, assert it renders | web only | `gates/browser.sh` |
+| a11y | axe assertions on `{route}` | web only | `gates/a11y.sh` |
+| visual | screenshot diff against the locked mock | web with a mock | `gates/visual.sh` |
 
-The last three are in the config schema and ship `enabled: false`. No script exists for them
-yet. `e2e` ships a script and `enabled: false`, because `commands.e2e` is null until someone
-sets it: it reports did-not-run, not a pass. `unit` runs `commands.test_scoped` only. It never falls back to `commands.test`, because
-a scoped gate that silently runs the whole suite is reporting a check it was not asked for.
+Nine gates, and the same nine are the `gates:` keys in
+[configuration.md](configuration.md). That schema is the roster. A name outside it lands in
+`unknown_keys` and never runs.
+
+`unit` runs `commands.test_scoped` only. It never falls back to `commands.test`, because a
+scoped gate that silently runs the whole suite is reporting a check it was not asked for.
+
+All nine ship a script. Four ship `enabled: false`: `e2e`, `browser`, `a11y`, `visual`. Each
+of those needs an input no detector can supply, and each reports did-not-run until it has
+it. `e2e` needs `commands.e2e`, which is null in the shipped schema. The other three are
+below.
 
 ## Blocking versus advisory
 
@@ -95,6 +111,95 @@ Three profiles:
 | `strict` | never. It fights your codebase. |
 
 What static analysis cannot see is handled by `/hyperpower:sweep`, which is a model pass.
+
+## The three web gates
+
+`browser`, `a11y` and `visual` check rendered output. All three ship `enabled: false`, and
+each needs more than a command before it reports anything but did-not-run.
+
+Turn one on only when every row of its table is satisfied. A gate switched on without its
+inputs reports did-not-run on every run, and a blocking gate that did not run is a hard stop
+for the caller. Off is the honest state until the inputs exist.
+
+All three take a route. The caller passes it as `hp-gates --route <path>`, which sets
+`HYPERPOWER_ROUTE` for the gate script. On UI work the routes come from `design.json`, whose
+`routes` array is the list the design stage wrote. One invocation checks one route, and an
+unset route means the site root.
+
+All three boot `commands.dev_server` and wait for `commands.dev_url` to answer, and all
+three treat a timeout as a failure rather than a did-not-run. The budget covers the boot and
+one page, so a page that never appeared inside `limits.gate_timeout_seconds` is a rendering
+failure.
+
+The harness installs nothing. The browser, the axe CLI, and an image comparator are yours to
+provide. `/hyperpower:doctor` names the one that is missing.
+
+### browser
+
+Boot `commands.dev_server`, wait for `commands.dev_url` to answer, load the route in a
+headless browser, and assert the page rendered.
+
+| Needs | From | Absent means |
+|---|---|---|
+| `gates.browser.enabled: true` | `hyperpower.yml` | did-not-run, the gate is off |
+| `commands.dev_server` | `hyperpower.yml`, null until you set it | did-not-run, nothing to boot |
+| `commands.dev_url` | `hyperpower.yml`, null until you set it | did-not-run, no origin to load |
+| `curl` or `wget` | your machine | did-not-run, no readiness probe |
+| a Chromium-family browser | your machine, or `HYPERPOWER_BROWSER_BIN` | did-not-run, and no fallback |
+
+`HYPERPOWER_ROUTE` unset loads `/`, and the result says it used the default. A dev server
+already answering on `commands.dev_url` is used as it is, and no second copy is started.
+
+The gate never downgrades to a `curl` request and calls that a render. A page that answers
+200 and paints nothing is the failure it exists to catch, so it asserts on the DOM: a body
+element, text, elements, and no error overlay.
+
+### a11y
+
+Boot the same dev server, then run the axe CLI against the route.
+
+| Needs | From | Absent means |
+|---|---|---|
+| `gates.a11y.enabled: true` | `hyperpower.yml` | did-not-run, the gate is off |
+| `commands.dev_server` and `commands.dev_url` | `hyperpower.yml` | did-not-run, no server to scan |
+| the axe CLI | `npm install -g @axe-core/cli` | did-not-run, the tool is missing |
+| a Chromium-family browser | your machine, or `HYPERPOWER_BROWSER_BIN` | did-not-run, axe has nothing to drive |
+| `curl` or `wget` | your machine | did-not-run, no readiness probe |
+
+It fails on any violation whose impact is serious or critical. Moderate and minor
+violations are counted and reported, and they never fail the gate. That threshold is
+hardcoded in the script, because the config schema has no field for it and a gate never
+reads a field the schema does not define. To change it, edit the script.
+
+A missing axe runner is did-not-run, never a pass. An accessibility check that did not
+happen is not a clean accessibility report. Axe exiting with no report the gate can read is
+did-not-run for the same reason.
+
+### visual
+
+Screenshot the route, screenshot the locked mock, and diff the two images.
+
+| Needs | From | Absent means |
+|---|---|---|
+| `gates.visual.enabled: true` | `hyperpower.yml` | did-not-run, the gate is off |
+| `commands.dev_server` and `commands.dev_url` | `hyperpower.yml` | did-not-run, no page to shoot |
+| a locked mock for the route | `mock.path` in `design.json`, then `<docs>/mocks/<slug>.html` | did-not-run, nothing to compare against |
+| `locked: true` on that contract | a human locked the mock | did-not-run, an unlocked mock is a proposal |
+| `verification.baseline_valid: true` | the design stage writes it | did-not-run, the baseline is not valid |
+| a Chromium-family browser | your machine, or `HYPERPOWER_BROWSER_BIN` | did-not-run, no screenshots |
+| `curl` or `wget` | your machine | did-not-run, no readiness probe |
+| an image comparator | `python3`, or ImageMagick `compare` with `identify` | did-not-run, the images cannot be diffed |
+
+Set `HYPERPOWER_RUN_DIR` so the gate can read `design.json`, and so the diff image and both
+screenshots land in that run's `gates/` directory.
+
+It fails when more than 5 percent of pixels differ by more than 8 per channel. Both numbers
+are hardcoded in the script, for the same reason the a11y threshold is: the config schema
+has no field for either.
+
+A mock nobody locked is not a baseline, and a diff against a proposal is a number nobody
+asked for. A route with no locked mock is did-not-run, not a failure: it is a route nobody
+has drawn yet.
 
 ## Adding a gate
 

@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+"""run-tests - the hyperpower kernel test suite.
+
+Discovers tests/cases/*.sh, runs each one in a fresh git repository under a temporary
+directory, and prints one summary line. Exit 0 when every assertion passed, 1 when any
+failed or any case crashed.
+
+Python 3.8 or newer, standard library only. No third-party imports and no test framework.
+
+A case never writes inside this repository. Each case gets its own scratch repo, its own
+HOME, and its own temporary directory, and they are removed when the case ends. The runner
+checks this repository afterwards and fails when a case left a file behind.
+
+    ./run-tests                    every case
+    ./run-tests --only hp-gates    the cases whose name matches the pattern
+    ./run-tests --verbose          every assertion, plus each case's own output
+    ./run-tests --keep             leave the scratch directories on disk
+"""
+
+import argparse
+import fnmatch
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+TESTS_DIR = Path(__file__).resolve().parent
+CASES_DIR = TESTS_DIR / "cases"
+PLUGIN_DIR = TESTS_DIR.parent
+REPO_ROOT = PLUGIN_DIR.parent.parent
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+
+CASE_TIMEOUT_SECONDS = 600
+
+PASS = "pass"
+FAIL = "fail"
+SKIP = "skip"
+
+# Paths a case would create if it read or wrote the plugin repository instead of its own
+# scratch repo. None of them exists here, and none may appear while the suite runs.
+POLLUTION_PATHS = (
+    "hyperpower.yml",
+    "hyperpower.local.yml",
+    "CODEBASE_RULEBOOK.md",
+    ".hyperpower",
+    "decisions",
+    "plugins/hyperpower/hyperpower.yml",
+    "plugins/hyperpower/.hyperpower",
+    "plugins/hyperpower/tests/.hyperpower",
+)
+
+# The scratch repository every case starts from. Every gate is off, so a case turns on the
+# one gate it is about and nothing else runs.
+SCRATCH_CONFIG = """version: 1
+
+project:
+  name: scratch
+  type: cli
+  languages: [python]
+
+paths:
+  source: [src/]
+  tests: [tests/]
+  docs: [docs/]
+  ignore: [dist/]
+
+commands:
+  install: null
+  typecheck: null
+  test: null
+  test_scoped: null
+  lint: null
+  build: null
+  dev_server: null
+  dev_url: null
+  e2e: null
+
+gates:
+  types:   { enabled: false, blocking: false }
+  unit:    { enabled: false, blocking: false }
+  lint:    { enabled: false, blocking: false }
+  build:   { enabled: false, blocking: false }
+  slop:    { enabled: false, blocking: false }
+  e2e:     { enabled: false, blocking: false }
+  browser: { enabled: false, blocking: false }
+  a11y:    { enabled: false, blocking: false }
+  visual:  { enabled: false, blocking: false }
+
+models:
+  judgment: claude-opus-5
+  mechanical: claude-haiku-4-5
+
+limits:
+  gate_timeout_seconds: 60
+
+telemetry:
+  enabled: true
+  destination: local
+  redact_paths: true
+"""
+
+SCRATCH_GITIGNORE = """.hyperpower/
+hyperpower.local.yml
+"""
+
+
+# --------------------------------------------------------------- helper library
+
+LIB_SH = r'''# Assertion helpers for a hyperpower kernel test case.
+#
+# run-tests writes this file into the case's scratch directory and names it in
+# $HP_TEST_LIB. It is not a file in the repository. Edit run-tests to change it.
+#
+# Every assertion takes the assertion name first. The name is what the report prints, so
+# write it as the property being checked, not as the step being run.
+
+T_OUT=$HP_TEST_TMP/stdout
+T_ERR=$HP_TEST_TMP/stderr
+T_STATUS=0
+T_CWD=
+T_STDIN=
+
+HP_CONFIG=$HP_SCRIPTS/hp-config
+HP_JOURNAL=$HP_SCRIPTS/hp-journal
+HP_VALIDATE=$HP_SCRIPTS/hp-validate
+HP_GATES_BIN=$HP_SCRIPTS/hp-gates
+HP_EVALS=$HP_SCRIPTS/run_evals.py
+
+: > "$T_OUT"
+: > "$T_ERR"
+
+# ------------------------------------------------------------------- recording
+
+t__next() {
+  t__n=0
+  if [ -f "$HP_TEST_OUT/seq" ]; then t__n=$(cat "$HP_TEST_OUT/seq"); fi
+  t__n=$((t__n + 1))
+  printf '%s' "$t__n" > "$HP_TEST_OUT/seq"
+  printf '%05d' "$t__n"
+}
+
+# t__record <status> <name> — the detail arrives on stdin.
+t__record() {
+  t__id=$(t__next)
+  t__file=$HP_TEST_OUT/$t__id.rec
+  printf '%s\t%s\n' "$1" "$2" > "$t__file"
+  cat >> "$t__file"
+}
+
+t_ok() { printf '' | t__record pass "$1"; }
+
+t_bad() { printf '%s\n' "$2" | t__record fail "$1"; }
+
+t_skip() { printf '%s\n' "$2" | t__record skip "$1"; }
+
+# ------------------------------------------------------------------- execution
+
+t_excerpt() {
+  if [ ! -s "$1" ]; then
+    printf 'empty'
+    return 0
+  fi
+  head -n 12 "$1" | cut -c 1-220
+}
+
+# t_run <command> [args...] — captures stdout, stderr and the exit status.
+# Set T_CWD to run somewhere else and T_STDIN to feed a file. Both reset afterwards.
+t_run() {
+  T_STATUS=0
+  (
+    if [ -n "$T_CWD" ]; then CDPATH= cd -- "$T_CWD" || exit 127; fi
+    if [ -n "$T_STDIN" ]; then exec < "$T_STDIN"; else exec < /dev/null; fi
+    exec "$@"
+  ) > "$T_OUT" 2> "$T_ERR" || T_STATUS=$?
+  T_CWD=
+  T_STDIN=
+  return 0
+}
+
+t_hp_config() { t_run "$HP_PYTHON" "$HP_CONFIG" "$@"; }
+t_hp_journal() { t_run "$HP_PYTHON" "$HP_JOURNAL" "$@"; }
+t_hp_validate() { t_run "$HP_PYTHON" "$HP_VALIDATE" "$@"; }
+t_hp_evals() { t_run "$HP_PYTHON" "$HP_EVALS" "$@"; }
+
+# hp-gates has no --root flag. It reads HYPERPOWER_REPO_ROOT, so the scratch repo is named
+# there rather than left to the working directory.
+t_hp_gates() {
+  t_run env HYPERPOWER_REPO_ROOT="$HP_TEST_REPO" "$HP_PYTHON" "$HP_GATES_BIN" "$@"
+}
+
+t_tool() { "$HP_PYTHON" "$HP_TEST_TMP/hptool.py" "$@"; }
+
+t_json_get() { t_tool json-get "$1" "$2"; }
+
+t_out() { cat "$T_OUT"; }
+
+t_err() { cat "$T_ERR"; }
+
+# ------------------------------------------------------------------ assertions
+
+t_eq() {
+  if [ "$2" = "$3" ]; then
+    t_ok "$1"
+    return 0
+  fi
+  t_bad "$1" "expected: $2
+actual:   $3"
+}
+
+t_ne() {
+  if [ "$2" != "$3" ]; then
+    t_ok "$1"
+    return 0
+  fi
+  t_bad "$1" "expected a value other than: $2
+actual:   $3"
+}
+
+t_ge() {
+  if [ "$3" -ge "$2" ] 2>/dev/null; then
+    t_ok "$1"
+    return 0
+  fi
+  t_bad "$1" "expected at least: $2
+actual:            $3"
+}
+
+t_status() {
+  if [ "$T_STATUS" -eq "$2" ]; then
+    t_ok "$1"
+    return 0
+  fi
+  t_bad "$1" "expected exit: $2
+actual exit:   $T_STATUS
+stdout: $(t_excerpt "$T_OUT")
+stderr: $(t_excerpt "$T_ERR")"
+}
+
+t_file_has() {
+  if [ ! -f "$2" ]; then
+    t_bad "$1" "no file at $2"
+    return 0
+  fi
+  if grep -F -q -e "$3" -- "$2"; then
+    t_ok "$1"
+    return 0
+  fi
+  t_bad "$1" "expected to find: $3
+in $2: $(t_excerpt "$2")"
+}
+
+t_file_lacks() {
+  if [ ! -f "$2" ]; then
+    t_ok "$1"
+    return 0
+  fi
+  if grep -F -q -e "$3" -- "$2"; then
+    t_bad "$1" "expected not to find: $3
+in $2: $(t_excerpt "$2")"
+    return 0
+  fi
+  t_ok "$1"
+}
+
+t_stdout_has() { t_file_has "$1" "$T_OUT" "$2"; }
+
+t_stderr_has() { t_file_has "$1" "$T_ERR" "$2"; }
+
+t_stderr_lacks() { t_file_lacks "$1" "$T_ERR" "$2"; }
+
+t_file() {
+  if [ -f "$2" ]; then
+    t_ok "$1"
+    return 0
+  fi
+  t_bad "$1" "no file at $2"
+}
+
+t_dir() {
+  if [ -d "$2" ]; then
+    t_ok "$1"
+    return 0
+  fi
+  t_bad "$1" "no directory at $2"
+}
+
+t_no_file() {
+  if [ -e "$2" ]; then
+    t_bad "$1" "$2 exists and should not"
+    return 0
+  fi
+  t_ok "$1"
+}
+
+t_json() { t_eq "$1" "$4" "$(t_json_get "$2" "$3")"; }
+
+# t_in <name> <needle> <comma separated list>
+t_in() {
+  case ",$3," in
+    *",$2,"*) t_ok "$1" ;;
+    *) t_bad "$1" "$2 is not in: $3" ;;
+  esac
+}
+'''
+
+
+# ------------------------------------------------------------------- json tool
+
+HPTOOL_PY = r'''#!/usr/bin/env python3
+"""Read JSON, JSONL and YAML for a hyperpower test case, and build minimal contracts.
+
+run-tests writes this file into the case's scratch directory. It is not a file in the
+repository. Edit run-tests to change it.
+
+YAML is parsed by the kernel's own hp-config, never by a second parser, so a case that
+reads task-classes.yml exercises the parser the harness ships.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+
+MISSING = "<missing>"
+
+
+def die(message):
+    sys.stderr.write("hptool: " + message + "\n")
+    raise SystemExit(2)
+
+
+def load_hp_config():
+    scripts = os.environ.get("HP_SCRIPTS", "")
+    path = os.path.join(scripts, "hp-config")
+    if not os.path.isfile(path):
+        die("hp-config is not at %s. HP_SCRIPTS must name the kernel scripts." % path)
+    loader = importlib.machinery.SourceFileLoader("hp_config_under_test", path)
+    spec = importlib.util.spec_from_file_location("hp_config_under_test", path, loader=loader)
+    module = importlib.util.module_from_spec(spec)
+    cached = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = cached
+    return module
+
+
+def read_json(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def read_yaml(path):
+    module = load_hp_config()
+    with open(path, "r", encoding="utf-8") as handle:
+        return module.parse_yaml(handle.read(), path=path)
+
+
+def read_lines(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return [line for line in handle.read().splitlines() if line.strip()]
+
+
+def walk(node, dotted):
+    """Read a dotted path. At a map, the longest matching key wins.
+
+    The longest match is what lets `sources.project.name` read the hp-config --source
+    envelope, whose `sources` map is flat and keyed by dotted leaf paths.
+    """
+    if dotted in ("", "."):
+        return node
+    parts = dotted.split(".")
+    index = 0
+    while index < len(parts):
+        if isinstance(node, dict):
+            matched = False
+            for end in range(len(parts), index, -1):
+                candidate = ".".join(parts[index:end])
+                if candidate in node:
+                    node = node[candidate]
+                    index = end
+                    matched = True
+                    break
+            if not matched:
+                return MISSING
+            continue
+        if isinstance(node, list):
+            part = parts[index]
+            if not part.isdigit() or int(part) >= len(node):
+                return MISSING
+            node = node[int(part)]
+            index += 1
+            continue
+        return MISSING
+    return node
+
+
+def render(value):
+    if value is MISSING:
+        return MISSING
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def keys_of(value, where):
+    if value is MISSING:
+        return MISSING
+    if not isinstance(value, dict):
+        die("%s is a %s, not an object" % (where, type(value).__name__))
+    return ",".join(sorted(value))
+
+
+def members_of(value, where, drop_null):
+    if value is MISSING:
+        return MISSING
+    if not isinstance(value, list):
+        die("%s is a %s, not a list" % (where, type(value).__name__))
+    items = [item for item in value if not (drop_null and item is None)]
+    return ",".join(sorted(render(item) for item in items))
+
+
+def yaml_blocks(text):
+    """Every fenced yaml block in a markdown document, in document order."""
+    blocks = []
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if current is None:
+            if stripped in ("```yaml", "```yml"):
+                current = []
+            continue
+        if stripped == "```":
+            blocks.append("\n".join(current) + "\n")
+            current = None
+            continue
+        current.append(line)
+    if current is not None:
+        die("the document ends inside an unclosed yaml block")
+    return blocks
+
+
+def minimal(node):
+    """The smallest instance a schema node accepts. Empty arrays and empty strings."""
+    if "const" in node:
+        return node["const"]
+    if "enum" in node:
+        for choice in node["enum"]:
+            if choice is not None:
+                return choice
+        return node["enum"][0]
+    names = node.get("type", "object")
+    if isinstance(names, list):
+        name = next((item for item in names if item != "null"), names[0])
+    else:
+        name = names
+    if name == "object":
+        out = {}
+        props = node.get("properties", {})
+        for field in node.get("required", []):
+            out[field] = minimal(props.get(field, {}))
+        return out
+    if name == "array":
+        return []
+    if name == "string":
+        return ""
+    if name == "integer":
+        return 0
+    if name == "number":
+        return 0
+    if name == "boolean":
+        return False
+    return None
+
+
+def build_contract(argv):
+    if not argv:
+        die("contract needs a schema path")
+    schema = read_json(argv[0])
+    options = {"run-id": None, "drop": None, "extra": None, "enum-break": None}
+    rest = argv[1:]
+    index = 0
+    while index < len(rest):
+        flag = rest[index]
+        if not flag.startswith("--") or flag[2:] not in options:
+            die("unknown contract option %s" % flag)
+        if index + 1 >= len(rest):
+            die("%s needs a value" % flag)
+        options[flag[2:]] = rest[index + 1]
+        index += 2
+
+    instance = minimal(schema)
+    if options["run-id"] and "run_id" in schema.get("properties", {}):
+        instance["run_id"] = options["run-id"]
+    if options["drop"]:
+        if options["drop"] not in instance:
+            die("--drop %s is not a required field of this schema" % options["drop"])
+        del instance[options["drop"]]
+    if options["extra"]:
+        instance[options["extra"]] = "not in the schema"
+    if options["enum-break"]:
+        if options["enum-break"] not in instance:
+            die("--enum-break %s is not a required field of this schema" % options["enum-break"])
+        instance[options["enum-break"]] = "hyperpower-invalid-value"
+    return json.dumps(instance, indent=2) + "\n"
+
+
+USAGE = """hptool <command> [args]
+
+  json-get FILE PATH          one value, dotted path, list indices are digits
+  json-keys FILE PATH         sorted comma-joined keys of an object
+  json-members FILE PATH      sorted comma-joined members of a list
+  json-members FILE PATH --no-null   the same, with nulls dropped
+  yaml-get FILE PATH          the same three, through the kernel's own parser
+  yaml-keys FILE PATH
+  yaml-members FILE PATH [--no-null]
+  jsonl-get FILE N PATH       one value from line N, counting from 1
+  jsonl-keys FILE N           sorted comma-joined keys of line N
+  jsonl-count FILE            non-empty lines
+  gate-field FILE GATE FIELD  one field of one gate record in an hp-gates aggregate
+  yaml-blocks DOC OUTDIR      write every fenced yaml block, print the count
+  contract SCHEMA [--run-id R] [--drop F] [--extra F] [--enum-break F]
+"""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        sys.stdout.write(USAGE)
+        return 0
+    command = argv[0]
+    rest = argv[1:]
+
+    if command in ("json-get", "json-keys", "json-members", "yaml-get", "yaml-keys", "yaml-members"):
+        if len(rest) < 2:
+            die("%s needs a file and a path" % command)
+        path, dotted = rest[0], rest[1]
+        drop_null = "--no-null" in rest[2:]
+        data = read_json(path) if command.startswith("json") else read_yaml(path)
+        value = walk(data, dotted)
+        where = "%s %s" % (path, dotted)
+        if command.endswith("-keys"):
+            sys.stdout.write(keys_of(value, where) + "\n")
+        elif command.endswith("-members"):
+            sys.stdout.write(members_of(value, where, drop_null) + "\n")
+        else:
+            sys.stdout.write(render(value) + "\n")
+        return 0
+
+    if command == "gate-field":
+        if len(rest) < 3:
+            die("gate-field needs a file, a gate name and a field")
+        records = walk(read_json(rest[0]), "gates")
+        if not isinstance(records, list):
+            die("%s has no gates list" % rest[0])
+        for record in records:
+            if isinstance(record, dict) and record.get("gate") == rest[1]:
+                sys.stdout.write(render(walk(record, rest[2])) + "\n")
+                return 0
+        sys.stdout.write(MISSING + "\n")
+        return 0
+
+    if command == "jsonl-get":
+        if len(rest) < 3:
+            die("jsonl-get needs a file, a line number and a path")
+        lines = read_lines(rest[0])
+        number = int(rest[1])
+        if number < 1 or number > len(lines):
+            die("%s has %d lines, so line %d does not exist" % (rest[0], len(lines), number))
+        sys.stdout.write(render(walk(json.loads(lines[number - 1]), rest[2])) + "\n")
+        return 0
+
+    if command == "jsonl-keys":
+        if len(rest) < 2:
+            die("jsonl-keys needs a file and a line number")
+        lines = read_lines(rest[0])
+        number = int(rest[1])
+        if number < 1 or number > len(lines):
+            die("%s has %d lines, so line %d does not exist" % (rest[0], len(lines), number))
+        sys.stdout.write(keys_of(json.loads(lines[number - 1]), rest[0]) + "\n")
+        return 0
+
+    if command == "jsonl-count":
+        if not rest:
+            die("jsonl-count needs a file")
+        if not os.path.isfile(rest[0]):
+            sys.stdout.write("0\n")
+            return 0
+        sys.stdout.write(str(len(read_lines(rest[0]))) + "\n")
+        return 0
+
+    if command == "yaml-blocks":
+        if len(rest) < 2:
+            die("yaml-blocks needs a document and an output directory")
+        with open(rest[0], "r", encoding="utf-8") as handle:
+            blocks = yaml_blocks(handle.read())
+        os.makedirs(rest[1], exist_ok=True)
+        for index, block in enumerate(blocks, 1):
+            target = os.path.join(rest[1], "%02d.yml" % index)
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(block)
+        sys.stdout.write(str(len(blocks)) + "\n")
+        return 0
+
+    if command == "contract":
+        sys.stdout.write(build_contract(rest))
+        return 0
+
+    die("unknown command %s. Run hptool --help." % command)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+
+
+# ------------------------------------------------------------------- scratch repo
+
+
+def run_quiet(argv, cwd, env):
+    return subprocess.run(
+        argv,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+
+def build_scratch(case_dir, env):
+    """Create the case's repo, home and temp directories. Returns the repo path."""
+    repo = case_dir / "repo"
+    (repo / "src").mkdir(parents=True)
+    (case_dir / "tmp").mkdir()
+    (case_dir / "out").mkdir()
+    (case_dir / "home").mkdir()
+
+    (repo / "hyperpower.yml").write_text(SCRATCH_CONFIG, encoding="utf-8")
+    (repo / ".gitignore").write_text(SCRATCH_GITIGNORE, encoding="utf-8")
+    (repo / "src" / "a.txt").write_text("first\n", encoding="utf-8")
+    (repo / "src" / "b.txt").write_text("second\n", encoding="utf-8")
+    (repo / "README.md").write_text("scratch repo for one hyperpower test case\n", encoding="utf-8")
+
+    for argv in (
+        ["git", "init", "-q"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-q", "-m", "scratch"],
+    ):
+        done = run_quiet(argv, repo, env)
+        if done.returncode != 0:
+            raise RuntimeError(
+                "%s failed in the scratch repo: %s"
+                % (" ".join(argv), done.stdout.decode("utf-8", "replace").strip())
+            )
+    return repo
+
+
+def case_env(case_dir, repo):
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("HYPERPOWER_") and not key.startswith("HP_")
+    }
+    home = case_dir / "home"
+    env.update(
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "TMPDIR": str(case_dir / "tmp"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "hyperpower tests",
+            "GIT_AUTHOR_EMAIL": "tests@hyperpower.invalid",
+            "GIT_COMMITTER_NAME": "hyperpower tests",
+            "GIT_COMMITTER_EMAIL": "tests@hyperpower.invalid",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "HP_PYTHON": sys.executable,
+            "HP_REPO": str(REPO_ROOT),
+            "HP_DOCS": str(REPO_ROOT / "docs"),
+            "HP_PLUGIN": str(PLUGIN_DIR),
+            "HP_SCRIPTS": str(PLUGIN_DIR / "scripts"),
+            "HP_SCHEMAS": str(PLUGIN_DIR / "schemas"),
+            "HP_GATES_DIR": str(PLUGIN_DIR / "gates"),
+            "HP_TEST_REPO": str(repo),
+            "HP_TEST_TMP": str(case_dir / "tmp"),
+            "HP_TEST_OUT": str(case_dir / "out"),
+            "HP_TEST_LIB": str(case_dir / "tmp" / "lib.sh"),
+        }
+    )
+    return env
+
+
+# ---------------------------------------------------------------------- results
+
+
+class Assertion:
+    def __init__(self, status, name, detail):
+        self.status = status
+        self.name = name
+        self.detail = detail
+
+
+def read_assertions(out_dir):
+    records = []
+    for path in sorted(out_dir.glob("*.rec")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        head, _, body = text.partition("\n")
+        status, _, name = head.partition("\t")
+        records.append(Assertion(status.strip(), name, body.rstrip("\n")))
+    return records
+
+
+def indent(text, prefix="        "):
+    return "\n".join(prefix + line for line in text.splitlines())
+
+
+# ------------------------------------------------------------------------- run
+
+
+def discover(only):
+    if not CASES_DIR.is_dir():
+        return []
+    cases = sorted(CASES_DIR.glob("*.sh"))
+    if not only:
+        return cases
+    pattern = only if any(ch in only for ch in "*?[") else "*%s*" % only
+    return [case for case in cases if fnmatch.fnmatch(case.stem, pattern)]
+
+
+def pollution_before():
+    return {name for name in POLLUTION_PATHS if (REPO_ROOT / name).exists()}
+
+
+def run_case(case, root, keep, verbose):
+    """Run one case. Returns (assertions, error message or None)."""
+    case_dir = root / case.stem
+    case_dir.mkdir(parents=True)
+    try:
+        repo = build_scratch(case_dir, dict(os.environ))
+        env = case_env(case_dir, repo)
+        (case_dir / "tmp" / "lib.sh").write_text(LIB_SH, encoding="utf-8")
+        (case_dir / "tmp" / "hptool.py").write_text(HPTOOL_PY, encoding="utf-8")
+
+        try:
+            done = subprocess.run(
+                ["/bin/sh", str(case)],
+                cwd=str(repo),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=CASE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return [], "the case did not finish within %ds" % CASE_TIMEOUT_SECONDS
+
+        output = done.stdout.decode("utf-8", "replace")
+        assertions = read_assertions(case_dir / "out")
+
+        error = None
+        if done.returncode != 0:
+            error = "the case exited %d\n%s" % (done.returncode, indent(output.strip()))
+        elif not assertions:
+            error = "the case recorded no assertions\n%s" % indent(output.strip())
+        elif verbose and output.strip():
+            sys.stdout.write(indent(output.strip(), "      ") + "\n")
+        return assertions, error
+    finally:
+        if not keep:
+            shutil.rmtree(str(case_dir), ignore_errors=True)
+
+
+def report(case_name, assertions, error, verbose):
+    failed = [item for item in assertions if item.status == FAIL]
+    skipped = [item for item in assertions if item.status == SKIP]
+    passed = [item for item in assertions if item.status == PASS]
+
+    parts = ["%d passed" % len(passed)]
+    if failed:
+        parts.append("%d failed" % len(failed))
+    if skipped:
+        parts.append("%d skipped" % len(skipped))
+    headline = "%-16s %s" % (case_name, ", ".join(parts))
+    if error:
+        headline = "%-16s ERROR" % case_name
+    sys.stdout.write(headline + "\n")
+
+    if error:
+        sys.stdout.write(indent(error, "      ") + "\n")
+    if verbose:
+        for item in assertions:
+            mark = {PASS: "  ok  ", FAIL: "  FAIL", SKIP: "  skip"}[item.status]
+            sys.stdout.write("%s  %s\n" % (mark, item.name))
+    for item in failed:
+        if not verbose:
+            sys.stdout.write("  FAIL  %s\n" % item.name)
+        if item.detail:
+            sys.stdout.write(indent(item.detail) + "\n")
+    for item in skipped:
+        if not verbose:
+            sys.stdout.write("  skip  %s\n" % item.name)
+        if item.detail:
+            sys.stdout.write(indent(item.detail) + "\n")
+    return len(passed), len(failed), len(skipped)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="run-tests",
+        description=(
+            "Run the hyperpower kernel test suite. Each case in tests/cases/ runs in its "
+            "own git repository under a temporary directory."
+        ),
+        epilog=(
+            "Exit 0 when every assertion passed. Exit 1 when any assertion failed, any "
+            "case crashed, or a case wrote inside this repository."
+        ),
+    )
+    parser.add_argument(
+        "--only",
+        metavar="PATTERN",
+        default=None,
+        help="run the cases whose file name matches. A pattern with no wildcard matches "
+        "as a substring.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print every assertion and each case's own output",
+    )
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="leave the scratch directories on disk and print where they are",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_cases",
+        help="print the cases that would run, then stop",
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    cases = discover(args.only)
+    if not cases:
+        sys.stderr.write(
+            "no cases matched. %s holds: %s\n"
+            % (CASES_DIR, ", ".join(sorted(p.stem for p in CASES_DIR.glob("*.sh"))) or "nothing")
+        )
+        return EXIT_FAILED
+    if args.list_cases:
+        for case in cases:
+            sys.stdout.write(case.stem + "\n")
+        return EXIT_OK
+
+    before = pollution_before()
+    root = Path(tempfile.mkdtemp(prefix="hp-tests-"))
+    totals = [0, 0, 0]
+    errors = 0
+    try:
+        for case in cases:
+            assertions, error = run_case(case, root, args.keep, args.verbose)
+            passed, failed, skipped = report(case.stem, assertions, error, args.verbose)
+            totals[0] += passed
+            totals[1] += failed
+            totals[2] += skipped
+            if error:
+                errors += 1
+    finally:
+        if args.keep:
+            sys.stdout.write("scratch kept at %s\n" % root)
+        else:
+            shutil.rmtree(str(root), ignore_errors=True)
+
+    leaked = sorted({name for name in POLLUTION_PATHS if (REPO_ROOT / name).exists()} - before)
+    if leaked:
+        sys.stdout.write(
+            "POLLUTION  a case wrote inside %s: %s\n" % (REPO_ROOT, ", ".join(leaked))
+        )
+
+    total = totals[0] + totals[1] + totals[2]
+    summary = "%d cases, %d assertions, %d passed, %d failed, %d skipped" % (
+        len(cases),
+        total,
+        totals[0],
+        totals[1],
+        totals[2],
+    )
+    if errors:
+        summary += ", %d case error%s" % (errors, "" if errors == 1 else "s")
+    sys.stdout.write(summary + ".\n")
+
+    if totals[1] or errors or leaked:
+        return EXIT_FAILED
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

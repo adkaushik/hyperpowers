@@ -23,7 +23,7 @@ Four executables in `${CLAUDE_PLUGIN_ROOT}/scripts/`. Run calls them. It never p
 | `hp-config` | `--json`, which prints the effective config on one line | 0 ok, 1 parse error, 78 no config |
 | `hp-journal` | `new`, `hash`, `step`, `usage`, `mistake`, `finish` | 0 written, 1 refused, 78 no config |
 | `hp-validate` | `hp-validate <step> --stdin`, or `--file <path>` | 0 valid, 1 invalid, 2 usage error, 78 no schema |
-| `hp-gates` | `--run <id> --files a,b --route <r> --config <path> --json` | 0 no blocking failure, 1 blocking failure, 2 could not run |
+| `hp-gates` | `--run <id> --files a,b --route <r> --config <path> --json` | 0 no blocking failure, 1 blocking failure, 78 blocking gate could not run, 2 hp-gates itself could not run |
 
 Write the config JSON to one file and pass it to `hp-gates --config`. Both then read the
 same bytes, and the run records one config hash rather than two.
@@ -189,7 +189,7 @@ alone.
 | `did_not_run` | `true` | hard stop. Name the gate, its `detail`, and `/hyperpower:doctor`. |
 | `did_not_run` | `false` | warning. Carry it into Render. |
 
-`hp-gates` exits 0 when no blocking gate failed, and a blocking gate that did not run does
+`hp-gates` exits 78 when a blocking gate could not run, and 0 only when every enabled blocking gate passed. A gate you disabled does
 not change that exit code. A repo with no gate commands configured returns exit 0 with
 `counts.did_not_run` equal to `counts.total`. The stop in row five is the caller's job, and
 it is the reason gates fail closed. A `did_not_run` is never a pass. Never report a gate you

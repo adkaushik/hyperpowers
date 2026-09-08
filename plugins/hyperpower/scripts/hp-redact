@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+"""hp-redact - hash file paths before run records reach an aggregate view.
+
+This is a read-side transform. Per-run journals keep real paths, because they already live
+inside the repo they describe. /hyperpower:usage and /hyperpower:cost pipe records through
+this script before they group anything, so a pasted aggregate carries digests instead of
+paths. Nothing here changes what hp-journal records.
+
+Reads JSON or JSONL on stdin and writes the same shape on stdout. A path becomes
+`path:<8 hex>`, derived from a salt stored in .hyperpower/ and never committed. The same
+path always yields the same token in the same repo, so grouping by file still works.
+
+Python 3 standard library only. No third-party imports, no network access.
+
+Exit codes: 0 emitted, 1 bad input, 2 usage error.
+"""
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+
+JOURNAL_DIR = ".hyperpower"
+SALT_NAME = "redact-salt"
+SALT_VERSION = "hyperpower-redact-salt-v1"
+DIGEST_CHARS = 8
+TOKEN_PREFIX = "path"
+
+# One candidate per run of path characters, with up to two :line numbers glued on the end.
+# Whitespace, quotes, commas, brackets and a colon before a non-digit all end a candidate.
+# The class is a negative one so an accented or non-Latin filename stays whole. Matching
+# ASCII only would cut src/caf<accent>.ts in half and leave the tail in the output.
+PATH_CHAR = r"[^\s\"'`<>(),;:\[\]{}|=&$*?!%\\]"
+TOKEN_RE = re.compile(PATH_CHAR + r"+(?::[0-9]+){0,2}")
+
+# A URL is not a file path. The port in http://localhost:5173/settings splits the URL into
+# two candidates, and the second one is path-shaped, so URLs are found first and skipped
+# whole rather than left to the candidate scan.
+URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>)\]}]+")
+LINE_SUFFIX_RE = re.compile(r"(:[0-9]+(?::[0-9]+)?)$")
+ALNUM_RE = re.compile(r"\w", re.UNICODE)
+
+# A bare filename is a path only when its extension is one of these. Without the list,
+# `example.com` and `1.4` in a free-text detail read as files and the aggregate fills with
+# digests of things that were never paths.
+FILE_EXTENSIONS = frozenset(
+    """
+    bash c cc cfg cjs conf cpp cs css csv env erb ex exs go gradle graphql h hbs hpp hs
+    html ini ipynb java js json jsonl jsx kt kts less lock log lua m md mdx mjs mts
+    php pl pp proto ps1 psd py pyi r rb rs rst s sass sbt scala scss sh slim snap sql
+    styl svelte svg swift tf tfvars toml ts tsv tsx txt vue xml yaml yml zsh
+    """.split()
+)
+
+# Harness-owned names. Hashing them hides nothing about the repo's code and makes a gate
+# detail unreadable, so they pass through whole.
+KEEP_NAMES = frozenset(
+    (
+        "hyperpower.yml",
+        "hyperpower.local.yml",
+        "pricing.yml",
+        "task-classes.yml",
+        "CODEBASE_RULEBOOK.md",
+    )
+)
+
+# Anything inside the run journal names a run, a step, or a gate log. None of it is repo
+# source, and keeping it lets an aggregate point at the evidence.
+KEEP_PREFIXES = (".hyperpower/",)
+
+# Keys whose value is never a path, whatever it looks like. These are the columns an
+# aggregate groups by. Redacting one destroys the analysis redaction is meant to protect.
+KEEP_KEYS = frozenset(
+    (
+        "agent",
+        "base_sha",
+        "class",
+        "config_hash",
+        "confidence",
+        "declared_at",
+        "files_hash",
+        "gate",
+        "id",
+        "key",
+        "kind",
+        "model",
+        "outcome_class",
+        "prompt_hash",
+        "result",
+        "run",
+        "run_id",
+        "severity",
+        "slice_id",
+        "source",
+        "stage",
+        "status",
+        "step",
+        "task_class",
+        "upstream_hash",
+        "verdict",
+    )
+)
+
+
+class RedactError(Exception):
+    """A run could not be completed. The message names the cause and the fix."""
+
+
+# ----------------------------------------------------------------------- paths
+
+
+def run_git(args, cwd):
+    """Run one git command. Return stripped stdout, or an empty string on any failure."""
+    try:
+        done = subprocess.run(
+            ["git"] + args,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return ""
+    if done.returncode != 0:
+        return ""
+    return done.stdout.decode("utf-8", "replace").strip()
+
+
+def find_root(explicit=None):
+    """Repo root: --root, then HYPERPOWER_REPO_ROOT, then git, then hyperpower.yml, then cwd."""
+    if explicit:
+        return os.path.abspath(explicit)
+    from_env = os.environ.get("HYPERPOWER_REPO_ROOT", "").strip()
+    if from_env:
+        # Same normalisation as hp-config and hp-journal: strip, then expanduser.
+        # One variable must not give three components three different roots.
+        return os.path.abspath(os.path.expanduser(from_env))
+    top = run_git(["rev-parse", "--show-toplevel"], os.getcwd())
+    if top:
+        return os.path.abspath(top)
+    current = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(current, "hyperpower.yml")):
+            return current
+        if os.path.isdir(os.path.join(current, JOURNAL_DIR)):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return os.getcwd()
+        current = parent
+
+
+# ------------------------------------------------------------------ hp-config
+
+
+def load_config_module():
+    """Import the sibling hp-config script. It has no .py suffix, so name the loader."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    if not os.path.isfile(path):
+        raise RedactError(
+            "hp-config is missing from {}. Reinstall the plugin.".format(
+                os.path.dirname(path)
+            )
+        )
+    loader = importlib.machinery.SourceFileLoader("hp_config", path)
+    spec = importlib.util.spec_from_file_location("hp_config", path, loader=loader)
+    module = importlib.util.module_from_spec(spec)
+    cached = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = cached
+    return module
+
+
+def read_config_json(path):
+    """Read a file holding `hp-config --json` or `hp-config --source` output."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            body = handle.read()
+    except OSError as exc:
+        raise RedactError("cannot read {}: {}".format(path, exc.strerror))
+    try:
+        payload = json.loads(body)
+    except ValueError as exc:
+        raise RedactError("{} is not valid JSON: {}".format(path, exc))
+    if not isinstance(payload, dict):
+        raise RedactError(
+            "{} holds a {}. Pass the output of hp-config --json or "
+            "hp-config --source.".format(path, type(payload).__name__)
+        )
+    inner = payload.get("config")
+    if isinstance(inner, dict):
+        return inner, payload.get("sources") or {}
+    return payload, {}
+
+
+def redaction_setting(args, root):
+    """Return (on, where). Absent config is not an error: redaction defaults to on."""
+    if args.config_json:
+        config, sources = read_config_json(args.config_json)
+        where = sources.get("telemetry.redact_paths") or args.config_json
+    else:
+        module = load_config_module()
+        try:
+            loaded = module.load(root)
+        except module.ConfigError as exc:
+            if exc.message == module.NO_CONFIG_MESSAGE:
+                return True, None
+            raise RedactError(exc.render())
+        config = loaded["config"]
+        where = loaded["sources"].get("telemetry.redact_paths", "default")
+    telemetry = config.get("telemetry")
+    if not isinstance(telemetry, dict):
+        return True, where
+    value = telemetry.get("redact_paths", True)
+    if value is False or (isinstance(value, str) and value.strip().lower() == "false"):
+        return False, where
+    return True, where
+
+
+# -------------------------------------------------------------------- the salt
+
+
+def default_salt_path(root):
+    return os.path.join(root, JOURNAL_DIR, SALT_NAME)
+
+
+def derive_salt(root):
+    """A salt fixed by the repo, not by a clock and not by randomness.
+
+    The root commit sha is stable across clones and machines, so the same repo produces the
+    same tokens everywhere. A repo with no commit falls back to its absolute root path.
+    """
+    roots = run_git(["rev-list", "--max-parents=0", "HEAD"], root)
+    lines = [line.strip() for line in roots.splitlines() if line.strip()]
+    seed = lines[-1] if lines else os.path.abspath(root)
+    return hashlib.sha256((SALT_VERSION + ":" + seed).encode("utf-8")).hexdigest()
+
+
+def load_salt(path, root, notes):
+    """Read the salt, or derive and store it. The file is created once and never rotated."""
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                body = handle.read().strip()
+        except OSError as exc:
+            raise RedactError("cannot read the salt {}: {}".format(path, exc.strerror))
+        if not body:
+            raise RedactError(
+                "the salt file {} is empty. Delete it and run again to derive a new "
+                "one. Every token changes when the salt changes.".format(path)
+            )
+        warn_if_committable(path, root, notes)
+        return body
+
+    parent = os.path.dirname(path) or "."
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as exc:
+        raise RedactError("cannot create {}: {}".format(parent, exc.strerror))
+    salt = derive_salt(root)
+    try:
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Two cases share this errno. Another writer won the race, in which case a
+        # regular file is now there and its salt is the one in use. Or the path is a
+        # directory or a symlink, which never becomes readable however often we retry.
+        # Retrying the second case recurses until the interpreter dies and buries the
+        # cause under a thousand frames, so check before recursing.
+        if os.path.isfile(path):
+            return load_salt(path, root, notes)
+        raise RedactError(
+            "the salt path {} exists but is not a regular file. Point --salt-file at a "
+            "file, or remove what is there.".format(path)
+        )
+    except OSError as exc:
+        # Every other errno is permanent: EACCES, EROFS, ENAMETOOLONG. Say the cause.
+        raise RedactError(
+            "cannot write the salt {}: {}. Redaction needs a writable .hyperpower/ "
+            "directory.".format(path, exc.strerror)
+        )
+    try:
+        os.write(handle, (salt + "\n").encode("ascii"))
+    finally:
+        os.close(handle)
+    notes.append("derived a new redaction salt at {}".format(path))
+    warn_if_committable(path, root, notes)
+    return salt
+
+
+def warn_if_committable(path, root, notes):
+    """Say so when git would commit the salt. Never edit .gitignore from here."""
+    try:
+        done = subprocess.run(
+            ["git", "check-ignore", "-q", path],
+            cwd=root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return
+    if done.returncode != 1:
+        return
+    relative = os.path.relpath(path, root).replace(os.sep, "/")
+    notes.append(
+        "{} is not gitignored. Committing it publishes the salt and every token becomes "
+        "reversible by anyone with the repo. Add this line to .gitignore: {}".format(
+            relative, relative
+        )
+    )
+
+
+# ---------------------------------------------------------------- path shapes
+
+
+def path_shape(body):
+    """True when this candidate is a file path. Everything else is left alone."""
+    if body == "" or "://" in body:
+        return False
+    if not ALNUM_RE.search(body):
+        return False
+    if "/" in body:
+        segments = [part for part in body.split("/") if part != ""]
+        if not segments:
+            return False
+        if "//" in body:
+            return False
+        if all(segment.isdigit() for segment in segments):
+            return False
+        return any(ALNUM_RE.search(segment) for segment in segments)
+    if "." not in body:
+        return False
+    stem, _, extension = body.rpartition(".")
+    if stem == "" or extension == "":
+        return False
+    return extension.lower() in FILE_EXTENSIONS
+
+
+class Redactor(object):
+    """Turns paths into stable tokens. One instance per run, holding one salt."""
+
+    def __init__(self, salt, root=None):
+        self.salt = salt.encode("utf-8")
+        self.root = os.path.abspath(root) if root else None
+        self.kept = 0
+        self.collisions = 0
+
+    def normalize(self, body):
+        """Repo-relative POSIX path, so an absolute and a relative form share a token."""
+        text = body.replace(os.sep, "/") if os.sep != "/" else body
+        while text.startswith("./"):
+            text = text[2:]
+        if self.root and os.path.isabs(text):
+            relative = os.path.relpath(text, self.root)
+            if relative != ".." and not relative.startswith(".." + os.sep):
+                text = relative.replace(os.sep, "/")
+        return text
+
+    def token(self, body):
+        digest = hashlib.sha256(self.salt + b"\n" + self.normalize(body).encode("utf-8"))
+        return "{}:{}".format(TOKEN_PREFIX, digest.hexdigest()[:DIGEST_CHARS])
+
+    def keep(self, body):
+        normalized = self.normalize(body)
+        if normalized in KEEP_NAMES:
+            return True
+        return any(normalized.startswith(prefix) for prefix in KEEP_PREFIXES)
+
+    def scan(self, text):
+        """Return (new_text, hits). A hit is (original, token, whole_value)."""
+        hits = []
+        out = []
+        cursor = 0
+        urls = [(found.start(), found.end()) for found in URL_RE.finditer(text)]
+        for match in TOKEN_RE.finditer(text):
+            if any(start <= match.start() < end for start, end in urls):
+                continue
+            raw = match.group(0)
+            core = raw
+            trailing = ""
+            while core.endswith("."):
+                core = core[:-1]
+                trailing = "." + trailing
+            suffix = ""
+            found = LINE_SUFFIX_RE.search(core)
+            if found:
+                suffix = found.group(1)
+                core = core[: found.start()]
+            if not path_shape(core):
+                continue
+            if self.keep(core):
+                self.kept += 1
+                continue
+            token = self.token(core)
+            out.append(text[cursor : match.start()])
+            out.append(token + suffix + trailing)
+            cursor = match.end()
+            whole = match.start() == 0 and match.end() == len(text)
+            hits.append((raw, token + suffix + trailing, whole))
+        if not hits:
+            return text, hits
+        out.append(text[cursor:])
+        return "".join(out), hits
+
+
+def walk(node, redactor, trail, hits, key=None):
+    """Rewrite every path in a record. Lists, maps, map keys, and free-text strings."""
+    if isinstance(node, dict):
+        result = {}
+        for name, value in node.items():
+            if isinstance(name, str):
+                new_name, name_hits = redactor.scan(name)
+                for original, token, whole in name_hits:
+                    hits.append((trail + " (key)", original, token, whole))
+            else:
+                new_name = name
+            child = "{}.{}".format(trail, name) if isinstance(name, str) else trail
+            if new_name in result:
+                redactor.collisions += 1
+            result[new_name] = walk(
+                value, redactor, child, hits, name if isinstance(name, str) else None
+            )
+        return result
+    if isinstance(node, list):
+        return [
+            walk(item, redactor, "{}[{}]".format(trail, index), hits, key)
+            for index, item in enumerate(node)
+        ]
+    if isinstance(node, str):
+        if key in KEEP_KEYS:
+            return node
+        new_text, found = redactor.scan(node)
+        for original, token, whole in found:
+            hits.append((trail, original, token, whole))
+        return new_text
+    return node
+
+
+# ---------------------------------------------------------------------- input
+
+
+def read_stdin():
+    data = sys.stdin.buffer.read()
+    return data.decode("utf-8", "replace")
+
+
+def parse_input(text):
+    """Return (mode, records). mode is `json` for one document, `jsonl` for line records.
+
+    Line records are tried first, so a one-record stream comes back as one line rather
+    than reformatted into an indented document. A whole-document parse is the fallback,
+    which is what a pretty-printed <step>.json takes.
+
+    A JSONL line that is not JSON is kept as raw text. Dropping it would hide a record
+    from the aggregate, and passing it through untouched would leak the path in it.
+    """
+    if text.strip() == "":
+        return "empty", []
+    lines = [
+        (number, line)
+        for number, line in enumerate(text.splitlines(), 1)
+        if line.strip() != ""
+    ]
+    records = []
+    every_line_parsed = True
+    for number, line in lines:
+        try:
+            records.append(("json", json.loads(line), number))
+        except ValueError:
+            every_line_parsed = False
+            records.append(("text", line, number))
+    if every_line_parsed:
+        return "jsonl", records
+    try:
+        return "json", [json.loads(text)]
+    except ValueError:
+        return "jsonl", records
+
+
+# --------------------------------------------------------------------- output
+
+
+def plural(count, one, many):
+    return "{} {}".format(count, one if count == 1 else many)
+
+
+def emit_explanation(hits, redactor, record_count, stream):
+    values = [hit for hit in hits if hit[3]]
+    inside = [hit for hit in hits if not hit[3]]
+    if not hits:
+        stream.write(
+            "hp-redact --explain: nothing would be redacted in {}.\n".format(
+                plural(record_count, "record", "records")
+            )
+        )
+    else:
+        stream.write(
+            "hp-redact --explain: {} and {} in {} would be redacted. Nothing was "
+            "written.\n\n".format(
+                plural(len(values), "value", "values"),
+                plural(len(inside), "substring", "substrings"),
+                plural(record_count, "record", "records"),
+            )
+        )
+        width_one = max(len(hit[0]) for hit in hits) + 2
+        width_two = max(len(hit[1]) for hit in hits) + 2
+        for trail, original, token, whole in hits:
+            stream.write(
+                "  {}{}{}{}\n".format(
+                    trail.ljust(width_one),
+                    original.ljust(width_two),
+                    token,
+                    "" if whole else "   (substring)",
+                )
+            )
+        stream.write("\n")
+    stream.write(
+        "{} kept: harness config names, and anything under {}.\n".format(
+            plural(redactor.kept, "path-shaped value", "path-shaped values"),
+            KEEP_PREFIXES[0],
+        )
+    )
+
+
+def emit_records(mode, records, redactor, hits, stream):
+    if mode == "json":
+        payload = walk(records[0], redactor, "$", hits)
+        stream.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        return 1
+    count = 0
+    for kind, record, number in records:
+        count += 1
+        if kind == "text":
+            new_text, found = redactor.scan(record)
+            for original, token, whole in found:
+                hits.append(("L{} (not JSON)".format(number), original, token, whole))
+            stream.write(new_text + "\n")
+            continue
+        payload = walk(record, redactor, "L{}".format(number), hits)
+        stream.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n")
+    return count
+
+
+# ------------------------------------------------------------------------ cli
+
+
+HELP_EPILOG = """\
+examples
+  cat .hyperpower/runs/4f2a/usage.jsonl | hp-redact --stdin
+  hp-journal drift latest --json | hp-redact --stdin --explain
+    --explain names each hit by its position: $.gates[0].detail in a JSON document,
+    L4.ref for line 4 of a JSONL stream.
+  hp-config --source > cfg.json && hp-redact --stdin --config-json cfg.json < records.jsonl
+
+what is redacted
+  Any value that is a file path, and any path-shaped substring inside a free-text field
+  such as a gate detail, a finding evidence line, or a failure outcome. A file:line
+  citation keeps its line number: src/a.ts:42 becomes path:9f2a1c04:42.
+
+what is not
+  A gate name, a step name, a stage name, an agent name, a model id, a git sha, a run id,
+  a config hash, a URL, a version number, and a timestamp. Keys that name a grouping
+  column are never redacted whatever their value. Harness-owned names and anything under
+  .hyperpower/ pass through whole.
+
+the salt
+  .hyperpower/redact-salt, derived from the repo's root commit sha the first time this
+  script runs, then read from that file forever. Never commit it. Deleting it changes
+  every token, and aggregates from before the change stop lining up with aggregates after.
+
+limits
+  Redaction is not anonymity. Anyone holding the repo and the salt can hash a path and
+  compare. The digest is 8 hex characters, so two paths can collide in a large repo. A
+  free-text field can carry a path this script does not recognise: a bare name with no
+  extension such as Makefile, a path written with spaces in it, a Windows path spelled
+  with backslashes, or a file named in prose.
+"""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="hp-redact",
+        description=(
+            "Hash file paths in run records before they reach an aggregate view. Reads "
+            "JSON or JSONL on stdin and writes the same shape on stdout."
+        ),
+        epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read the records from stdin. Required when stdin is a terminal.",
+    )
+    parser.add_argument(
+        "--config-json",
+        default=None,
+        metavar="F",
+        dest="config_json",
+        help="file holding hp-config --json or --source output, instead of calling hp-config",
+    )
+    parser.add_argument(
+        "--salt-file",
+        default=None,
+        metavar="F",
+        dest="salt_file",
+        help="salt file to use. Default: .hyperpower/redact-salt under the repo root",
+    )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="print what would be redacted and write no records",
+    )
+    parser.add_argument(
+        "--root",
+        default=None,
+        metavar="DIR",
+        help="repo root. Default: HYPERPOWER_REPO_ROOT, then the git top level",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.stdin and sys.stdin.isatty():
+        sys.stderr.write(
+            "hp-redact: no input. Pipe JSON or JSONL in, or pass --stdin to read from "
+            "this terminal.\n"
+        )
+        return EXIT_USAGE
+
+    notes = []
+    try:
+        root = find_root(args.root)
+        on, where = redaction_setting(args, root)
+        text = read_stdin()
+        if not on:
+            sys.stderr.write(
+                "hp-redact: redaction is off. telemetry.redact_paths is false in {}. The "
+                "input was passed through unchanged and every path in it is real.\n".format(
+                    where or "the effective config"
+                )
+            )
+            sys.stdout.write(text)
+            return EXIT_OK
+        if where is None:
+            notes.append(
+                "no hyperpower.yml here, so redact_paths was treated as true. Run "
+                "/hyperpower:init to record the choice."
+            )
+        salt_path = args.salt_file or default_salt_path(root)
+        salt = load_salt(salt_path, root, notes)
+    except RedactError as exc:
+        sys.stderr.write("hp-redact: {}\n".format(exc))
+        return EXIT_ERROR
+
+    mode, records = parse_input(text)
+    redactor = Redactor(salt, root)
+    hits = []
+
+    if mode == "empty":
+        if args.explain:
+            sys.stdout.write("hp-redact --explain: stdin held no records.\n")
+        for note in notes:
+            sys.stderr.write("hp-redact: " + note + "\n")
+        return EXIT_OK
+
+    if args.explain:
+        sink = open(os.devnull, "w", encoding="utf-8")
+        try:
+            count = emit_records(mode, records, redactor, hits, sink)
+        finally:
+            sink.close()
+        emit_explanation(hits, redactor, count, sys.stdout)
+    else:
+        emit_records(mode, records, redactor, hits, sys.stdout)
+
+    if mode == "jsonl":
+        broken = len([row for row in records if row[0] == "text"])
+        if broken:
+            notes.append(
+                "{} input {} not JSON. {} emitted as text with the path-shaped "
+                "substrings redacted, not dropped.".format(
+                    broken,
+                    "line was" if broken == 1 else "lines were",
+                    "It was" if broken == 1 else "They were",
+                )
+            )
+    if redactor.collisions:
+        notes.append(
+            "{} {} merged after colliding. Two paths share one token, so their rows are "
+            "one row.".format(
+                plural(redactor.collisions, "redacted map key", "redacted map keys"),
+                "was" if redactor.collisions == 1 else "were",
+            )
+        )
+    for note in notes:
+        sys.stderr.write("hp-redact: " + note + "\n")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

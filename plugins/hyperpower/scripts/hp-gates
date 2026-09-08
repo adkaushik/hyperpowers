@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Gate runner for the hyperpower harness.
 
-Runs every enabled gate, writes the aggregate to the run journal, and exits non-zero when a
-blocking gate failed. Python 3.8 or newer, standard library only. No third-party imports.
+Runs every enabled gate and writes the aggregate to the run journal. Exit 0 means every
+enabled blocking gate passed, 1 means a blocking gate failed, 78 means a blocking gate
+could not run. Python 3.8 or newer, standard library only. No third-party imports.
 
 Config comes from `hp-config --json`. This script never parses YAML.
+The aggregate is checked by `hp-validate gates` before it is written. This script never
+writes a contract its own validator rejects.
 """
 
 from __future__ import annotations
@@ -116,6 +119,13 @@ def one_line(text, limit=160):
 
 
 def resolve_root():
+    """Repo root: HYPERPOWER_REPO_ROOT, then the git top level, then the nearest directory
+    at or above the working directory holding hyperpower.yml.
+
+    hp-config, hp-journal and gates/_lib.sh resolve it the same way. Do not reorder it here
+    alone: the root picked here is the one hp-config is asked for with --root, so a
+    different order makes hp-gates read a config no other component read.
+    """
     env_root = os.environ.get("HYPERPOWER_REPO_ROOT", "").strip()
     if env_root:
         candidate = Path(env_root).expanduser()
@@ -134,7 +144,11 @@ def resolve_root():
             return Path(top).resolve()
     except OSError:
         pass
-    return Path.cwd().resolve()
+    here = Path.cwd().resolve()
+    for candidate in [here] + list(here.parents):
+        if (candidate / "hyperpower.yml").is_file():
+            return candidate
+    return here
 
 
 def find_helper(name):
@@ -392,6 +406,52 @@ def prompt_hash(cfg):
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------- contract
+
+
+def validate_aggregate(aggregate, counts, root):
+    """Check the gates contract against schemas/gates.json. Exit EXIT_ERROR when it fails.
+
+    hp-gates is the one producer that writes a step contract with no model in the loop, so
+    nothing else would catch a shape change here. hp-validate owns the schema. Do not add a
+    second check in this file: two validators drift and the output never shows it.
+
+    An unchecked contract is not written and not printed. The next stage reads gates.json,
+    and a contract the harness's own gate would reject is worse than no contract.
+    """
+    ran = "The gates ran: %d passed, %d failed, %d did not run." % (
+        counts[PASS],
+        counts[FAIL],
+        counts[DID_NOT_RUN],
+    )
+    helper = find_helper("hp-validate")
+    if helper is None:
+        fail(
+            "hp-validate was not found next to this script, under CLAUDE_PLUGIN_ROOT, or on "
+            "PATH, so the gates contract could not be checked and nothing was recorded.\n"
+            "%s Reinstall the plugin, then run it again." % ran
+        )
+    proc = subprocess.run(
+        interpreter_argv(helper) + ["gates", "--stdin"],
+        cwd=str(root),
+        input=(json.dumps(aggregate, indent=2) + "\n").encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode == 0:
+        return
+    detail = tail_text(proc.stderr, lines=40) or "hp-validate printed nothing."
+    if proc.returncode == 1:
+        head = "the gates contract does not match schemas/gates.json."
+    else:
+        head = "hp-validate exited %d and could not check the gates contract." % proc.returncode
+    fail(
+        "%s Nothing was recorded.\n%s\n%s Fix hp-gates or the schema, then run it again."
+        % (head, detail, ran)
+    )
 
 
 # ---------------------------------------------------------------- run journal
@@ -826,7 +886,26 @@ def blocking_unverified(records):
     ]
 
 
-def render_table(records, counts):
+def verdict(blocked, unverified):
+    """One line naming the exit code and why. The table alone does not say it.
+
+    A reader sees `did not run` beside `blocking` and cannot tell from that whether the run
+    passed. State the outcome instead of leaving it to be inferred.
+    """
+    if blocked:
+        return "%s failed and %s blocking. hp-gates exits 1." % (
+            ", ".join(blocked),
+            "is" if len(blocked) == 1 else "are",
+        )
+    if unverified:
+        return (
+            "%s could not run and %s blocking. That is not a pass. hp-gates exits 78."
+            % (", ".join(unverified), "is" if len(unverified) == 1 else "are")
+        )
+    return "Every enabled blocking gate passed. hp-gates exits 0."
+
+
+def render_table(records, counts, blocked, unverified):
     lines = []
     headline = "Gates  %d passed, %d failed, %d did not run" % (
         counts[PASS],
@@ -834,6 +913,7 @@ def render_table(records, counts):
         counts[DID_NOT_RUN],
     )
     lines.append(headline)
+    lines.append(verdict(blocked, unverified))
     lines.append("")
     rows = [("gate", "result", "blocking", "duration")]
     for record in records:
@@ -864,26 +944,51 @@ def render_table(records, counts):
     return lines
 
 
-def render_block(title, records, rest_at):
-    """One block of detail lines. Ranked, five shown, the remainder counted."""
+def render_block(title, records, rest_at, second=None):
+    """One block of detail lines. Ranked, five shown, the remainder counted.
+
+    `second` is a function naming a middle column. The did-not-run block uses it to say
+    which of those gates held the run, so the report answers that without gates.json.
+    """
     if not records:
         return []
-    width = max(len(record["gate"]) for record in records[:BLOCK_ROWS])
+    shown = records[:BLOCK_ROWS]
+    width = max(len(record["gate"]) for record in shown)
+    mark_width = 0 if second is None else max(len(second(record)) for record in shown)
     lines = ["", "%s  %d" % (title, len(records))]
-    for record in records[:BLOCK_ROWS]:
-        lines.append("  %-*s  %s" % (width, record["gate"], one_line(record["detail"])))
+    for record in shown:
+        if second is None:
+            lines.append("  %-*s  %s" % (width, record["gate"], one_line(record["detail"])))
+            continue
+        lines.append(
+            "  %-*s  %-*s  %s"
+            % (width, record["gate"], mark_width, second(record), one_line(record["detail"]))
+        )
     remainder = len(records) - BLOCK_ROWS
     if remainder > 0:
         lines.append("  +%d more in %s" % (remainder, rest_at))
     return lines
 
 
+def did_not_run_mark(record):
+    """Which of the three did-not-run cases this is. The exit code follows this column.
+
+    blocking  counted in blocking_unverified, so hp-gates exits 78
+    warning   gates.<name>.blocking is false, so it does not hold the run
+    disabled  gates.<name>.enabled is false, which is a deliberate choice and is excluded
+    """
+    if record["detail"] == DISABLED:
+        return "disabled"
+    return "blocking" if record["blocking"] else "warning"
+
+
 def rank_did_not_run(records):
-    """A gate that could not execute outranks one the config turned off on purpose."""
-    return sorted(records, key=lambda record: 1 if record["detail"] == DISABLED else 0)
+    """Blocking first, then a warning, then one the config turned off on purpose."""
+    order = {"blocking": 0, "warning": 1, "disabled": 2}
+    return sorted(records, key=lambda record: order[did_not_run_mark(record)])
 
 
-def render_next(records, blocked):
+def render_next(records, blocked, unverified):
     timed_out = [r["gate"] for r in records if r["timed_out"]]
     lines = []
     if blocked:
@@ -893,20 +998,28 @@ def render_next(records, blocked):
             "  %s hit limits.gate_timeout_seconds. Raise it, or scope the command with "
             "{files}." % ", ".join(timed_out)
         )
-    absent = [
+    if unverified:
+        lines.append(
+            "  Fix what the Did not run block names for %s, or set `enabled: false` for "
+            "that gate in hyperpower.yml. A blocking gate that cannot run holds the run at "
+            "exit 78." % ", ".join(unverified)
+        )
+    # Non-blocking gates that could not run. A blocking one is in unverified and is named
+    # by the line above, so it is not repeated here.
+    warned = [
         r["gate"]
         for r in records
-        if r["result"] == DID_NOT_RUN and r["detail"] != DISABLED
+        if r["result"] == DID_NOT_RUN and did_not_run_mark(r) == "warning"
     ]
-    if absent and not blocked:
-        lines.append("  Run /hyperpower:doctor to see why %s did not run." % ", ".join(absent))
+    if warned and not blocked:
+        lines.append("  Run /hyperpower:doctor to see why %s did not run." % ", ".join(warned))
     if not lines:
         return []
     return ["", "Next"] + lines
 
 
-def render(records, counts, blocked, rest_at):
-    lines = render_table(records, counts)
+def render(records, counts, blocked, unverified, rest_at):
+    lines = render_table(records, counts, blocked, unverified)
     lines += render_block(
         "Failed", [r for r in records if r["result"] == FAIL and r["blocking"]], rest_at
     )
@@ -917,8 +1030,9 @@ def render(records, counts, blocked, rest_at):
         "Did not run",
         rank_did_not_run([r for r in records if r["result"] == DID_NOT_RUN]),
         rest_at,
+        second=did_not_run_mark,
     )
-    lines += render_next(records, blocked)
+    lines += render_next(records, blocked, unverified)
     return "\n".join(lines) + "\n"
 
 
@@ -927,17 +1041,31 @@ def render(records, counts, blocked, rest_at):
 
 HELP_EPILOG = """\
 exit codes
-  0  no blocking gate failed
-  1  a blocking gate failed, or a blocking gate timed out
-  2  hp-gates could not run: bad flags, no config, or no gates configured
+  0   every enabled blocking gate passed
+  1   a blocking gate failed, or a blocking gate timed out
+  2   hp-gates could not run: bad flags, no config, no gates configured, or the aggregate
+      failed hp-validate
+  78  a blocking gate could not run. Not a failure, and not a pass.
+
+The exit code is the only signal a shell caller, a CI step, or a hook reads. Do not treat
+78 as success. A gate whose `enabled` is false is excluded from it, because turning a gate
+off is a deliberate choice; a gate that is missing, broken, or lacks its tool is not.
 
 results
   pass          the gate script exited 0
   fail          the gate script exited non-zero, or hp-gates killed it at the timeout
   did not run   the gate script exited 78, is missing, or is disabled in config
 
-A did-not-run gate is never counted as a pass and never fails the run. A timeout is a
-failure: the gate is named in the Failed block with the timeout in seconds.
+A did-not-run gate is never counted as a pass and never counted as a failure. The Did not
+run block marks each one blocking, warning, or disabled, which is the same column the exit
+code follows. A timeout is a failure: the gate is named in the Failed block with the
+timeout in seconds.
+
+contract
+  gates.json is a step contract. hp-gates hands the aggregate to `hp-validate gates` before
+  writing it, and a contract that fails validation is neither written nor printed. Read
+  gates.json rather than the table when a caller needs blocking_failures or
+  blocking_unverified by name; --json prints the same object without writing it.
 
 selection
   A gate runs when hyperpower.yml lists it under `gates:` and its `enabled` is not false.
@@ -977,7 +1105,9 @@ file scope
   gate report did_not_run instead of running against the whole repo.
 
 environment
-  HYPERPOWER_REPO_ROOT   directory the gates run in. Default: git rev-parse --show-toplevel
+  HYPERPOWER_REPO_ROOT   directory the gates run in, and the root hp-config is asked for.
+                         Default: the git top level, then the nearest directory at or above
+                         the working directory holding hyperpower.yml.
   HYPERPOWER_FILES_FILE  one path per line. Read when --files is absent.
   HYPERPOWER_FILES       whitespace-separated paths. Read when the two above are absent.
   HYPERPOWER_ROUTE       value for {route}. Read when --route is absent.
@@ -988,8 +1118,8 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="hp-gates",
         description=(
-            "Run every enabled hyperpower gate, record the aggregate in the run journal, "
-            "and exit non-zero when a blocking gate failed."
+            "Run every enabled hyperpower gate and record the aggregate in the run journal. "
+            "Exit 1 when a blocking gate failed, 78 when a blocking gate could not run."
         ),
         epilog=HELP_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1078,6 +1208,8 @@ def main(argv=None):
             "assumptions": [],
         }
 
+        validate_aggregate(aggregate, counts, root)
+
         rest_at = "hp-gates --json"
         if run_dir is not None:
             write_journal(aggregate, records, cfg, run_id, run_dir, root, scope_file)
@@ -1088,7 +1220,7 @@ def main(argv=None):
     if args.json:
         sys.stdout.write(json.dumps(aggregate, indent=2) + "\n")
     else:
-        sys.stdout.write(render(records, counts, blocked, rest_at))
+        sys.stdout.write(render(records, counts, blocked, unverified, rest_at))
     return exit_code
 
 

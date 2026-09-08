@@ -95,6 +95,26 @@ That list is one vocabulary in three places: `task-classes.yml`, the `task_class
 `meta.json`, the planner copies it into `plan.json`, and `/hyperpower:usage` groups by it.
 `hp-selfcheck task-classes` fails when the three lists stop agreeing.
 
+#### The two skills that drive it
+
+`skills/route` runs first and writes nothing. It reads the requirement, the config, and
+`task-classes.yml`, then emits the route contract: the class, the ordered `stages` list, the
+`tiers` map, and the stages it skipped. It never reads the code it is routing.
+
+`skills/run` is the only component that executes stages. In order: `hp-config --json` once,
+then route, then `hp-journal new --task-class`, then each stage the route named. Route runs
+before the journal exists because `hp-journal new` needs the class, so a run that stops at
+routing leaves no folder behind.
+
+Each stage is recorded with three calls in this order: `hp-journal hash`, then `hp-validate`,
+then `hp-journal step`. Validation sits between them so an invalid contract is never
+recorded. `hp-gates` makes those three calls for the `gates` step itself.
+
+Run also owns the fix loop and the render boundary. It does not implement, review, or
+adjudicate; it spawns the agents that do, by their namespaced names. A bare agent name
+resolves to a same-named agent in the user's own `~/.claude/agents/`, which returns a
+contract this pipeline cannot read.
+
 ### 6. Render
 
 The single boundary where machine output becomes human output. Every harness exits here.
@@ -171,7 +191,7 @@ counts as drift. A committed-only hash would miss it.
 
 ## Kernel scripts
 
-Five executables in `plugins/hyperpower/scripts/`. Python 3, standard library only. No
+Six executables in `plugins/hyperpower/scripts/`. Python 3, standard library only. No
 third-party imports and no network access. They are what makes the harness more than
 prose: skills and agents call them rather than parsing YAML, hashing files, or writing the
 journal themselves. A second implementation of any of these drifts from the first, and
@@ -182,11 +202,41 @@ nothing in the output shows it.
 | `hp-config` | merges `hyperpower.yml` and `hyperpower.local.yml` and prints the effective config, the per-field source, and the config hash | 0 ok, 1 parse error, 78 no config |
 | `hp-journal` | writes and reads `.hyperpower/runs/<run-id>/`: `new`, `step`, `hash`, `usage`, `mistake`, `drift`, `finish`, `list`, `path` | 0 written, 1 refused, 78 no config |
 | `hp-validate` | checks a stage contract against `schemas/<stage>.json` | 0 valid, 1 invalid, 2 usage, 78 no schema |
-| `hp-gates` | runs every enabled gate and records the aggregate | 0 no blocking failure, 1 blocking failure, 2 could not run |
+| `hp-gates` | runs every enabled gate and records the aggregate | 0 all blocking passed, 1 blocking failure, 78 blocking gate could not run, 2 hp-gates could not run |
+| `hp-redact` | hashes file paths in run records before they reach an aggregate view | 0 emitted, 1 bad input, 2 usage |
 | `hp-selfcheck` | checks the plugin against its own documentation, 13 checks | 0 clean, 1 findings |
+
+`hp-redact` is the one read-side script. It changes nothing on disk: records go in on
+stdin, the same shape comes out with each path replaced by `path:<8 hex>`, salted from a
+file in `.hyperpower/` that is never committed. Pipe an aggregate through it before that
+aggregate leaves the repo. Per-run journals keep real paths, because they are already
+inside the repo they describe, so `telemetry.redact_paths` governs the view and never the
+journal.
 
 `run_evals.py` sits beside them and is documented in `plugins/hyperpower/scripts/README.md`
 with the rest.
+
+### Tests
+
+`plugins/hyperpower/tests/run-tests` is the kernel test suite. Python 3, standard library
+only, no test framework. It discovers `tests/cases/*.sh`, runs each case in a fresh git
+repository under a temporary directory with its own `HOME`, and prints one line per case
+plus a summary: cases, assertions, passed, failed, skipped.
+
+```sh
+./run-tests                    # every case
+./run-tests --only hp-gates    # the cases whose file name matches
+./run-tests --list             # the cases that would run, then stop
+```
+
+Exit 0 when every assertion passed. Exit 1 when any assertion failed, any case crashed, or
+a case wrote inside this repository. That last one matters: a case that writes into the
+plugin repo instead of its scratch repo would pass while corrupting the tree it is testing,
+so the runner compares the repo before and after and fails on a leaked path.
+
+`hp-selfcheck` and `run-tests` check different things. Selfcheck reads the tree and compares
+it against the documentation. The suite executes the scripts and asserts on what they
+print, what they write, and what they exit.
 
 Who calls what:
 
@@ -198,7 +248,7 @@ Who calls what:
 | `/hyperpower:config` | `hp-config --source` |
 | `/hyperpower:doctor` | `hp-config --source`, then `hp-gates --only <gate>` per gate |
 | the mapper, planner, designer | `hp-validate` on their own contract before returning it |
-| CI | `hp-selfcheck --strict` |
+| CI | `hp-selfcheck`, then `run_evals.py validate` |
 
 ## Assumptions
 

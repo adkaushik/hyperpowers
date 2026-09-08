@@ -1,6 +1,6 @@
 ---
 name: usage
-description: Report what the harness did - run counts, stage pass rates, fix-loop round distribution, gate failure counts by gate, assumption verified/refuted/unresolved ratio, median run duration. Reads .hyperpower/runs/*/usage.jsonl and the step contracts beside it. No money and no token prices - that is /hyperpower:cost. Use /hyperpower:usage, with --since <7d|30d|all> and --by <stage|agent|model|run>.
+description: Report what the harness did - run counts, stage pass rates, fix-loop round distribution, gate failure counts by gate, assumption verified/refuted/unresolved ratio, median run duration. Reads .hyperpower/runs/*/usage.jsonl and the step contracts beside it through scripts/hp-redact, which hashes file paths before anything is grouped. No money and no token prices - that is /hyperpower:cost. Use /hyperpower:usage, with --since <7d|30d|all> and --by <stage|agent|model|run>.
 ---
 
 # Usage
@@ -29,7 +29,23 @@ before the window keeps the records that fall inside it.
 
 ## Step 1 - read the records
 
-One JSON object per line.
+One JSON object per line. Read every file through `hp-redact`, never straight off disk, one
+run folder at a time:
+
+```sh
+for f in .hyperpower/runs/*/usage.jsonl; do
+  echo "== run $(basename "$(dirname "$f")")"
+  ${CLAUDE_PLUGIN_ROOT}/scripts/hp-redact --stdin < "$f"
+done
+```
+
+A record carries no run id. `cat .hyperpower/runs/*/usage.jsonl` into one pipe loses the run
+boundary, and with it run count, fix-loop rounds per run, median run duration, and `--by
+run`. The folder name is the only run id there is.
+
+It hashes file paths and passes everything else through. Group what it prints. Redacting
+the finished table instead misses every path folded into a group label. Pipe each
+`<step>.json` through it too, before reading `checkable` or a file list out of one.
 
 | Field | Holds |
 |---|---|
@@ -131,14 +147,28 @@ sample is small.
 | window has no records | report zero runs and the date of the newest record on disk |
 | no `hyperpower.yml` | use the defaults below. Do not ask the user to create one. |
 
+## Redaction
+
+`hp-redact` hashes a path-shaped value, a path inside a free-text `outcome` string, and a
+map key that is a path. A `file:line` citation keeps its line number, so
+`src/api/settings.ts:42` prints as `path:9f2a1c04:42`. The same path always gives the same
+token in this repo, so grouping by file still works.
+
+It does not catch every path. A bare name with no extension, such as `Makefile`, stays, and
+an `outcome` string is free text that can carry a path in a form nothing recognises. Call
+the report redacted. Never call it clean.
+
+Per-run journals keep real paths, by design. They already live inside the repo they
+describe. This is a read-side transform: it protects the view, not the file on disk.
+
+When `telemetry.redact_paths` is false, `hp-redact` passes the records through and says so
+on stderr. Print that line above the report. `/hyperpower:telemetry` holds the full rule.
+
 ## Config
 
 If `hyperpower.yml` exists at the repo root, read `limits.fix_loop_max_rounds` for the
-histogram width and `telemetry.redact_paths` for output. Without it, use 5 rounds and treat
-redaction as on.
-
-Records carry no file paths, so redaction usually has nothing to do here. When a failure
-string contains one and `redact_paths` is true, hash it as `/hyperpower:telemetry` describes.
+histogram width. Without it, use 5 rounds. `hp-redact` reads `telemetry.redact_paths`
+itself, so do not read it here and do not hash a path yourself.
 
 ## Do not
 
@@ -147,3 +177,5 @@ string contains one and `redact_paths` is true, hash it as `/hyperpower:telemetr
 - Do not write to `.hyperpower/`. This command records nothing.
 - Do not report a stage as passing when it has no records.
 - Do not report a gate as run when only the model calls around it were recorded.
+- Do not print a real file path in the report, and do not hash one by hand. `hp-redact` is
+  the one implementation, and a second one gives a different token for the same file.

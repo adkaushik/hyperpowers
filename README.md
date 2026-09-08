@@ -23,11 +23,15 @@ Restart the session, then run this once per repository:
 `init` detects your stack, asks at most six questions, and writes `hyperpower.yml`. Budget
 five minutes the first time.
 
-Version 0.1.0. `/hyperpower:scout` and `/hyperpower:janitor` are available today.
-
 ## How it works
 
 ### The pipeline
+
+One command drives one requirement to the end:
+
+```
+/hyperpower:run "add a settings screen"
+```
 
 ```
 Requirement
@@ -43,22 +47,43 @@ Requirement
   → You
 ```
 
+Every stage writes a typed JSON contract, and the contract is checked against its schema
+before the next stage reads it. A stage that cannot produce a valid contract stops the run
+instead of handing the next stage prose it will misread.
+
+The contracts land in `.hyperpower/runs/<run-id>/` while the run happens, not afterwards.
+That folder is the record: what each stage decided, what it assumed, what every gate
+printed, and every model call it made.
+
 Stages that do not apply are skipped. A one-file change with a rulebook precedent runs
-Understand, Build, Gates, Review.
+Understand, Build, Gates, Review. `/hyperpower:route "<requirement>"` prints the stage list
+it would use, and writes nothing, so you can see the cost before paying it.
 
 ### Gates execute commands
 
-A gate runs `tsc --noEmit`, or your test command, or a browser that loads the changed route
-and asserts it rendered. It reads the exit code. No model judgment.
+A gate runs a command from your config — `tsc --noEmit`, your test command, your build —
+and reads the exit code. No model judgment.
 
-A gate that cannot run says it did not run. It never reports a pass it did not verify.
+A gate that cannot run says it did not run. A missing tool, a null command, a timeout: none
+of those is a pass, and a blocking gate that did not run stops the run just as a failure
+does. It never reports a pass it did not verify.
 
-You choose which gates block and which only warn.
+You choose which gates block and which only warn. Start `lint` as a warning and promote it
+once the codebase is clean.
+
+Nine gates are in the schema. Types, unit, lint, build and e2e run commands from your
+config. Slop runs two static linters. Browser, a11y and visual check rendered output, so
+they need a dev server, a route, and their own tooling before they check anything. Full
+list in [docs/gates.md](docs/gates.md).
 
 ### A run is a folder, not a conversation
 
-Every step writes its output contract to `.hyperpower/runs/<run-id>/`. Sessions are
-disposable. You can resume any step days later, on another machine.
+The run journal is written as the run goes: `meta.json`, one contract per step, the full
+output of every gate command, a line per model call, and a line per failure event. Sessions
+are disposable. The folder is not. You can resume any step days later, on another machine.
+
+The run id comes from the base commit, not from a clock, so the same run has the same id
+everywhere.
 
 Resume re-hashes the working tree first and reports drift:
 
@@ -149,13 +174,19 @@ Blind A/B/C labelling against a weighted rubric. A change ships only when it has
 blockers, correctness and safety hold within 0.1 of baseline, and the weighted score beats
 baseline.
 
+Fifteen stack-neutral cases ship. Write your own against work you have read, then record
+the baseline. Nothing generates cases from your commit history: a case taken from a commit
+nobody reviewed is a baseline nobody trusts, and every later comparison inherits it.
+
 ## Commands
 
-Eighteen commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
+Twenty commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
 
 ```
 /hyperpower:init            set up this repo
 /hyperpower:doctor          check what is broken
+/hyperpower:run "<req>"     drive one requirement to the end
+/hyperpower:route "<req>"   print the stages it would run, and stop
 /hyperpower:why <run>       what it decided and assumed
 /hyperpower:resume <run>    replay from any step
 /hyperpower:decisions       search the archive
@@ -184,6 +215,10 @@ Full schema in [docs/configuration.md](docs/configuration.md).
 
 Nothing leaves your machine. There is no remote destination in the codebase, and no opt-in
 that would create one. Usage and cost data are files inside your repository.
+
+When `telemetry.redact_paths` is on, file paths are hashed before they reach an aggregate
+view, so a report you paste somewhere carries digests instead of your directory names. The
+per-run journal keeps the real paths, because it already lives in the repo it describes.
 
 ```
 /hyperpower:telemetry purge

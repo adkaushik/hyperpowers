@@ -4,6 +4,10 @@
 Reads hyperpower.yml at the repo root, then merges hyperpower.local.yml over it field by
 field. A field in neither file falls back to the built-in default in SCHEMA.
 
+The root is HYPERPOWER_REPO_ROOT, then the git top level, then the nearest directory at or
+above the working directory holding hyperpower.yml. hp-journal and gates/_lib.sh resolve it
+in that order, so one repo never gives two components two different roots.
+
 Python 3 standard library only. No third-party imports, no network access.
 
 Exit codes: 0 printed, 1 bad input or unparseable file, 78 no hyperpower.yml.
@@ -14,6 +18,7 @@ import copy
 import hashlib
 import json
 import os
+import subprocess
 import sys
 
 EXIT_OK = 0
@@ -23,6 +28,7 @@ EXIT_NO_CONFIG = 78
 CONFIG_NAME = "hyperpower.yml"
 LOCAL_NAME = "hyperpower.local.yml"
 DEFAULT_SOURCE = "default"
+ENV_ROOT = "HYPERPOWER_REPO_ROOT"
 
 NO_CONFIG_MESSAGE = (
     "No {} found. Run /hyperpower:init to create one. "
@@ -563,9 +569,51 @@ def config_hash(config):
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def git_top_level(start):
+    """The git working tree root containing start. Empty when git cannot name one."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=start,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    top = result.stdout.decode("utf-8", "replace").strip()
+    if not top or not os.path.isdir(top):
+        return ""
+    return os.path.abspath(top)
+
+
 def find_root(start=None):
-    """Nearest directory at or above start holding hyperpower.yml. None when there is none."""
-    current = os.path.abspath(start or os.getcwd())
+    """The repo root: HYPERPOWER_REPO_ROOT, then the git top level, then the nearest
+    directory at or above start holding hyperpower.yml. None when none of the three answers.
+
+    This is the order hp-journal and gates/_lib.sh already use. Do not reorder it here alone.
+    A monorepo whose git root holds no hyperpower.yml would otherwise give hp-config a
+    subdirectory and hp-journal the git root, and the two would read different files.
+
+    Raise ConfigError when HYPERPOWER_REPO_ROOT names something that is not a directory. The
+    variable is an instruction, so a wrong one is bad input, not a reason to search.
+    """
+    begin = os.path.abspath(start or os.getcwd())
+    from_env = os.environ.get(ENV_ROOT, "").strip()
+    if from_env:
+        expanded = os.path.abspath(os.path.expanduser(from_env))
+        if not os.path.isdir(expanded):
+            raise ConfigError(
+                "{} is set to {}, which is not a directory. Point it at the directory "
+                "holding {}, or unset it.".format(ENV_ROOT, from_env, CONFIG_NAME)
+            )
+        return expanded
+    top = git_top_level(begin)
+    if top:
+        return top
+    current = begin
     while True:
         if os.path.isfile(os.path.join(current, CONFIG_NAME)):
             return current
@@ -578,7 +626,10 @@ def find_root(start=None):
 def load(root=None):
     """Read both config files and return the effective config with its provenance.
 
-    Raise ConfigError when hyperpower.yml is absent or either file cannot be parsed.
+    `root` is the directory holding hyperpower.yml. Without one, find_root resolves it.
+
+    Raise ConfigError when hyperpower.yml is absent, either file cannot be parsed, or
+    HYPERPOWER_REPO_ROOT names something that is not a directory.
     """
     if root is None:
         found = find_root()
@@ -647,16 +698,23 @@ def build_parser():
             "merges hyperpower.local.yml over it field by field."
         ),
         epilog=(
+            "Without --root the root is HYPERPOWER_REPO_ROOT, then the git top level, then "
+            "the nearest directory at or above the working directory holding "
+            "hyperpower.yml. hp-journal and the gate scripts resolve it the same way. In a "
+            "monorepo whose git root holds no hyperpower.yml, name the directory that does "
+            "with --root or HYPERPOWER_REPO_ROOT.\n"
             "Exit 0 printed. Exit 1 bad input or an unparseable file, with the file name "
             "and line number. Exit 78 no hyperpower.yml."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--root",
         default=None,
         metavar="DIR",
-        help="repo root holding hyperpower.yml. Default: the nearest one at or above the "
-        "working directory",
+        help="repo root holding hyperpower.yml. Default: HYPERPOWER_REPO_ROOT, then the git "
+        "top level, then the nearest directory at or above the working directory holding "
+        "hyperpower.yml",
     )
     parser.add_argument(
         "--json",

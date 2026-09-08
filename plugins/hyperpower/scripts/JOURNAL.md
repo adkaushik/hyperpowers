@@ -12,11 +12,39 @@ hp-journal step 4f2a plan --file plan.json
 hp-journal hash 4f2a plan --files src/a.ts,src/b.ts --prompt-file plan.prompt
 hp-journal usage 4f2a --stage plan --agent planner --model claude-opus-5 --input 900 --output 120
 hp-journal mistake 4f2a --kind gate_failed --key generated-import-drift --ref .hyperpower/runs/4f2a/gates.json
+hp-journal correction 4f2a --step plan --assumption a1 --text "it returns { items: [] }" --scope run
+hp-journal resume-event 4f2a --from gates --decision build --drifted build
 hp-journal drift 4f2a --from gates
 hp-journal finish 4f2a --outcome ok
 ```
 
 `latest` is a valid run id everywhere. It resolves to the newest recorded run.
+
+## The repo root
+
+One rule, three sources, in this order. This section is the statement of it.
+
+| Order | Source |
+|---|---|
+| 1 | `HYPERPOWER_REPO_ROOT`, when it is set and not empty |
+| 2 | the git top level, from `git rev-parse --show-toplevel` |
+| 3 | the nearest directory at or above the working directory holding `hyperpower.yml` |
+
+Every component that resolves a root follows this order: `hp-journal`, `hp-config`, and
+`gates/_lib.sh`. A component that resolves it differently reads a different repo, so a gate
+writes its log into one journal while the run writes its contracts into another, and
+nothing in the output shows the split.
+
+Two additions, and no others:
+
+1. An explicit `--root DIR` wins over all three. A path the caller passed is not a guess.
+2. After the three, `hp-journal` accepts a directory holding `.hyperpower/`, so `drift`,
+   `list`, and `path` still read a journal in a repo whose `hyperpower.yml` was deleted.
+   Subcommands that need the config still exit 78 there.
+
+Do not reorder the three. Do not add a fourth source. Do not honour `HYPERPOWER_REPO_ROOT`
+in one script and ignore it in another: that variable is how a worktree, a sandbox, and a
+gate subprocess name a root that is not the working directory.
 
 ## Layout
 
@@ -26,13 +54,14 @@ hp-journal finish 4f2a --outcome ok
 | `<step>.json` | `hp-journal step`, `hp-journal hash` | why, resume, correct, usage, archivist |
 | `usage.jsonl` | `hp-journal usage` | usage, cost, telemetry |
 | `mistakes.jsonl` | `hp-journal mistake`, the archivist | promoter, why, telemetry |
-| `corrections.jsonl` | `/hyperpower:correct` | why, resume, archivist |
-| `resume.jsonl` | `/hyperpower:resume` | telemetry |
+| `corrections.jsonl` | `hp-journal correction` and `correction-applied`, for `/hyperpower:correct` and `/hyperpower:resume` | why, resume, archivist |
+| `resume.jsonl` | `hp-journal resume-event`, for `/hyperpower:resume` | telemetry |
 | `gates/<gate>.log` | `gates/_lib.sh`, when `HYPERPOWER_RUN_DIR` is set | the gate report, telemetry |
 | `superseded/<ts>/` | `/hyperpower:resume` | history |
 
-`hp-journal` writes the first four. It never writes `corrections.jsonl`, `resume.jsonl`,
-the gate logs, or `superseded/`. Those belong to the components named above.
+`hp-journal` writes every file in that table except the gate logs and `superseded/`. A
+command that wants a record written calls the subcommand for it. It does not append to a
+`.jsonl` itself: one writer per file is what keeps the record shapes from forking.
 
 A missing `<step>.json` means the stage was skipped. It is not a failure and not a pass.
 
@@ -81,6 +110,15 @@ Do not parse a run id for meaning. It is an identifier, not the base sha.
 `hp-journal new` exits 78 when there is no `hyperpower.yml`. The model tiers and the config
 hash come from the config, and the harness does not guess a config.
 
+`--task-class` is checked against the `classes:` map in `task-classes.yml`. A class outside
+that file is refused with the valid list, and the run folder is not created. The check
+happens before the folder is claimed, so a refused class leaves nothing behind.
+
+The reason is grouping. `/hyperpower:usage` groups runs by this field, and
+`schemas/plan.json` carries the same seven values. A class no other component knows
+produces a run that every aggregate silently drops. Omitting `--task-class` is fine and
+records `null`. Inventing a class is not.
+
 ## `<step>.json`
 
 Nine step names, in pipeline order: `route`, `understand`, `plan`, `design`, `build`,
@@ -104,6 +142,60 @@ not the journal's: `build.json` carries `changed_files` and `assumptions` becaus
 
 Do not apply ADHD shaping or the cap-at-five rule to a step contract. It is an
 agent-to-agent handoff. Truncating it drops work.
+
+### Every step is validated before it is recorded
+
+`hp-journal step` runs `hp-validate <step> --stdin` on the record it is about to write,
+stamped fields and all, and writes nothing when the schema rejects it. The message names the
+source, lists every violation with its JSON path, and exits 1.
+
+```
+hp-journal: plan.json is not a valid plan contract, so it was not written.
+invalid: stdin against /path/to/schemas/plan.json
+  $.status                     missing required field
+  $.assumptions[0].confidence  "very-low" is not one of: "high", "medium", "low"
+2 violations.
+Fix the contract, or pass --no-validate to record it unchecked.
+```
+
+The check is here and not only in `skills/run/SKILL.md` because prose binds one caller. Any
+skill, agent, or shell loop that calls `hp-journal step` gets the same refusal.
+
+`hp-validate` is the one implementation of the check. `hp-journal` shells out to it rather
+than reading the schema itself, so there is no second implementation to drift.
+
+| `hp-validate` exit | `hp-journal step` does |
+|---|---|
+| 0 | writes the contract |
+| 1 | refuses, and prints every violation |
+| 2 | refuses. The flags were wrong, so nothing was checked. |
+| 78 | refuses. There is no usable schema for that step, so nothing was checked. |
+| script missing, or will not run | refuses. Reinstall the plugin. |
+
+`--no-validate` records the contract unchecked. Two cases are legitimate:
+
+1. A stage whose schema does not exist yet, while it is being written.
+2. Importing a run folder recorded against an older schema, for forensics.
+
+Do not pass `--no-validate` in a pipeline run, and do not pass it to get past violations you
+have not read. `/hyperpower:resume`, `/hyperpower:why`, and the archivist read these
+files by their schema, and a contract that does not match reads as a stage that produced
+nothing.
+
+### A step file with no contract
+
+`hash` writes `<step>.json` when it runs before the stage returns, which is the order
+`skills/run/SKILL.md` uses. That file holds only `step`, `run_id`, `prompt_hash`,
+`files_read`, and `cache_key`. It is a placeholder, not a recorded stage.
+
+`drift` reports it as `UNRECORDED`. That is the fix for it, chosen over making `hash` refuse
+to create the file, because refusing would break the documented hash-validate-step order and
+leave the cache key nowhere to live.
+
+`upstream_step` still picks a placeholder as the nearest earlier step. Leave that alone.
+The file changes when the real contract lands, so the downstream step then reports
+`DRIFTED — upstream <step>.json changed since this step`, which is the truth. Skipping
+placeholders would silence it.
 
 ## The cache key
 
@@ -130,7 +222,33 @@ name which one moved.
 | `upstream_hash` | sha256 of the nearest earlier recorded `<step>.json`, as it is on disk. `null` for the first step. |
 | `files_hash` | sha256 over `<path> <blob>` lines, sorted by path |
 | `blobs` | the value `git hash-object <path>` prints, per file. `null` when the file is gone. |
-| `key` | sha256 of the three digests joined by newlines |
+| `key` | sha256 over the three digests, one per line. Exactly as described below. |
+
+### The key, byte for byte
+
+Three lines, each terminated by `\n`, in this order: `prompt_hash`, `upstream_hash`,
+`files_hash`. The third line carries a trailing newline like the first two.
+
+```
+prompt_hash + "\n" + upstream_hash + "\n" + files_hash + "\n"
+```
+
+A digest that is `null` or empty is written as the literal four-character string `none`.
+`upstream_hash` is `null` for a first recorded step, so `none` is what it hashes.
+
+Each digest is the `sha256:<hex>` string as it is stored, prefix included. The body is
+encoded UTF-8, hashed with sha256, and the key is `sha256:` followed by the hex digest.
+
+Reproduce a recorded key from its own `cache_key` block:
+
+```sh
+printf '%s\n%s\n%s\n' "$prompt_hash" "${upstream_hash:-none}" "$files_hash" \
+  | python3 -c 'import hashlib,sys; print("sha256:"+hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+```
+
+That command prints the value in `cache_key.key`. A second implementation that joins the
+three with newlines and stops, or that omits the `none` sentinel, computes a different key
+for the same step and reports drift that did not happen.
 
 The blob hash is computed in process, from the bytes on disk. It equals `git hash-object`
 and needs no git subprocess, so an uncommitted edit counts as drift.
@@ -150,7 +268,8 @@ Resume run 4f2a from Gates.
 Re-run from Build instead? [build / gates-anyway / abort]
 ```
 
-1. `ok` is lowercase. `DRIFTED` and `UNHASHED` are uppercase. No emoji and no tick marks.
+1. `ok` is lowercase. `DRIFTED`, `UNHASHED`, and `UNRECORDED` are uppercase. No emoji and no
+   tick marks.
 2. Step names are padded to the longest printed name plus three spaces.
 3. A drifted line names the file count when any file changed. When no file changed, it names
    the input that did: `DRIFTED — upstream plan.json changed since this step`, or
@@ -158,16 +277,20 @@ Re-run from Build instead? [build / gates-anyway / abort]
    under the first, indented to the value column.
 4. `UNHASHED — no cache key recorded for this step` means the step was never hashed. Treat
    it as drifted. It is not `ok`.
-5. Files matched by `paths.ignore` are skipped. Without a config the whole recorded list is
+5. `UNRECORDED — cache key only, no step contract recorded` means `hash` created the file
+   and no stage ever wrote a contract into it. Treat it as drifted. It is not `ok`, and it
+   is not skipped: a skipped stage has no file at all.
+6. Files matched by `paths.ignore` are skipped. Without a config the whole recorded list is
    compared, and a note says so.
-6. A `config_hash` that no longer matches prints
+7. A `config_hash` that no longer matches prints
    `Config hash changed since this run. Treat every step as drifted.` after the step lines.
-7. The question prints only when a step earlier than the requested one drifted. When the
+8. The question prints only when a step earlier than the requested one drifted. When the
    requested step is itself the earliest drifted one, resume replays from it and there is
    nothing to offer instead.
 
 `--json` prints the whole comparison: per step `state`, `changed_files`, the changed file
-list, and a `drifted` object with a boolean for each of the three inputs.
+list, and a `drifted` object with a boolean for each of the three inputs. `state` is `ok`,
+`drifted`, `unhashed`, or `no_contract`. Only `ok` may be replayed over.
 
 ## usage.jsonl
 
@@ -226,17 +349,95 @@ whose `ref` does not resolve.
 
 ## corrections.jsonl
 
-Written by `/hyperpower:correct`, not by `hp-journal`. Documented here because it lives in
-the run folder and resume replays from it.
+One line per correction `/hyperpower:correct` made. `hp-journal correction` writes it.
+
+```sh
+hp-journal correction 4f2a --step plan --assumption a1 \
+  --text "settings API returns { items: [] }" --scope run --challenged
+```
 
 ```jsonl
 {"run":"4f2a","step":"plan","assumption":"a1","key":"settings-api-shape","text":"settings API returns { items: [] }","scope":"run","challenged":true,"ts":"2026-09-07T11:04:12Z"}
 ```
 
+| Field | Holds |
+|---|---|
+| `run` | the run id, the same key the other jsonl records use |
+| `step` | the step whose assumption was corrected |
+| `assumption` | the id that step declared. An id it did not declare is refused. |
+| `key` | stable kebab-case slug naming the cause. Derived from `--text` when `--key` is omitted. |
+| `text` | the correction itself |
+| `scope` | `once`, `run`, or `forever` |
+| `challenged` | true when the code contradicted the correction and the challenge was printed |
+| `ts` | ISO 8601 UTC |
+| `applied` | absent until a replay used a `once` correction. See below. |
+
+The command refuses a correction against an assumption the step never declared, and names
+the ids it did declare. `/hyperpower:correct` edits an existing record. It never invents
+one.
+
+Pass `--key` when the promoter must count one cause across runs that word it differently. A
+derived key is stable for one wording and changes when the wording changes.
+
+`hp-journal correction` writes `corrections.jsonl` and nothing else. The other two writes in
+`skills/correct/SKILL.md` step 3 are `hp-journal mistake` for the promoter and the
+assumption's own `status` in `<step>.json`.
+
+### The once lifecycle
+
+A `once` correction applies to the next replay of its own step, and then retires. Three
+commands, one owner each.
+
+| Step | Command | Writes |
+|---|---|---|
+| record it | `hp-journal correction ... --scope once` | the entry, with no `applied` field |
+| find it before a replay | `hp-journal corrections <run> --step plan --pending` | nothing |
+| retire it after the replay | `hp-journal correction-applied <run> --step plan` | `applied: true` on every matching entry |
+
+`correction-applied` is the one writer of `applied`. `hp-journal correction` never sets it,
+and nothing else may.
+
+Order matters. Call `correction-applied` after the replay wrote that step's `<step>.json`,
+never before. A replay that fails or is interrupted first must leave the entry unstamped, so
+the next replay applies the correction again. Stamping first drops the correction silently.
+
+The rewrite keeps every other line byte for byte, including a line that does not parse.
+Such a line is reported by number and kept, because deleting it would delete a correction a
+human made.
+
+`run` and `forever` corrections are never stamped. `run` stands for the life of the run, and
+`forever` is retired only by a promoter demotion.
+
 ## resume.jsonl
 
-Written by `/hyperpower:resume`, one line per replay: the timestamp, the `--from` step, the
-answer taken, and the drifted step names.
+One line per `/hyperpower:resume` replay. `hp-journal resume-event` writes it.
+
+```sh
+hp-journal resume-event 4f2a --from gates --decision build --drifted build
+```
+
+```jsonl
+{"run":"4f2a","ts":"2026-09-07T11:04:12Z","from":"gates","decision":"build","drifted":["build"]}
+```
+
+| Field | Holds |
+|---|---|
+| `run` | the run id |
+| `ts` | ISO 8601 UTC of the replay |
+| `from` | the step `--from` named |
+| `decision` | the answer the human gave |
+| `drifted` | the drifted step names, sorted into pipeline order |
+
+`decision` is one of three shapes: a step name, which replays from there; `<step>-anyway`,
+which replays from the requested step over the drift; or `abort`. Anything else is refused
+with the vocabulary.
+
+`--drifted` takes step names, not a count. The count is the length of the list, and a name
+tells a reader which step moved. `--drifted` is repeatable and comma-separated.
+
+Append the record after the invalidation, not before. `/hyperpower:resume` moves the
+invalidated contracts into `superseded/<ts>/` first, so the `--from` step may have no file
+on disk by then. `resume-event` does not require one.
 
 ## Concurrency
 
@@ -244,9 +445,13 @@ Every subcommand is safe to call from parallel agents.
 
 | Write | Mechanism |
 |---|---|
-| `usage.jsonl`, `mistakes.jsonl` | `O_APPEND`, one `write()` per line. Lines are capped at 4096 bytes, so the write is atomic. |
+| `usage.jsonl`, `mistakes.jsonl`, `resume.jsonl` | `O_APPEND`, one `write()` per line. Lines are capped at 4096 bytes, so the write is atomic. |
 | `meta.json`, `<step>.json` | an `O_EXCL` lock file beside the target, then write a temp file and `os.replace` |
+| `corrections.jsonl` | the same lock, taken by both the append and the `applied` rewrite |
 | a run folder | `mkdir`, which fails rather than reuse an existing folder |
+
+`corrections.jsonl` is the one `.jsonl` with a rewriter, so its appends take the lock too.
+Without that, a correction appended during a `correction-applied` rewrite is lost.
 
 A record larger than 4096 bytes is refused with its byte count. Do not raise the cap. Put
 the long content in a `<step>.json` and reference it.
@@ -259,17 +464,21 @@ A lock held by a live writer waits 10 seconds, then reports which file is locked
 | Command | Does |
 |---|---|
 | `hp-journal new [--task-class C] [--base SHA]` | create the folder and `meta.json`, print the run id |
-| `hp-journal step <run> <step> --file F \| --stdin` | write that step's output contract |
+| `hp-journal step <run> <step> --file F \| --stdin` | validate that step's contract, then write it |
 | `hp-journal usage <run> --stage S --model M --input N --output N` | append one usage record |
 | `hp-journal mistake <run> --kind K --key K [--ref R]` | append one failure event |
+| `hp-journal correction <run> --step S --assumption A --text T --scope C` | append one correction, print its key |
+| `hp-journal corrections <run> [--step S] [--scope C] [--pending]` | print the corrections recorded for a run |
+| `hp-journal correction-applied <run> --step S` | stamp `applied: true` on the `once` corrections a replay used |
+| `hp-journal resume-event <run> --from STEP --decision D [--drifted S1,S2]` | append one replay record |
 | `hp-journal hash <run> <step> --files F1,F2` | compute and store the step's cache key |
 | `hp-journal drift <run> [--from STEP]` | re-hash the working tree, report per-step drift |
 | `hp-journal finish <run> --outcome O` | stamp `outcome` and `finished_at` |
 | `hp-journal list [--limit N]` | recorded runs, newest first |
 | `hp-journal path <run>` | the absolute path to a run folder |
 
-Every subcommand takes `--root DIR`. Without it the root is `HYPERPOWER_REPO_ROOT`, then the
-git top level, then the nearest directory holding `hyperpower.yml` or `.hyperpower/`.
+Every subcommand takes `--root DIR`. Without it the root resolves the way "The repo root"
+above states.
 
 ## Exit codes
 
@@ -311,9 +520,18 @@ and tabs in indentation, naming the file and line.
   hash the resume drift check needs.
 - Do not delete a run folder to clean up. `/hyperpower:telemetry purge` is the one path that
   removes recorded telemetry.
-- Do not append to `usage.jsonl` or `mistakes.jsonl` with a shell redirect. Two agents doing
-  that interleave a partial record, and the file stops parsing.
+- Do not append to any `.jsonl` in a run folder with a shell redirect. Two agents doing that
+  interleave a partial record, and the file stops parsing. Every one of the four has a
+  subcommand: `usage`, `mistake`, `correction`, `resume-event`.
 - Do not put a timestamp in a mistake line. The promoter counts distinct `run` values, and a
   bigger line makes the scan more expensive for nothing.
 - Do not report a step as `ok` because it has no cache key. An unhashed step was never
   verified.
+- Do not report a step as `ok` because a file exists for it. A file holding only a cache key
+  is a placeholder `hash` wrote, and no stage recorded a contract into it.
+- Do not record a step contract without validating it. `--no-validate` exists for a missing
+  schema and for importing an old run, not for a contract whose violations you did not read.
+- Do not set `applied` on a correction from anywhere but `hp-journal
+  correction-applied`, and do not set it before the replay wrote its contract.
+- Do not invent a task class. `task-classes.yml` is the whole vocabulary, and `null` is the
+  value for a run that was never routed.

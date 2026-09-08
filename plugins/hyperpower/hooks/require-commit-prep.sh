@@ -119,9 +119,8 @@ fi
 
 # did_not_run covers two cases. A gate turned off in config is intended. A missing tool or a
 # timeout is not, and it never counts as a pass. Both detail strings come from gates/_lib.sh.
-if grep -Eq '"result"[[:space:]]*:[[:space:]]*"did_not_run"' "$gates_file" 2>/dev/null &&
-    grep -Eq 'is not on PATH|timed out after' "$gates_file" 2>/dev/null; then
-    deny "a gate in the newest run could not execute, so its check never happened."
+if grep -Eq '"blocking_unverified"[[:space:]]*:[[:space:]]*\[[[:space:]]*"' "$gates_file" 2>/dev/null; then
+    deny "a blocking gate in the newest run could not execute, so its check never happened."
 fi
 
 # Any change made after the gates ran is unverified. Staged files first, then the

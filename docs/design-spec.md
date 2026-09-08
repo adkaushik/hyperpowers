@@ -160,6 +160,7 @@ gates:
   lint:    { enabled: true,  blocking: false }
   build:   { enabled: true,  blocking: true }
   slop:    { enabled: true,  blocking: true,  profile: core }
+  e2e:     { enabled: false, blocking: false, reason: "no e2e command configured" }
   browser: { enabled: false, blocking: false, reason: "no dev_url configured" }
   a11y:    { enabled: false, blocking: false }
   visual:  { enabled: false, blocking: false }
@@ -217,12 +218,20 @@ that matter.
 Every stage boundary is a typed JSON schema. A stage that cannot produce a valid contract
 fails loudly rather than degrading into prose the next stage misreads.
 
+Nine schemas, one per stage, in `plugins/hyperpower/schemas/`. `scripts/hp-validate` checks
+a contract against its schema and prints every violation with its JSON path. Anything but
+exit 0 is a hard stop; the next stage never reads an unvalidated contract.
+
 Every contract carries an `assumptions` array. See below.
 
 ### 3. Gates
 
 The only part of the pipeline that can stop a run. Gates execute commands from
 `hyperpower.yml` and read exit codes. No model judgment.
+
+Nine gates. The same nine appear in the `gates:` schema in [configuration.md](configuration.md)
+and in the table in [gates.md](gates.md). Those three lists are one roster, and
+`hp-selfcheck` fails when a schema gate has no script and no not-shipped marker.
 
 | Gate | Runs | Applies to |
 |---|---|---|
@@ -231,6 +240,7 @@ The only part of the pipeline that can stop a run. Gates execute commands from
 | lint | `commands.lint` | any repo with a linter |
 | build | `commands.build` | any repo that builds |
 | slop | `antislop --profile core`, `ai-slop-detector` | any repo |
+| e2e | `commands.e2e` | any repo with an end-to-end suite |
 | browser | boot `dev_server`, load `{route}`, assert render | web only |
 | a11y | axe assertions on `{route}` | web only |
 | visual | screenshot diff against the locked mock | web with a mock |
@@ -239,6 +249,30 @@ Gates fail closed. A gate that cannot run reports that it did not run. It never 
 pass it did not verify.
 
 A gate marked `blocking: false` reports as a warning and does not stop the run.
+
+`scripts/hp-gates` is the runner. It reads the effective config, runs every enabled gate in
+config order, writes `gates.json` and one `gate:<name>` usage record into the run journal,
+and exits 1 only when a blocking gate failed. A gate that could not run reports
+`did_not_run`, which is neither a pass nor a failure, and the caller stops on it.
+
+#### Gates run in place
+
+Settled during planning. Gates run in the working tree. They do not run in a git worktree.
+
+The reason: a worktree costs a checkout per run, and the gates are read-only with respect
+to source. They run a configured command and read its exit code. None of them edits a file
+the repo tracks. Paying for a checkout on every run buys isolation from a write that the
+design does not make.
+
+`gates/_lib.sh` implements this. `hp_init` calls `hp_cd_root`, which moves to
+`HYPERPOWER_REPO_ROOT`, or to `git rev-parse --show-toplevel`, and runs the command there.
+
+The accepted risk: a gate whose command writes build output pollutes the working tree.
+`commands.build` writing `dist/` is the ordinary case. Keep those paths in `paths.ignore`
+and in `.gitignore`, and the pollution stays invisible to the file scope and to git.
+
+A gate that edits source is a defect in that gate. It is not a case this choice covers.
+Revisit the worktree if a gate ever needs to write to a tracked path.
 
 ### 4. Evals
 
@@ -256,8 +290,22 @@ ADHD and voice rules.
 Release rule: a prompt change ships only when it has no blockers, correctness and safety
 are within 0.1 of baseline or better, and the weighted score beats baseline.
 
-Ship with 15 stack-neutral seed cases. Users add their own; `init` offers to generate five
-from the repo's recent commits.
+Ship with 15 stack-neutral seed cases. Users add their own.
+
+`init` does not generate cases from recent commits, and does not offer to. Settled during
+planning. A case generated from a commit nobody reviewed is a case nobody trusts, and an
+untrusted baseline is worse than an empty one: every later comparison inherits it, and the
+release rule then gates prompt changes on a number that was never checked.
+
+Do this instead. Run a few real tasks. Write cases against the work you have read, one per
+behaviour you care about. Then record the baseline:
+
+```
+/hyperpower:eval --baseline
+```
+
+An empty suite is honest. `run_evals.py validate` reports `0 cases` and warns once per
+empty category, so the gap is visible rather than filled with cases nobody read.
 
 ### 5. Orchestration
 
@@ -322,7 +370,20 @@ A run is a folder, not a conversation. Sessions are disposable.
   <step>.json         that step's output contract
   mistakes.jsonl      failure events appended during the run
   usage.jsonl         one line per model call: stage, model, tokens, duration
+  corrections.jsonl   corrections from /hyperpower:correct
+  resume.jsonl        one line per /hyperpower:resume replay
+  gates/<gate>.log    full output of each gate command
+  superseded/<ts>/    step contracts a resume invalidated
 ```
+
+`scripts/hp-journal` writes it. Nothing else creates a run folder, and nothing appends to a
+`.jsonl` in one with a shell redirect: two agents doing that interleave a partial record and
+the file stops parsing. Record shapes are in `plugins/hyperpower/scripts/JOURNAL.md`.
+
+The run id is `sha256("<base_sha>:<counter>")` truncated to four hex characters. It comes
+from the base sha, not from a clock and not from randomness, so the same run is the same id
+on any machine. `hp-journal new` claims the folder with `mkdir`, which is atomic, so two
+callers racing never share one.
 
 Each step's cache key is the hash of `(prompt, upstream contract, git tree sha of files
 read)`. Not the prompt alone — that is the bug that would let a resumed run review code
@@ -590,6 +651,8 @@ Everything namespaced. Nothing shadows an existing command.
 
 | Command | Does |
 |---|---|
+| `/hyperpower:run "<requirement>"` | drive one requirement through the pipeline, writing the run journal |
+| `/hyperpower:route "<requirement>"` | classify the requirement and print the stages it would run, writing nothing |
 | `/hyperpower:resume <run> --from <step>` | drift-check, invalidate downstream, replay |
 | `/hyperpower:why <run> [--assumptions]` | what it decided and what it assumed |
 | `/hyperpower:correct <run> <step> <id> "..." --scope` | correct a recorded assumption |
@@ -643,23 +706,31 @@ Speed and intelligence are in tension. This is how it is handled rather than wis
 The plugin repository:
 
 ```
-hyperpower/
-  .claude-plugin/
-    marketplace.json
-    plugin.json
-  agents/                      one file per agent role
-  skills/                      process skills, vendored and original
-  hooks/                       session start, commit gate
-  gates/                       executable gate scripts
-  workflows/                   review sweep, council
-  evals/
-    cases.jsonl
-    rubric.md
-  scripts/run_evals.py
-  pricing.yml
+hyperpowers/
+  .claude-plugin/marketplace.json
+  plugins/hyperpower/
+    .claude-plugin/plugin.json
+    agents/                    one file per agent role
+    skills/                    one directory per command
+    hooks/                     session start, commit gate
+    gates/                     executable gate scripts, and _lib.sh
+    schemas/                   the nine stage contracts
+    scripts/                   the kernel executables, and run_evals.py
+    tests/                     run-tests, and the shell cases it runs
+    workflows/                 review sweep, council
+    evals/
+      cases.jsonl
+      rubric.md
+      baseline.json
+    pricing.yml
+    task-classes.yml           the routing table
+  docs/
   ATTRIBUTION.md
   LICENSE
 ```
+
+The plugin lives under `plugins/`, not at the repository root, because the repository is
+also the marketplace that serves it.
 
 A repository using it:
 
@@ -695,13 +766,36 @@ Scout and janitor already exist as standalone skills and gain run-journal input 
 Product and business harnesses come after the kernel is proven. They add stages before
 Route; they add no new kernel.
 
+## Known deviations
+
+Where the tree does not match a rule this project states. Each one is a decision on record.
+
+### Skill length
+
+`docs/contributing.md` says a skill past 150 lines is doing two jobs. Four driver skills are
+past it. At the time of writing: `run` 408 lines, `init` 251, `eval` 214, `route` 160. Count
+the current set with `wc -l plugins/hyperpower/skills/*/SKILL.md`. Anything on that list
+that is not one of the four is debt against the rule, not an exception to it.
+
+The rule takes an exception, and those four are not split. `init` is one procedure of six
+ordered steps with one exit, so splitting it would publish a half that runs without the half
+it depends on, which is the failure the rule exists to prevent.
+
+A driver skill runs a fixed sequence end to end, and no section of it is worth invoking on
+its own. That is the whole exception.
+
+Do not read it as a raised cap. A skill that is not a driver and is past 150 lines is doing
+two jobs, and the repair is a shorter skill rather than a wider exception. The test is
+whether a section could be a command by itself, not the line count.
+
 ## Open questions
 
-None blocking. Three to settle during planning:
+One left, and it does not block. Two were settled during planning and moved into the body.
+
+| Question | Answer | Now in |
+|---|---|---|
+| Do gates run in a worktree or in place? | In place | The kernel, part 3, under Gates run in place |
+| Should `init` generate eval cases from recent commits? | No | The kernel, part 4 |
 
 1. Whether the rulebook cap is a rule count or a token budget. A token budget is more
    honest about the real constraint but harder to reason about while writing a rule.
-2. Whether gates run in a worktree or in place. A worktree is safer and costs a checkout
-   per run.
-3. Whether `init` should offer to generate eval cases from recent commits on first run, or
-   leave the suite empty until the user has run a few tasks.

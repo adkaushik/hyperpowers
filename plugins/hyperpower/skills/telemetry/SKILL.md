@@ -35,6 +35,7 @@ delete it.
 | `.hyperpower/runs/<id>/gates/<gate>.log` | full output of each gate command | no |
 | `.hyperpower/backlog.jsonl`, `.hyperpower/hygiene.jsonl` | scout and janitor sheets | yes |
 | `.hyperpower/promotions.jsonl` | one line per promoter action | yes |
+| `.hyperpower/redact-salt` | the salt that path tokens are derived from | no, and never |
 
 The sheets and the promotion log are committed because people review them. They are not
 telemetry, and `purge` does not touch them.
@@ -49,17 +50,32 @@ Telemetry - local only. Nothing is uploaded.
   enabled          true          hyperpower.yml
   destination      local         fixed. No other value is accepted.
   redact_paths     true          hyperpower.yml
+  redaction        on            aggregate views only: usage, cost, this command
+  salt             .hyperpower/redact-salt   present, gitignored
   runs recorded    37
   files            412  (18.4 MB)
   oldest record    2026-07-02
   newest record    2026-09-07
+
+Redaction hashes file paths in grouped output. Run journals keep real paths. A free-text
+field can still carry a path hp-redact does not recognise.
 ```
+
+The last two lines are part of the status. Print them every time. A status that says
+redaction is `on` and stops there reads as a promise the aggregate holds no paths.
+
+Read the three config values through `hp-config --source`, which names the file each came
+from. Read the salt state from disk: `present, gitignored` when `git check-ignore -q` exits
+0, `present, NOT gitignored - add .hyperpower/redact-salt to .gitignore` when it exits 1,
+`present` when git cannot answer, and `not derived yet - the next usage or cost run writes
+it` when the file is absent.
 
 | Case | Do |
 |---|---|
 | no `hyperpower.yml` | print `default` for all three fields, say `/hyperpower:init` has not run here, and report what is on disk. Do not create the file. |
 | `.hyperpower/runs/` missing | report zero runs and zero files. Do not create the directory. |
 | `enabled` is false | print the status, then say new runs are not being recorded |
+| `redact_paths` is false | print `redaction off` and `usage and cost print real paths` beside it |
 
 ## off and on
 
@@ -93,7 +109,7 @@ Never delete before step 3. Never delete anything outside `.hyperpower/runs/`.
 
 | Removed | Kept |
 |---|---|
-| every run folder, including `meta.json`, step contracts, `usage.jsonl`, `mistakes.jsonl`, `corrections.jsonl`, `resume.jsonl`, and the `gates/` logs | `decisions/`, `CODEBASE_RULEBOOK.md`, `backlog.jsonl`, `hygiene.jsonl`, `promotions.jsonl`, the config files |
+| every run folder, including `meta.json`, step contracts, `usage.jsonl`, `mistakes.jsonl`, `corrections.jsonl`, `resume.jsonl`, and the `gates/` logs | `decisions/`, `CODEBASE_RULEBOOK.md`, `backlog.jsonl`, `hygiene.jsonl`, `promotions.jsonl`, `redact-salt`, the config files |
 
 Say the consequence before asking. The mistakes log lives inside the run folders, so purging
 removes the evidence the promoter counts toward a rulebook rule. Rules already promoted stay
@@ -106,20 +122,50 @@ Kept decisions/, CODEBASE_RULEBOOK.md, and the backlog and hygiene sheets.
 
 ## Path redaction
 
-When `telemetry.redact_paths` is true, hash a file path before it enters any aggregate view:
-`/hyperpower:usage`, `/hyperpower:cost`, and this command's output.
+`${CLAUDE_PLUGIN_ROOT}/scripts/hp-redact` performs it. Nothing else hashes a path, and no
+skill implements the rule a second time.
 
-Hash rule: the first 8 hex characters of the SHA-256 of the repo-relative path, printed as
-`path:9f2a1c04`. The same path hashes the same way every time, so grouping still works.
+```sh
+cat .hyperpower/runs/*/usage.jsonl | ${CLAUDE_PLUGIN_ROOT}/scripts/hp-redact --stdin
+${CLAUDE_PLUGIN_ROOT}/scripts/hp-redact --stdin --explain < records.jsonl
+```
+
+Every aggregate view pipes its records through it before grouping: `/hyperpower:usage`,
+`/hyperpower:cost`, and this command. `--explain` prints what it would change and writes
+nothing. When `telemetry.redact_paths` is false, it passes the records through unchanged
+and says so on stderr. When the config is absent, treat `redact_paths` as true.
+
+Token format: `path:` plus the first 8 hex characters of a salted SHA-256 of the
+repo-relative path. `src/api/settings.ts:42` prints as `path:9f2a1c04:42`, keeping the line
+number. The same path gives the same token in this repo, so grouping by file still works.
+
+The salt is `.hyperpower/redact-salt`, derived from the repo's root commit sha the first
+time `hp-redact` runs and read from that file afterwards. Never commit it. Never rotate it:
+a new salt renames every file in every aggregate, and reports from before and after stop
+lining up.
+
+| Redacted | Left alone |
+|---|---|
+| a value that is a file path | a gate, step, stage, agent, or model name |
+| a path inside a free-text `detail`, `evidence`, or `outcome` string | a git sha, a run id, a config hash |
+| a map key that is a path, such as the `blobs` map | a URL, a version number, a timestamp |
+| a `file:line` citation, keeping the line number | `hyperpower.yml`, `pricing.yml`, and anything under `.hyperpower/` |
 
 Per-run journals keep real paths. They already live inside the repo they describe, so
 hashing them removes usefulness and adds no privacy.
 
-Redaction is not anonymity. Anyone holding the repo can hash a path and compare. It stops a
-path leaking through a view that gets pasted elsewhere. Say that when asked, rather than
-implying more.
+What still leaks, stated plainly rather than implied away:
 
-When the config is absent, treat `redact_paths` as true.
+1. A bare name with no extension, such as `Makefile` or `Dockerfile`, is not recognised as a
+   path and prints as written.
+2. A free-text field carries anything. A path written with spaces, or described in prose as
+   "the settings module", survives the transform.
+3. `.hyperpower/runs/<id>/gates/<gate>.log` holds the raw output of a gate command, paths
+   included. It is a journal file, not an aggregate. Do not paste one.
+
+Redaction is not anonymity. Anyone holding the repo and the salt can hash a path and
+compare. It stops a path leaking through a view that gets pasted elsewhere. Say that when
+asked, rather than implying more.
 
 ## Do not
 
@@ -130,3 +176,8 @@ When the config is absent, treat `redact_paths` as true.
 - Do not invent a config field. `telemetry` has three: `enabled`, `destination`,
   `redact_paths`.
 - Do not report a purge count you did not measure. Count the files before and after.
+- Do not hash a path yourself, and do not redact a per-run journal file on disk. `hp-redact`
+  is a read-side transform, and a second implementation gives a different token for the same
+  file.
+- Do not commit `.hyperpower/redact-salt`, and do not delete it to start fresh. Every token
+  in every earlier report changes with it.

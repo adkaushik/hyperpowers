@@ -499,8 +499,10 @@ hp_fail() {
 }
 
 hp_did_not_run() {
+  # 78, never 0. The JSON says did_not_run, but the exit code is the only thing a shell
+  # caller, CI step or hook reads, and 0 there reports a pass nobody verified.
   hp_result did_not_run "$1" "${2:-}"
-  exit "$HP_DID_NOT_RUN"
+  exit 78
 }
 
 # ---------------------------------------------------------------- shared gate body
