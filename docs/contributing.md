@@ -54,6 +54,16 @@ does. Not when it would be nice to have a name for something.
 Before adding one, check: does this differ from an existing agent in capability, or only in
 prompt wording? If only in wording, extend the existing agent instead.
 
+## Bump the version when you change the plugin
+
+`plugins/hyperpower/.claude-plugin/plugin.json` carries a `version`. The plugin updater
+compares that string and nothing else. A change shipped without a bump reaches nobody:
+`claude plugin update` reports "already at latest version" and skips, however many commits
+the marketplace has fetched.
+
+Bump it in the same commit as the change. Patch for a fix, minor for a new command or
+agent.
+
 ## Evals are required
 
 Any change to a prompt, skill, or agent needs an eval run.

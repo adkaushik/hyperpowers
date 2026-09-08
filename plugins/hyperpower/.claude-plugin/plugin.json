@@ -1,6 +1,6 @@
 {
   "name": "hyperpower",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Agentic development harness. Runs a requirement through a gated pipeline, records what it decided and assumed, and learns from repeated mistakes without adding cost to a normal run.",
   "author": {
     "name": "Kaushik",
@@ -9,5 +9,13 @@
   "homepage": "https://github.com/adkaushik/hyperpowers",
   "repository": "https://github.com/adkaushik/hyperpowers",
   "license": "MIT",
-  "keywords": ["agentic", "harness", "code-review", "gates", "evals", "memory", "workflows"]
+  "keywords": [
+    "agentic",
+    "harness",
+    "code-review",
+    "gates",
+    "evals",
+    "memory",
+    "workflows"
+  ]
 }
