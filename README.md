@@ -180,7 +180,7 @@ nobody reviewed is a baseline nobody trusts, and every later comparison inherits
 
 ## Commands
 
-Twenty commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
+Twenty-one commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
 
 ```
 /hyperpower:init            set up this repo
@@ -197,6 +197,7 @@ Twenty commands in six groups. Full reference in [docs/commands.md](docs/command
 /hyperpower:cost            tokens and money by stage
 /hyperpower:review          partition, review, adjudicate
 /hyperpower:eval            score a prompt change
+/hyperpower:visualize       report what the agents did this session
 ```
 
 ## Configuration

@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""Build a visual report of what the agents did in a session.
+
+Reads three log sources and merges them into one self-contained HTML page:
+
+  1. the Claude Code session transcript  every tool call, its timestamp, its tokens
+  2. subagents/workflows/<run>/journal.jsonl  per-agent results from multi-agent runs
+  3. .hyperpower/runs/<run-id>/  stages, gates, assumptions, mistakes
+
+The report is written to disk and never uploaded. Transcripts carry prompts and real
+file paths, so publishing one would leak the repo. Pass --redact to hash paths when you
+want to share it.
+
+Exit 0 report written. 1 nothing to report. 2 bad input. 78 no logs found.
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import sys
+from collections import Counter, OrderedDict, defaultdict
+from datetime import datetime
+
+EXIT_OK = 0
+EXIT_EMPTY = 1
+EXIT_ERROR = 2
+EXIT_NO_LOGS = 78
+
+PROJECTS = os.path.expanduser("~/.claude/projects")
+PATH_RE = re.compile(r"(?:/[\w.\-]+){2,}/?[\w.\-]*")
+
+
+def die(msg, code=EXIT_ERROR):
+    sys.stderr.write("hp-visualize: %s\n" % msg)
+    raise SystemExit(code)
+
+
+def read_jsonl(path):
+    """Every parseable line. A truncated tail is normal on a live session."""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return []
+    return out
+
+
+def parse_ts(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
+def project_dir(repo_root):
+    """Claude Code encodes the cwd into the project directory name."""
+    slug = repo_root.replace("/", "-")
+    return os.path.join(PROJECTS, slug)
+
+
+def find_sessions(pdir):
+    if not os.path.isdir(pdir):
+        return []
+    rows = []
+    for name in os.listdir(pdir):
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(pdir, name)
+        try:
+            rows.append((os.path.getmtime(path), name[:-6], path))
+        except OSError:
+            continue
+    rows.sort(reverse=True)
+    return rows
+
+
+# ------------------------------------------------------------------ transcript
+
+def read_transcript(path):
+    """Tool calls, turns and token totals, in order."""
+    calls = []
+    turns = 0
+    tokens = Counter()
+    first = last = None
+    model = None
+    branch = None
+
+    for rec in read_jsonl(path):
+        if rec.get("type") != "assistant":
+            continue
+        turns += 1
+        ts = parse_ts(rec.get("timestamp"))
+        if ts:
+            first = ts if first is None else min(first, ts)
+            last = ts if last is None else max(last, ts)
+        branch = rec.get("gitBranch") or branch
+        msg = rec.get("message") or {}
+        model = msg.get("model") or model
+        usage = msg.get("usage") or {}
+        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                    "cache_creation_input_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int):
+                tokens[key] += value
+        for block in msg.get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            calls.append({
+                "tool": block.get("name") or "?",
+                "ts": ts,
+                "detail": describe_call(block),
+                "sidechain": bool(rec.get("isSidechain")),
+            })
+    return {
+        "calls": calls, "turns": turns, "tokens": tokens,
+        "first": first, "last": last, "model": model, "branch": branch,
+    }
+
+
+def describe_call(block):
+    """One short line naming what the call actually did."""
+    data = block.get("input") or {}
+    if not isinstance(data, dict):
+        return ""
+    for key in ("description", "command", "file_path", "pattern", "query",
+                "prompt", "skill", "url"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().splitlines()[0][:150]
+    return ""
+
+
+# ------------------------------------------------------------------ workflows
+
+def read_workflows(session_dir):
+    """One entry per multi-agent run, with its agents and their outcomes."""
+    root = os.path.join(session_dir, "subagents", "workflows")
+    if not os.path.isdir(root):
+        return []
+    runs = []
+    for name in sorted(os.listdir(root)):
+        journal = os.path.join(root, name, "journal.jsonl")
+        if not os.path.isfile(journal):
+            continue
+        agents = OrderedDict()
+        for rec in read_jsonl(journal):
+            key = rec.get("key") or rec.get("agentId") or "?"
+            kind = rec.get("type")
+            entry = agents.setdefault(key, {"key": key, "state": "started", "result": None})
+            if kind == "result":
+                entry["state"] = "done"
+                entry["result"] = rec.get("result")
+            elif kind == "failed":
+                entry["state"] = "failed"
+        if agents:
+            runs.append({
+                "run": name,
+                "agents": list(agents.values()),
+                "mtime": os.path.getmtime(journal),
+            })
+    runs.sort(key=lambda r: r["mtime"])
+    return runs
+
+
+# ------------------------------------------------------------------ hyperpower
+
+STEP_ORDER = ["route", "understand", "plan", "design", "build",
+              "gates", "review", "fix", "render"]
+
+
+def read_hp_runs(repo_root, limit):
+    """Stages, gates and assumptions from this repo's own run journal."""
+    runs_dir = os.path.join(repo_root, ".hyperpower", "runs")
+    if not os.path.isdir(runs_dir):
+        return []
+    rows = []
+    for name in sorted(os.listdir(runs_dir)):
+        folder = os.path.join(runs_dir, name)
+        if not os.path.isdir(folder):
+            continue
+        meta = {}
+        meta_path = os.path.join(folder, "meta.json")
+        if os.path.isfile(meta_path):
+            try:
+                meta = json.load(open(meta_path, encoding="utf-8"))
+            except (OSError, ValueError):
+                meta = {}
+        steps = []
+        assume = Counter()
+        for step in STEP_ORDER:
+            spath = os.path.join(folder, "%s.json" % step)
+            if not os.path.isfile(spath):
+                continue
+            try:
+                body = json.load(open(spath, encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for item in body.get("assumptions") or []:
+                if isinstance(item, dict):
+                    assume[item.get("status") or "declared"] += 1
+            steps.append(step)
+        gates = []
+        gpath = os.path.join(folder, "gates.json")
+        if os.path.isfile(gpath):
+            try:
+                gbody = json.load(open(gpath, encoding="utf-8"))
+                for g in gbody.get("gates") or []:
+                    gates.append({
+                        "gate": g.get("gate"),
+                        "result": g.get("result"),
+                        "blocking": bool(g.get("blocking")),
+                        "detail": g.get("detail") or "",
+                    })
+            except (OSError, ValueError):
+                pass
+        mistakes = len(read_jsonl(os.path.join(folder, "mistakes.jsonl")))
+        rows.append({
+            "run": name,
+            "task_class": meta.get("task_class") or "-",
+            "started": meta.get("started_at") or "-",
+            "steps": steps, "gates": gates,
+            "assumptions": assume, "mistakes": mistakes,
+            "mtime": os.path.getmtime(folder),
+        })
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows[:limit]
+
+
+# ------------------------------------------------------------------ rendering
+
+def redact_text(text, on):
+    if not on or not text:
+        return text
+    def swap(match):
+        raw = match.group(0)
+        digest = 0
+        for ch in raw:
+            digest = (digest * 131 + ord(ch)) & 0xFFFFFFFF
+        return "path:%08x" % digest
+    return PATH_RE.sub(swap, text)
+
+
+def esc(value):
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def fmt_int(n):
+    return "{:,}".format(int(n))
+
+
+def bar_rows(counter, limit):
+    total = sum(counter.values()) or 1
+    top = counter.most_common(limit)
+    return [(name, count, int(round(count * 100.0 / total))) for name, count in top], total
+
+
+def build_html(ctx):
+    t = ctx["transcript"]
+    red = ctx["redact"]
+    dur = "-"
+    if t["first"] and t["last"]:
+        secs = int((t["last"] - t["first"]).total_seconds())
+        dur = "%dh %02dm" % (secs // 3600, (secs % 3600) // 60) if secs >= 3600 else "%dm" % (secs // 60)
+
+    tools, tool_total = bar_rows(Counter(c["tool"] for c in t["calls"]), 12)
+    tok = t["tokens"]
+    fresh = tok.get("input_tokens", 0) + tok.get("cache_creation_input_tokens", 0)
+
+    wf_agents = sum(len(w["agents"]) for w in ctx["workflows"])
+    wf_failed = sum(1 for w in ctx["workflows"] for a in w["agents"] if a["state"] == "failed")
+
+    out = []
+    A = out.append
+    A(HEAD)
+    A('<div class="wrap"><header><div class="head-row"><div>')
+    A('<div class="eyebrow">%s</div>' % esc(redact_text(ctx["repo"], red)))
+    A('<h1>Session Report</h1></div>')
+    A('<span class="chip">%s</span></div>' % esc(ctx["session"][:8]))
+    A('<p class="sub">What the agents did, reconstructed from the session transcript, '
+      'the workflow journals and this repo&rsquo;s run journal. Nothing here was uploaded.</p>')
+    A('</header>')
+
+    # summary
+    A('<section><h2>Session</h2><div class="stats">')
+    for n, l in [(fmt_int(t["turns"]), "assistant turns"),
+                 (fmt_int(len(t["calls"])), "tool calls"),
+                 (dur, "elapsed"),
+                 (fmt_int(wf_agents), "workflow agents"),
+                 (fmt_int(tok.get("output_tokens", 0)), "output tokens")]:
+        A('<div class="stat"><div class="n">%s</div><div class="l">%s</div></div>' % (esc(n), esc(l)))
+    A('</div>')
+    A('<div class="note">Cache reads were <strong>%s</strong> tokens against <strong>%s</strong> '
+      'fresh input. Cache reads cost a tenth of fresh input, so a total that mixes them '
+      'misreads the bill.%s</div>'
+      % (fmt_int(tok.get("cache_read_input_tokens", 0)), fmt_int(fresh),
+         (" Model: <code>%s</code>." % esc(t["model"])) if t["model"] else ""))
+    A('</section>')
+
+    # tools
+    if tools:
+        A('<section><h2>Where the work went</h2>')
+        A('<p class="sec-note">%s tool calls, by tool.</p><div class="bars">' % fmt_int(tool_total))
+        for name, count, pct in tools:
+            A('<div class="bar-row"><span class="bar-lab">%s</span>'
+              '<span class="bar-track"><span class="bar-fill" style="width:%d%%"></span></span>'
+              '<span class="bar-num">%s</span></div>' % (esc(name), max(pct, 1), fmt_int(count)))
+        A('</div></section>')
+
+    # workflows
+    if ctx["workflows"]:
+        A('<section><h2>Multi-agent runs</h2>')
+        A('<p class="sec-note">%d runs, %d agents, %d failed. Each row is one agent and how it '
+          'ended.</p>' % (len(ctx["workflows"]), wf_agents, wf_failed))
+        for w in ctx["workflows"]:
+            done = sum(1 for a in w["agents"] if a["state"] == "done")
+            failed = sum(1 for a in w["agents"] if a["state"] == "failed")
+            A('<div class="wf"><div class="wf-head"><code>%s</code>'
+              '<span class="wf-meta">%d done &middot; %d failed</span></div><div class="lanes">'
+              % (esc(w["run"]), done, failed))
+            for a in w["agents"]:
+                cls = {"done": "s-ok", "failed": "s-bad"}.get(a["state"], "s-mid")
+                A('<div class="lane %s"><span class="dot"></span><span class="lane-key">%s</span></div>'
+                  % (cls, esc(a["key"])))
+            A('</div></div>')
+        A('</section>')
+
+    # hyperpower runs
+    if ctx["hp_runs"]:
+        A('<section><h2>Harness runs</h2>')
+        A('<p class="sec-note">From <code>.hyperpower/runs/</code>. Stages recorded, gates that '
+          'ran, and what each run assumed.</p>')
+        for r in ctx["hp_runs"]:
+            A('<div class="wf"><div class="wf-head"><code>%s</code>'
+              '<span class="wf-meta">%s &middot; %s</span></div>'
+              % (esc(r["run"]), esc(r["task_class"]), esc(r["started"])))
+            A('<div class="pipe">')
+            for step in STEP_ORDER:
+                on = "on" if step in r["steps"] else "off"
+                A('<span class="pstep %s">%s</span>' % (on, esc(step)))
+            A('</div>')
+            if r["gates"]:
+                A('<div class="gates">')
+                for g in r["gates"]:
+                    cls = {"pass": "s-ok", "fail": "s-bad"}.get(g["result"], "s-mid")
+                    mark = {"pass": "0", "fail": "1", "did_not_run": "78"}.get(g["result"], "?")
+                    A('<span class="gate %s" title="%s">%s <b>%s</b></span>'
+                      % (cls, esc(redact_text(g["detail"], red)), esc(g["gate"]), mark))
+                A('</div>')
+            bits = []
+            for status in ("verified", "refuted", "unresolved", "declared"):
+                if r["assumptions"].get(status):
+                    bits.append("%d %s" % (r["assumptions"][status], status))
+            if bits or r["mistakes"]:
+                A('<div class="wf-foot">assumptions: %s &middot; failure events: %d</div>'
+                  % (esc(", ".join(bits) or "none recorded"), r["mistakes"]))
+            A('</div>')
+        A('</section>')
+
+    # timeline
+    if ctx["timeline"]:
+        A('<section><h2>Timeline</h2>')
+        A('<p class="sec-note">The %d longest gaps between calls, which is where the time '
+          'actually went.</p><div class="tbl-wrap"><table>' % len(ctx["timeline"]))
+        A('<thead><tr><th>At</th><th>Tool</th><th>What</th><th style="text-align:right">Gap</th></tr></thead><tbody>')
+        for row in ctx["timeline"]:
+            A('<tr><td class="mono">%s</td><td>%s</td><td class="what">%s</td>'
+              '<td class="num">%s</td></tr>'
+              % (esc(row["at"]), esc(row["tool"]),
+                 esc(redact_text(row["detail"], red)), esc(row["gap"])))
+        A('</tbody></table></div></section>')
+
+    A('<footer>Generated by <code>hp-visualize</code> from local logs. '
+      'Redaction: <strong>%s</strong>.</footer></div>' % ("on" if red else "off"))
+    return "\n".join(out)
+
+
+def longest_gaps(calls, limit):
+    rows = []
+    prev = None
+    for call in calls:
+        ts = call["ts"]
+        if prev and ts:
+            gap = int((ts - prev).total_seconds())
+            if gap > 0:
+                rows.append({
+                    "at": ts.strftime("%H:%M:%S"), "tool": call["tool"],
+                    "detail": call["detail"], "gap_s": gap,
+                    "gap": "%dm %02ds" % (gap // 60, gap % 60) if gap >= 60 else "%ds" % gap,
+                })
+        if ts:
+            prev = ts
+    rows.sort(key=lambda r: r["gap_s"], reverse=True)
+    return rows[:limit]
+
+
+HEAD = """<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Session Report</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Serif:wght@600&display=swap">
+<style>
+:root{--ground:#FAF9F6;--raised:#fff;--sunken:#F1EFEA;--ink:#1B1E24;--ink2:#4A5058;--ink3:#7A818B;
+--rule:#DEDBD3;--accent:#35507E;--ok:#2C6E49;--okb:#E3EFE7;--warn:#96631A;--warnb:#F6EEDF;
+--bad:#9B3535;--badb:#F7E7E7}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--ground:#14161A;--raised:#1B1E23;
+--sunken:#101215;--ink:#E9EBEE;--ink2:#A8AEB7;--ink3:#757C86;--rule:#2A2E35;--accent:#8FB0E0;
+--ok:#7FBF9A;--okb:#17251D;--warn:#D7A860;--warnb:#2A2216;--bad:#DE8B8B;--badb:#2B1B1B}}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font:15px/1.6 "IBM Plex Sans",system-ui,sans-serif;margin:0}
+.wrap{max-width:900px;margin:0 auto;padding:36px 22px 64px}
+h1,h2{font-family:"IBM Plex Serif",Georgia,serif;margin:0;text-wrap:balance}
+h1{font-size:28px}h2{font-size:19px}
+p{margin:0;max-width:66ch}
+code,.mono{font-family:"IBM Plex Mono",monospace;font-size:.88em}
+.eyebrow{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.09em;
+text-transform:uppercase;color:var(--ink3)}
+header{border-bottom:1px solid var(--rule);padding-bottom:22px}
+.head-row{display:flex;gap:14px;justify-content:space-between;align-items:baseline;flex-wrap:wrap}
+.chip{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--ink2);
+background:var(--sunken);border:1px solid var(--rule);border-radius:4px;padding:3px 8px}
+.sub{color:var(--ink2);margin-top:9px}
+section{margin-top:40px}
+.sec-note{color:var(--ink2);font-size:14px;margin:6px 0 14px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:1px;
+background:var(--rule);border:1px solid var(--rule);border-radius:6px;overflow:hidden;margin-top:16px}
+.stat{background:var(--raised);padding:13px 15px}
+.stat .n{font-family:"IBM Plex Mono",monospace;font-size:21px;font-variant-numeric:tabular-nums}
+.stat .l{font-size:12px;color:var(--ink3);margin-top:2px}
+.note{border-left:2px solid var(--rule);padding-left:15px;color:var(--ink2);font-size:14px;margin-top:16px}
+.note strong{color:var(--ink);font-weight:500}
+.bars{display:flex;flex-direction:column;gap:7px}
+.bar-row{display:grid;grid-template-columns:150px 1fr 60px;gap:12px;align-items:center;font-size:13px}
+.bar-lab{color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-track{background:var(--sunken);border-radius:3px;height:9px;overflow:hidden}
+.bar-fill{display:block;height:100%;background:var(--accent);opacity:.75}
+.bar-num{font-family:"IBM Plex Mono",monospace;text-align:right;color:var(--ink3);
+font-variant-numeric:tabular-nums}
+.wf{border:1px solid var(--rule);border-radius:6px;padding:13px 15px;margin-top:12px;background:var(--raised)}
+.wf-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap}
+.wf-meta{font-size:12px;color:var(--ink3)}
+.wf-foot{margin-top:10px;font-size:12px;color:var(--ink3)}
+.lanes{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px}
+.lane{display:flex;align-items:center;gap:6px;font-size:12px;padding:3px 9px 3px 7px;
+border:1px solid var(--rule);border-radius:12px;background:var(--sunken)}
+.lane-key{font-family:"IBM Plex Mono",monospace;color:var(--ink2)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ink3);flex:none}
+.s-ok .dot{background:var(--ok)}.s-bad .dot{background:var(--bad)}.s-mid .dot{background:var(--warn)}
+.pipe{display:flex;flex-wrap:wrap;gap:5px;margin-top:11px}
+.pstep{font-family:"IBM Plex Mono",monospace;font-size:11px;padding:3px 8px;border-radius:3px;
+border:1px solid var(--rule);color:var(--ink3)}
+.pstep.on{color:var(--accent);border-color:var(--accent);background:var(--sunken)}
+.gates{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.gate{font-family:"IBM Plex Mono",monospace;font-size:11px;padding:3px 8px;border-radius:3px;
+border:1px solid currentColor}
+.gate b{font-weight:500}
+.gate.s-ok{color:var(--ok);background:var(--okb)}
+.gate.s-bad{color:var(--bad);background:var(--badb)}
+.gate.s-mid{color:var(--warn);background:var(--warnb)}
+.tbl-wrap{overflow-x:auto;border:1px solid var(--rule);border-radius:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 13px;border-bottom:1px solid var(--rule)}
+tr:last-child td{border-bottom:0}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink3);
+font-weight:500;background:var(--sunken)}
+td.num{font-family:"IBM Plex Mono",monospace;text-align:right;color:var(--ink2);
+font-variant-numeric:tabular-nums}
+td.what{color:var(--ink2);max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--rule);color:var(--ink3);font-size:13px}
+</style>
+"""
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", help="repo root. Default: the working directory.")
+    ap.add_argument("--session", help="session id. Default: the newest for this repo.")
+    ap.add_argument("--out", help="where to write the report.")
+    ap.add_argument("--redact", action="store_true",
+                    help="hash file paths before writing. Use before sharing the report.")
+    ap.add_argument("--runs", type=int, default=5, metavar="N",
+                    help="harness runs to include, newest first. Default 5.")
+    ap.add_argument("--gaps", type=int, default=15, metavar="N",
+                    help="longest gaps to list. Default 15.")
+    ap.add_argument("--list", action="store_true", help="list sessions and exit.")
+    args = ap.parse_args(argv)
+
+    root = os.path.abspath(args.root or os.getcwd())
+    pdir = project_dir(root)
+    sessions = find_sessions(pdir)
+
+    if args.list:
+        if not sessions:
+            die("no sessions recorded for %s" % root, EXIT_NO_LOGS)
+        for _, sid, path in sessions[:20]:
+            size = os.path.getsize(path) // 1024
+            sys.stdout.write("%s  %6d KB\n" % (sid, size))
+        return EXIT_OK
+
+    if not sessions:
+        die("no session logs under %s. Nothing to visualise." % pdir, EXIT_NO_LOGS)
+
+    if args.session:
+        match = [s for s in sessions if s[1].startswith(args.session)]
+        if not match:
+            die("no session id starting %s. Try --list." % args.session, EXIT_ERROR)
+        _, sid, tpath = match[0]
+    else:
+        _, sid, tpath = sessions[0]
+
+    transcript = read_transcript(tpath)
+    if not transcript["calls"] and not transcript["turns"]:
+        die("session %s recorded no assistant turns" % sid, EXIT_EMPTY)
+
+    ctx = {
+        "repo": root,
+        "session": sid,
+        "redact": args.redact,
+        "transcript": transcript,
+        "workflows": read_workflows(os.path.join(pdir, sid)),
+        "hp_runs": read_hp_runs(root, args.runs),
+        "timeline": longest_gaps(transcript["calls"], args.gaps),
+    }
+
+    out = args.out or os.path.join(root, ".hyperpower", "reports", "session-%s.html" % sid[:8])
+    parent = os.path.dirname(out) or "."
+    try:
+        os.makedirs(parent, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(build_html(ctx))
+    except OSError as exc:
+        die("cannot write %s: %s" % (out, exc.strerror), EXIT_ERROR)
+
+    sys.stdout.write("%s\n" % out)
+    sys.stderr.write(
+        "hp-visualize: %d turns, %d tool calls, %d workflow runs, %d harness runs.\n"
+        % (transcript["turns"], len(transcript["calls"]),
+           len(ctx["workflows"]), len(ctx["hp_runs"])))
+    if not args.redact:
+        sys.stderr.write(
+            "hp-visualize: paths are unredacted. Rerun with --redact before sharing it.\n")
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(EXIT_ERROR)

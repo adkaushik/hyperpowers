@@ -1,6 +1,6 @@
 # Commands
 
-Twenty commands in six groups. Everything is namespaced `hyperpower:`, so nothing
+Twenty-one commands in six groups. Everything is namespaced `hyperpower:`, so nothing
 collides with commands you already have.
 
 ## Setup
@@ -199,6 +199,29 @@ stale rather than shown as fact.
 
 Everything is local. See [analytics.md](analytics.md).
 
+### `/hyperpower:visualize`
+
+Build a visual report of what the agents did in a session. Reads three local sources and
+merges them: the session transcript, the workflow journals, and this repo's run journal.
+
+| Flag | Does |
+|---|---|
+| `--list` | show recorded sessions for this repo, newest first |
+| `--session <id>` | report on an earlier session, by id prefix |
+| `--redact` | hash file paths before writing |
+| `--runs N` | harness runs to include, newest first. Default 5. |
+| `--out PATH` | write somewhere other than `.hyperpower/reports/` |
+
+Run it after the work, not during. A live transcript is still being appended, so a report
+built mid-run describes an unfinished thing.
+
+Nothing is uploaded. The transcript carries prompts, paths and command lines, so rerun with
+`--redact` before sharing the file. Redaction rewrites path-shaped substrings and leaves
+tool names, gate names and timings intact — it is not a guarantee, because a free-text
+command line can carry anything.
+
+Exit 0 report written, 1 the session recorded nothing, 2 bad input, 78 no logs found.
+
 ## Quality
 
 ### `/hyperpower:sweep`
@@ -357,6 +380,12 @@ before the change stop lining up with aggregates after.
 
 Redaction is not anonymity. Anyone holding the repo and the salt can hash a path and
 compare it.
+
+### `hp-visualize`
+
+Parses the session transcript, the workflow journals and the run journal into one
+self-contained HTML report. Standard library only. Writes to disk and uploads nothing.
+Backs `/hyperpower:visualize`.
 
 ### `hp-selfcheck`
 
