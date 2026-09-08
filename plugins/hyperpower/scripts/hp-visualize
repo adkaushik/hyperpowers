@@ -180,9 +180,40 @@ STEP_ORDER = ["route", "understand", "plan", "design", "build",
               "gates", "review", "fix", "render"]
 
 
+_CONFIG_MODULE = []
+
+
+def load_config_module():
+    """Import the sibling hp-config once. It has no .py suffix, so name the loader."""
+    if _CONFIG_MODULE:
+        return _CONFIG_MODULE[0]
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    loader = importlib.machinery.SourceFileLoader("hp_config", path)
+    spec = importlib.util.spec_from_loader("hp_config", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _CONFIG_MODULE.append(module)
+    return module
+
+
+def state_root(root):
+    """The directory the harness writes into. paths.state in config, or .hyperpower."""
+    try:
+        cfg = load_config_module()
+    except Exception:
+        return os.path.join(str(root), ".hyperpower")
+    try:
+        loaded = cfg.load(str(root))
+        return cfg.state_dir(str(root), loaded["config"])
+    except Exception:
+        return cfg.state_dir(str(root), None)
+
+
 def read_hp_runs(repo_root, limit):
     """Stages, gates and assumptions from this repo's own run journal."""
-    runs_dir = os.path.join(repo_root, ".hyperpower", "runs")
+    runs_dir = os.path.join(state_root(repo_root), "runs")
     if not os.path.isdir(runs_dir):
         return []
     rows = []
@@ -534,7 +565,7 @@ def main(argv):
         "timeline": longest_gaps(transcript["calls"], args.gaps),
     }
 
-    out = args.out or os.path.join(root, ".hyperpower", "reports", "session-%s.html" % sid[:8])
+    out = args.out or os.path.join(state_root(root), "reports", "session-%s.html" % sid[:8])
     parent = os.path.dirname(out) or "."
     try:
         os.makedirs(parent, exist_ok=True)

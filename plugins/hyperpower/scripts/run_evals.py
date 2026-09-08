@@ -15,6 +15,7 @@ import json
 import random
 import re
 import subprocess
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -812,10 +813,10 @@ def cmd_run(args):
     if args.out:
         out_dir = Path(args.out)
     else:
-        out_dir = anchor / ".hyperpower" / "evals" / run_id
+        out_dir = Path(state_root(anchor)) / "evals" / run_id
 
     if args.dry_run:
-        label = str(out_dir) if args.out else str(anchor / ".hyperpower" / "evals" / "<run-id>")
+        label = str(out_dir) if args.out else str(Path(state_root(anchor)) / "evals" / "<run-id>")
         return dry_run_report(args, cases, conditions, rows, key_map, label, config)
 
     if out_dir.exists() and any(out_dir.iterdir()) and not args.force:
@@ -1527,6 +1528,36 @@ def build_parser():
 
     return parser
 
+
+_CONFIG_MODULE = []
+
+
+def load_config_module():
+    """Import the sibling hp-config once. It has no .py suffix, so name the loader."""
+    if _CONFIG_MODULE:
+        return _CONFIG_MODULE[0]
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    loader = importlib.machinery.SourceFileLoader("hp_config", path)
+    spec = importlib.util.spec_from_loader("hp_config", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _CONFIG_MODULE.append(module)
+    return module
+
+
+def state_root(root):
+    """The directory the harness writes into. paths.state in config, or .hyperpower."""
+    try:
+        cfg = load_config_module()
+    except Exception:
+        return os.path.join(str(root), ".hyperpower")
+    try:
+        loaded = cfg.load(str(root))
+        return cfg.state_dir(str(root), loaded["config"])
+    except Exception:
+        return cfg.state_dir(str(root), None)
 
 def main(argv=None):
     parser = build_parser()

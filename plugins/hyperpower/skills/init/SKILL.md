@@ -127,18 +127,40 @@ Never write a key that is not in the schema. Something you detected with nowhere
 
 ### .gitignore entries
 
-Append these three lines to `.gitignore` at the repo root, each only if it is not already there:
+Resolve the state directory first. Never assume `.hyperpower` - `paths.state` moves it, and
+a repo that set it did so to avoid a new ignore entry:
+
+```bash
+hp-config --state-dir
+```
+
+If git already ignores that directory, write nothing but `hyperpower.local.yml`, and say so
+in the step 6 report. That is the whole point of the setting, and adding a redundant entry
+undoes it.
+
+Otherwise append these lines to `.gitignore` at the repo root, each only if it is not
+already there, with `<state>` replaced by the resolved path relative to the root:
 
 ```
-.hyperpower/runs/
-.hyperpower/evals/
+<state>/runs/
+<state>/evals/
+<state>/reports/
+<state>/redact-salt
 hyperpower.local.yml
 ```
 
-`.hyperpower/evals/` is where `scripts/run_evals.py` writes eval run directories, including
-every generated response. Create `.gitignore` if it does not exist. Do not reorder, rewrite,
-or deduplicate the rest of the file. Do not ignore `.hyperpower/` as a whole: `backlog.jsonl`,
-`hygiene.jsonl`, and `promotions.jsonl` live there and are committed.
+Those four are churn, per-machine, or a secret. `<state>/evals/` holds every generated
+response from an eval run. `redact-salt` reverses every redacted token if it is committed.
+
+Do not ignore `<state>/` as a whole. `backlog.jsonl`, `hygiene.jsonl` and `promotions.jsonl`
+live there and are meant to be committed so the team can read what scout and janitor found.
+
+The exception is a repo whose `paths.state` already sits inside an ignored directory. There
+the sheets are ignored too. Say that in the report rather than letting the user find out
+when a colleague cannot see their backlog.
+
+Create `.gitignore` if it does not exist. Do not reorder, rewrite, or deduplicate the rest
+of the file.
 
 ## Step 4 - generate the rulebook
 

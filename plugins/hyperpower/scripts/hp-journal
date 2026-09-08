@@ -30,8 +30,25 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NO_CONFIG = 78
 
+# The default only. paths.state moves the whole tree; state_root() resolves it. This
+# constant stays because find_root() uses it as a last-resort marker, and a marker has to
+# be a literal - the config that would rename it lives inside the root we are still
+# looking for.
 JOURNAL_DIR = ".hyperpower"
 RUNS_DIR = os.path.join(JOURNAL_DIR, "runs")
+
+
+def state_root(root):
+    """The directory the harness writes into. paths.state, or .hyperpower."""
+    try:
+        cfg = load_config_module()
+    except Exception:
+        return os.path.join(root, JOURNAL_DIR)
+    try:
+        loaded = cfg.load(root)
+        return cfg.state_dir(root, loaded["config"])
+    except Exception:
+        return cfg.state_dir(root, None)
 
 # The plugin ships hp-config, hp-validate and task-classes.yml beside this script.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -267,7 +284,7 @@ def find_root(explicit=None):
 
 
 def runs_root(root):
-    return os.path.join(root, RUNS_DIR)
+    return os.path.join(state_root(root), "runs")
 
 
 def run_git(args, cwd):

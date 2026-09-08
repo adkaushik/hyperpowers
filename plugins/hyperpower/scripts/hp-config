@@ -29,6 +29,32 @@ CONFIG_NAME = "hyperpower.yml"
 LOCAL_NAME = "hyperpower.local.yml"
 DEFAULT_SOURCE = "default"
 ENV_ROOT = "HYPERPOWER_REPO_ROOT"
+ENV_STATE = "HYPERPOWER_STATE_DIR"
+
+# Everything the harness writes lives under one directory: run journals, telemetry,
+# reports, eval output, the scout and janitor sheets. paths.state moves all of it, so a
+# repo that already gitignores somewhere can point it there instead of adding an entry.
+DEFAULT_STATE_DIR = ".hyperpower"
+
+
+def state_dir(root, cfg=None):
+    """Absolute path to the state directory.
+
+    HYPERPOWER_STATE_DIR wins, so hp-gates can pin one value for every child process.
+    Then paths.state from the config. Then the default.
+
+    A relative value is anchored to the repo root, never the working directory - the
+    same rule the run directory follows, and for the same reason.
+    """
+    raw = os.environ.get(ENV_STATE, "").strip()
+    if not raw and cfg:
+        raw = (cfg.get("paths") or {}).get("state") or ""
+        raw = raw.strip() if isinstance(raw, str) else ""
+    raw = raw or DEFAULT_STATE_DIR
+    path = os.path.expanduser(raw)
+    if not os.path.isabs(path):
+        path = os.path.join(root, path)
+    return os.path.abspath(path)
 
 NO_CONFIG_MESSAGE = (
     "No {} found. Run /hyperpower:init to create one. "
@@ -50,6 +76,7 @@ SCHEMA = {
         "tests": [],
         "docs": [],
         "ignore": [],
+        "state": DEFAULT_STATE_DIR,
     },
     "commands": {
         "install": None,
@@ -731,6 +758,12 @@ def build_parser():
         action="store_true",
         help="print the config hash alone. This is the value meta.json records.",
     )
+    parser.add_argument(
+        "--state-dir",
+        action="store_true",
+        help="print the absolute state directory alone. Every other script resolves it "
+        "the same way, so this is the one place to check where the harness writes.",
+    )
     return parser
 
 
@@ -746,6 +779,10 @@ def main(argv=None):
 
     if args.hash:
         sys.stdout.write(loaded["hash"] + "\n")
+        return EXIT_OK
+
+    if args.state_dir:
+        sys.stdout.write(state_dir(loaded["root"], loaded["config"]) + "\n")
         return EXIT_OK
 
     payload = loaded if args.source else loaded["config"]

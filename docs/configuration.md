@@ -86,6 +86,7 @@ paths:
   tests: [src/**/*.test.ts]
   docs: [docs/]
   ignore: [dist/, node_modules/, generated/]
+  state: .hyperpower          # everything the harness writes lives here
 
 commands:
   install: pnpm install --frozen-lockfile
@@ -141,6 +142,38 @@ voice:
 
 The only directories the harness may edit. Everything else is read-only to it. Keep this
 tight.
+
+### paths.state
+
+Every file the harness writes lives under this one directory: run journals, gate logs,
+telemetry, eval output, reports, the redaction salt, and the scout and janitor sheets.
+
+Default `.hyperpower` at the repo root. Point it somewhere else when your repo already
+ignores a directory and you would rather not add another `.gitignore` entry:
+
+```yaml
+paths:
+  state: .claude/hyperpower
+```
+
+A relative value is anchored to the repo root, never the working directory. An absolute
+path is used as given. `HYPERPOWER_STATE_DIR` overrides both, which is how `hp-gates`
+pins one value for every gate script it spawns.
+
+Check where it resolved to:
+
+```bash
+hp-config --state-dir
+```
+
+**Moving it moves the sheets too.** `backlog.jsonl` and `hygiene.jsonl` are meant to be
+committed so your team can read what scout and janitor found. If you point `state` at a
+directory that is already fully ignored, those stop being shared. That is the trade: one
+setting, everything moves together.
+
+Changing it does not migrate anything. Existing runs stay where they were written, and
+`/hyperpower:why` will not find them. Move the directory yourself, or accept that history
+starts fresh.
 
 ### commands
 

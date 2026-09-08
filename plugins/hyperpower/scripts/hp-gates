@@ -354,13 +354,21 @@ def scope_files(args, cfg, root):
     """
     patterns = ignore_patterns(cfg)
     seen = set()
+    # Drop the state tree from the scope. Gates would otherwise lint and typecheck the
+    # journal this command is writing. paths.state moves it, so compute it once here
+    # rather than matching a literal.
+    try:
+        state_rel = os.path.relpath(state_root(root), str(root))
+    except ValueError:
+        state_rel = ".hyperpower"
+
     kept = []
     for entry in raw_files(args, root):
         path = entry.strip()
         if not path or path in seen:
             continue
         seen.add(path)
-        if path == ".hyperpower" or path.startswith(".hyperpower/"):
+        if path == state_rel or path.startswith(state_rel + "/"):
             continue
         if not (root / path).is_file():
             continue
@@ -466,6 +474,37 @@ def finished(run_dir):
         return False
 
 
+_CONFIG_MODULE = []
+
+
+def load_config_module():
+    """Import the sibling hp-config once. It has no .py suffix, so name the loader."""
+    if _CONFIG_MODULE:
+        return _CONFIG_MODULE[0]
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    loader = importlib.machinery.SourceFileLoader("hp_config", path)
+    spec = importlib.util.spec_from_loader("hp_config", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _CONFIG_MODULE.append(module)
+    return module
+
+
+def state_root(root):
+    """The directory the harness writes into. paths.state in config, or .hyperpower."""
+    try:
+        cfg = load_config_module()
+    except Exception:
+        return os.path.join(str(root), ".hyperpower")
+    try:
+        loaded = cfg.load(str(root))
+        return cfg.state_dir(str(root), loaded["config"])
+    except Exception:
+        return cfg.state_dir(str(root), None)
+
+
 def resolve_run(args, root):
     """Return (run_id, run_dir). Both are None when this repo has no run to write into.
 
@@ -474,7 +513,7 @@ def resolve_run(args, root):
     which produces a one-gate aggregate that is not the run's gate result, and a run that
     already finished, whose gates.json is what /hyperpower:why and the archivist read.
     """
-    runs_dir = root / ".hyperpower" / "runs"
+    runs_dir = Path(state_root(root)) / "runs"
     run_id = args.run or os.environ.get("HYPERPOWER_RUN_ID", "").strip()
     if run_id:
         return run_id, runs_dir / run_id

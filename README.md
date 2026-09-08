@@ -390,6 +390,14 @@ Twenty-one commands in six groups. Full reference in [docs/commands.md](docs/com
 `hyperpower.yml` at your repo root, committed. `hyperpower.local.yml` overrides it per
 machine and is gitignored.
 
+Everything the harness writes lives under one directory, `.hyperpower` by default. If your
+repo already ignores somewhere, point it there instead of adding a `.gitignore` entry:
+
+```yaml
+paths:
+  state: .claude/hyperpower
+```
+
 It sets which directories the harness may edit, which commands each gate runs, which gates
 block, your two model tiers, and the limits.
 

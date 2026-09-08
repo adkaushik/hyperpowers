@@ -196,6 +196,19 @@ def load_config_module():
     return module
 
 
+def state_root(root):
+    """The directory the harness writes into. paths.state in config, or .hyperpower."""
+    try:
+        cfg = load_config_module()
+    except Exception:
+        return os.path.join(root, ".hyperpower")
+    try:
+        loaded = cfg.load(root)
+        return cfg.state_dir(root, loaded["config"])
+    except Exception:
+        return cfg.state_dir(root, None)
+
+
 def read_config_json(path):
     """Read a file holding `hp-config --json` or `hp-config --source` output."""
     try:
@@ -246,7 +259,7 @@ def redaction_setting(args, root):
 
 
 def default_salt_path(root):
-    return os.path.join(root, JOURNAL_DIR, SALT_NAME)
+    return os.path.join(state_root(root), SALT_NAME)
 
 
 def derive_salt(root):
