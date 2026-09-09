@@ -53,6 +53,25 @@ No lockfile: leave `package_manager` null and disable every gate whose command y
 
 ### Languages
 
+**Build `paths.ignore` by measuring, not from a fixed list.** Every directory holding a
+large number of *untracked* files is not source, whatever it is called. Find them:
+
+```bash
+git status --porcelain --ignored=no --untracked-files=all | awk '{print $2}' \
+  | awk -F/ '{print $1}' | sort | uniq -c | sort -rn | head -20
+```
+
+Any top-level entry above ~500 untracked files goes into `paths.ignore`. Then add
+`.claude/` and `.superpowers/` unconditionally — those are agent tooling caches, they
+routinely hold thousands of files including source in your repo's own languages, and a
+blast-radius walk that enters them spends minutes mapping other people's plugins.
+
+Also add `**/migrations/` when the repo has generated migrations, and any directory git
+already ignores that a walk would still enter.
+
+Getting this wrong is expensive and silent. A repo where the cache is larger than the
+source makes Understand several times slower, and nothing in the output says why.
+
 Count tracked files per extension, excluding the default ignore list in step 3. List every language above 5% of tracked source files, most files first. Vendored directories are not languages.
 
 ### CI is the best source
@@ -114,7 +133,7 @@ Defaults for anything not detected:
 |---|---|
 | `project.type` | `other` |
 | `paths.source` | `[src/]` when `src/` exists, otherwise the largest source directory |
-| `paths.ignore` | `[node_modules/, dist/, build/, .venv/, target/, vendor/]` |
+| `paths.ignore` | the detected list from step 1, never the bare default |
 | `models` | `judgment: claude-opus-5`, `mechanical: claude-haiku-4-5` |
 | `limits` | `30`, `5`, `3`, `5`, `600` in schema order |
 | `memory` | `decisions_dir: decisions/`, `archivist: true`, `promoter: true` |

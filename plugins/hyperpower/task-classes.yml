@@ -37,7 +37,7 @@ tiers_allowed: [judgment, mechanical]
 # and say so. The ratchet is one way. Route never picks a class lighter than the
 # heaviest one that fits, and never lighter than the class already recorded in
 # meta.json on a replay.
-ratchet: [trivial, one-file-fix, dependency, bug, refactor, feature, ui-feature]
+ratchet: [triage, trivial, one-file-fix, dependency, bug, refactor, feature, ui-feature]
 
 # The class route uses when nothing fits. feature is the heaviest non-UI class,
 # so an unrecognised requirement gets the full non-UI pipeline rather than a
@@ -45,6 +45,34 @@ ratchet: [trivial, one-file-fix, dependency, bug, refactor, feature, ui-feature]
 fallback: feature
 
 classes:
+
+  triage:
+    summary: A question about the code, not a change to it. Ends with findings.
+    recognise:
+      - the requirement asks what, why, where, or how much, not "make it so"
+      - phrased as look into, investigate, why is X slow, or what would it take to
+      - no acceptance condition a command could check
+      - the useful output is a diagnosis the human reads and then decides on
+    not_this_class:
+      - any requirement naming a change to make, even a small one
+      - a bug with a reproduction. That is bug, and it ends with a fix.
+      - make it faster with a measurable target. That is refactor.
+    # Two stages. Nothing is built, so nothing needs gating, reviewing or fixing.
+    # A class that ends at render is the whole point: the human reads the findings
+    # and routes the real work themselves.
+    stages: [understand, render]
+    tiers:
+      understand: mechanical
+      render: mechanical
+    review_slices_max: null
+    # No build, so no loop to bound. Setting this true would promise a fix stage
+    # that does not exist in the stage list.
+    fix_loop: false
+    waits_for_human: false
+    notes:
+      - Ends with findings, never a plan and never a diff.
+      - Both stages run mechanical. A diagnosis needing judgment gets re-routed by the human.
+      - Writing a plan for a question spends judgment tokens on work nobody agreed to start.
 
   trivial:
     summary: Text a program does not execute. Nothing observable changes.
@@ -110,10 +138,9 @@ classes:
     not_this_class:
       - adopting a new library across the codebase. That is refactor or feature.
       - a defect caused by a stale package. That is bug, and the ratchet picks it.
-    stages: [understand, plan, build, gates, review, fix, render]
+    stages: [understand, build, gates, review, fix, render]
     tiers:
       understand: mechanical
-      plan: mechanical
       build: mechanical
       gates: mechanical
       review: judgment
@@ -123,6 +150,8 @@ classes:
     fix_loop: true
     waits_for_human: false
     notes:
+      - No plan stage. The upgrade is mechanical; review catches what changed underneath.
+      - A major bump needing a migration is refactor, not this.
       - Build runs on mechanical because the gates are the real check on a bump.
       - Fix-loop rounds 4 and 5 move build to judgment, which is a real escalation.
       - Two slices at most. One for the manifest, one for the repaired call sites.
@@ -136,10 +165,9 @@ classes:
     not_this_class:
       - make it faster. That is refactor.
       - it never existed and was never built. That is feature.
-    stages: [understand, plan, build, gates, review, fix, render]
+    stages: [understand, build, gates, review, fix, render]
     tiers:
       understand: judgment
-      plan: judgment
       build: judgment
       gates: mechanical
       review: judgment
@@ -149,6 +177,8 @@ classes:
     fix_loop: true
     waits_for_human: false
     notes:
+      - No plan stage. A reproduction states the acceptance condition more precisely than a plan would.
+      - When understand shows the cause spans subsystems, route ratchets this to refactor.
       - Understand runs on judgment. Finding the root cause is the whole job here.
       - Plan records the root cause and the options rejected, so the archivist can read them.
 

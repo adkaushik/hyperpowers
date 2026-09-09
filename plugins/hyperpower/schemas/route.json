@@ -173,6 +173,7 @@
       "type": "string",
       "description": "The one chosen class. The names come from task-classes.yml.",
       "enum": [
+        "triage",
         "trivial",
         "one-file-fix",
         "dependency",
@@ -318,6 +319,7 @@
       "items": {
         "type": "string",
         "enum": [
+          "triage",
           "trivial",
           "one-file-fix",
           "dependency",
@@ -335,6 +337,7 @@
       ],
       "description": "The lighter class the ratchet passed over, or null.",
       "enum": [
+        "triage",
         "trivial",
         "one-file-fix",
         "dependency",

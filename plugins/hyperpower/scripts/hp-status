@@ -220,6 +220,23 @@ def read_run(folder, name):
     }
 
 
+def stage_seconds(run):
+    """Wall-clock per stage, from the recorded timestamps.
+
+    The gap between one stage's record and the previous one is that stage's time.
+    Route reads these to estimate a run before starting it, so a guess is worse
+    than useless here - it would be an estimate nobody measured.
+    """
+    out = {}
+    prev = run["started"]
+    for step, info in run["steps"].items():
+        stamp = info["recorded_at"] or info["mtime"]
+        if prev and stamp and stamp > prev:
+            out[step] = int(stamp - prev)
+        prev = stamp or prev
+    return out
+
+
 def fix_rounds(run):
     """Rounds counted from the usage records, which the fix loop appends per round."""
     return sum(1 for row in run["usage"] if (row.get("stage") or "").startswith("fix"))
@@ -450,10 +467,22 @@ def main(argv=None):
                     "fix_rounds": fix_rounds(run),
                     "mistakes": len(run["mistakes"]),
                     "model_calls": len(run["usage"]),
+                    "stage_seconds": stage_seconds(run),
                     "stuck": stuck_signals(run, ctx["now"]),
                 })
+            history = {}
+            for _, name, folder in ctx["runs"]:
+                for step, secs in stage_seconds(read_run(folder, name)).items():
+                    history.setdefault(step, []).append(secs)
+            medians = {}
+            for step, values in history.items():
+                values.sort()
+                medians[step] = values[len(values) // 2]
+
             payload = {
                 "root": ctx["root"], "state": ctx["state"],
+                "stage_seconds_median": medians,
+                "runs_measured": len(ctx["runs"]),
                 "protocol_injected": ctx["protocol"],
                 "state_git_excluded": ctx["excluded"],
                 "runs_recorded": len(ctx["runs"]),

@@ -136,16 +136,58 @@ validator pass, and do not move it into `notes`. The planner and the archivist b
 Route never calls `hp-journal new`. Opening a run folder for a classification nobody
 executes leaves an empty run in `/hyperpower:usage` forever.
 
-## Step 7 - the human line
+## Step 7 - the human line, with the cost
 
-Two lines when the ratchet fired, one when it did not. This is progress output, not the
-render boundary. Do not shape it and do not truncate it.
+Say the class, why, the stages, and **how long this is likely to take**. The estimate comes
+from this repo's own recorded runs, never from a guess:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hp-status --json
+```
+
+Read `stage_seconds_median` and sum the entries for the stages you selected. Report
+`runs_measured` alongside it, because an estimate from one run is not an estimate — say so
+rather than presenting it as one.
+
+With no history at all, say "no recorded runs yet, no estimate" and do not invent a number.
 
 ```
 Route  ui-feature. The requirement adds a settings screen, which is rendered output a human reads.
        feature also fit. Picked ui-feature, the heavier one.
 Stages understand, plan, design, build, gates, review, fix, render. Design waits for you.
+Est    ~24 min, from 6 recorded runs. plan is the long one at ~13 min.
 ```
+
+This is progress output, not the render boundary. Do not shape it and do not truncate it.
+
+## Step 8 - stop when the run is expensive
+
+**More than four stages: report, then stop and ask.** Wait for a yes.
+
+```
+That is 7 stages, ~24 min. Proceed? Or:
+  triage    understand + render only, ~10 min, ends with findings
+  narrower  give me a smaller requirement
+```
+
+Four or fewer: proceed without asking. Small work must stay frictionless, and a
+confirmation on every run trains people to hit yes without reading.
+
+Why the gate exists: the classification lands in about 25 seconds, and the expensive
+stages run for twenty minutes after it. Everything needed to decide is known at 25 seconds.
+Spending the twenty minutes before offering the choice is the defect this closes.
+
+Two exceptions, both of which skip the gate:
+
+- **A replay.** `/hyperpower:resume` already has a class in `meta.json` and the human
+  already chose once.
+- **A headless run.** No human can answer, so stalling accomplishes nothing. Proceed, and
+  put the class, stage list and estimate in the first line of output so the log shows what
+  it committed to.
+
+Offer `triage` by name whenever the requirement reads as a question. A requirement asking
+what, why, where or how much usually wants findings, and routing it to `feature` writes a
+plan for work nobody has agreed to start.
 
 ## Do not
 
@@ -158,3 +200,7 @@ Stages understand, plan, design, build, gates, review, fix, render. Design waits
 - Do not emit a `stages` list without a `tiers` entry for every stage in it. Run stops on
   that contract, and the stop is the correct behaviour.
 - Do not emit `route` inside `stages`. Route already ran.
+- Do not invent a duration. Read `stage_seconds_median`, or say there is no history.
+- Do not skip the confirmation above four stages because the requirement looks obvious.
+  The 25-second classification is exactly when the human can still act cheaply.
+- Do not ask for confirmation at four stages or fewer. That is friction with no payoff.

@@ -171,6 +171,7 @@
       "type": "string",
       "description": "The class as route set it. The seven in task-classes.yml are the whole set, and route.json carries the same seven. agents/planner.md forbids changing the value or naming a class outside task-classes.yml, so the planner can only ever emit one of these. /hyperpower:usage groups by this field and meta.json records what route wrote, so a second vocabulary here fragments every aggregate silently.",
       "enum": [
+        "triage",
         "trivial",
         "one-file-fix",
         "dependency",
