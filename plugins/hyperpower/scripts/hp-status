@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Report what the harness is doing, from the run journal on disk.
+
+Two jobs. A snapshot answers "is the harness even active here" - protocol, config, state
+directory, which gates are live, how many runs exist. A live read answers "what is
+happening right now" by reading the journal a running pipeline is writing into.
+
+It reads. It never writes, never edits config, and never stops a run. Stuck detection is
+mechanical - repeated failure keys, no new files between rounds, a journal that stopped
+moving - and reporting a stuck run is not the same as deciding to end it. That call is the
+human's, and --stop-hint prints the command rather than running it.
+
+Because a run is a folder and not a conversation, this works from a second session while
+the first one is still running. That is the intended way to watch a run in progress.
+
+Exit 0 reported. 1 no run to report on. 2 bad input. 78 no config, so nothing to report.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import Counter, OrderedDict
+from datetime import datetime, timezone
+
+EXIT_OK = 0
+EXIT_NO_RUN = 1
+EXIT_ERROR = 2
+EXIT_NO_CONFIG = 78
+
+STEP_ORDER = ["route", "understand", "plan", "design", "build",
+              "gates", "review", "fix", "render"]
+
+# A round that changed nothing and failed the same way is the signal worth surfacing.
+STUCK_REPEAT = 3
+STALL_SECONDS = 600
+
+_CONFIG_MODULE = []
+
+
+def die(message, code=EXIT_ERROR):
+    sys.stderr.write("hp-status: %s\n" % message)
+    raise SystemExit(code)
+
+
+def load_config_module():
+    """Import the sibling hp-config once. It has no .py suffix, so name the loader."""
+    if _CONFIG_MODULE:
+        return _CONFIG_MODULE[0]
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    if not os.path.isfile(path):
+        die("hp-config is missing from %s. Reinstall the plugin."
+            % os.path.dirname(path))
+    loader = importlib.machinery.SourceFileLoader("hp_config", path)
+    spec = importlib.util.spec_from_loader("hp_config", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _CONFIG_MODULE.append(module)
+    return module
+
+
+def read_jsonl(path):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return []
+    return rows
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def ago(seconds):
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return "%ds ago" % seconds
+    if seconds < 3600:
+        return "%dm ago" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh %02dm ago" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%dd ago" % (seconds // 86400)
+
+
+def dur(seconds):
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return "%ds" % seconds
+    return "%dm %02ds" % (seconds // 60, seconds % 60)
+
+
+def parse_ts(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        stamp = datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+        return stamp.replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+# ------------------------------------------------------------------- environment
+
+
+def hook_would_inject(root, config_path):
+    """Whether the session-start hook injects the protocol in this repo.
+
+    The hook keys on the config file existing. This reproduces that test rather than
+    claiming the protocol is loaded in the caller's session - a session that started
+    before the config was written did not get it, and no file on disk records that.
+    """
+    return bool(config_path and os.path.isfile(config_path))
+
+
+def git_excluded(root, rel):
+    try:
+        done = subprocess.run(
+            ["git", "check-ignore", "-q", rel],
+            cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return done.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def gate_summary(cfg):
+    gates = cfg.get("gates") or {}
+    live, warn, off = [], [], []
+    for name in sorted(gates):
+        entry = gates[name] if isinstance(gates[name], dict) else {}
+        if entry.get("enabled") is False:
+            off.append(name)
+        elif entry.get("blocking") is False:
+            warn.append(name)
+        else:
+            live.append(name)
+    return live, warn, off
+
+
+# ------------------------------------------------------------------------- runs
+
+
+def list_runs(runs_dir):
+    if not os.path.isdir(runs_dir):
+        return []
+    rows = []
+    for name in sorted(os.listdir(runs_dir)):
+        folder = os.path.join(runs_dir, name)
+        if not os.path.isdir(folder):
+            continue
+        try:
+            rows.append((os.path.getmtime(folder), name, folder))
+        except OSError:
+            continue
+    rows.sort(reverse=True)
+    return rows
+
+
+def read_run(folder, name):
+    meta = read_json(os.path.join(folder, "meta.json")) or {}
+    steps = OrderedDict()
+    for step in STEP_ORDER:
+        path = os.path.join(folder, "%s.json" % step)
+        if not os.path.isfile(path):
+            continue
+        body = read_json(path) or {}
+        steps[step] = {
+            "recorded_at": parse_ts(body.get("recorded_at")),
+            "mtime": os.path.getmtime(path),
+            "assumptions": Counter(
+                (a.get("status") or "declared")
+                for a in (body.get("assumptions") or []) if isinstance(a, dict)
+            ),
+            "files": body.get("files_read") or [],
+        }
+    gates = []
+    gbody = read_json(os.path.join(folder, "gates.json"))
+    if gbody:
+        for entry in gbody.get("gates") or []:
+            gates.append({
+                "gate": entry.get("gate"),
+                "result": entry.get("result"),
+                "blocking": bool(entry.get("blocking")),
+                "detail": entry.get("detail") or "",
+                "disabled": bool(entry.get("disabled")),
+            })
+    usage = read_jsonl(os.path.join(folder, "usage.jsonl"))
+    mistakes = read_jsonl(os.path.join(folder, "mistakes.jsonl"))
+
+    newest = max(
+        [s["mtime"] for s in steps.values()] +
+        [os.path.getmtime(folder)] +
+        [os.path.getmtime(os.path.join(folder, f))
+         for f in ("usage.jsonl", "mistakes.jsonl", "gates.json")
+         if os.path.isfile(os.path.join(folder, f))]
+    )
+    return {
+        "run": name, "folder": folder, "meta": meta, "steps": steps,
+        "gates": gates, "usage": usage, "mistakes": mistakes,
+        "started": parse_ts(meta.get("started_at")),
+        "newest": newest,
+        "finished": bool(meta.get("outcome")),
+    }
+
+
+def fix_rounds(run):
+    """Rounds counted from the usage records, which the fix loop appends per round."""
+    return sum(1 for row in run["usage"] if (row.get("stage") or "").startswith("fix"))
+
+
+def stuck_signals(run, now):
+    """Mechanical signals only. No judgment about whether the approach is right.
+
+    Each returned line states a fact a human can act on. Nothing here decides anything.
+    """
+    out = []
+    if run["finished"]:
+        return out
+
+    idle = now - run["newest"]
+    if idle > STALL_SECONDS:
+        out.append("no journal write in %s. The run may have died without recording an "
+                   "outcome." % dur(idle))
+
+    keys = Counter((m.get("kind"), m.get("key")) for m in run["mistakes"])
+    for (kind, key), count in keys.most_common(3):
+        if count >= STUCK_REPEAT:
+            out.append("%s failed %d times on the same key %r. Rounds 1-3 resume the same "
+                       "builder, so a third identical failure means the retry is not "
+                       "learning." % (kind or "a step", count, key or "?"))
+
+    rounds = fix_rounds(run)
+    if rounds >= 4:
+        out.append("fix loop is at round %d of 5. Rounds 4-5 already escalated; round 5 "
+                   "failing is a hard stop." % rounds)
+
+    blocking_fail = [g["gate"] for g in run["gates"]
+                     if g["result"] == "fail" and g["blocking"]]
+    if blocking_fail and rounds >= STUCK_REPEAT:
+        out.append("%s still failing after %d rounds."
+                   % (", ".join(blocking_fail), rounds))
+
+    unverified = [g["gate"] for g in run["gates"]
+                  if g["result"] == "did_not_run" and g["blocking"] and not g["disabled"]]
+    if unverified:
+        out.append("blocking gate could not run: %s. That is not a pass, and the run "
+                   "should not have proceeded past it." % ", ".join(unverified))
+    return out
+
+
+# -------------------------------------------------------------------- rendering
+
+
+def render_env(ctx, out):
+    cfg = ctx["cfg"]
+    project = (cfg.get("project") or {}).get("name") or os.path.basename(ctx["root"])
+    out.append("hyperpower  %s" % project)
+    out.append("  protocol    %s" % (
+        "injected at session start"
+        if ctx["protocol"] else "NOT injected - no hyperpower.yml, run /hyperpower:init"))
+    rel = os.path.relpath(ctx["state"], ctx["root"])
+    out.append("  state       %s%s" % (
+        rel, "  (git-excluded)" if ctx["excluded"] else "  (NOT git-ignored)"))
+    live, warn, off = gate_summary(cfg)
+    out.append("  gates       %s blocking%s%s" % (
+        ", ".join(live) or "none",
+        " · %s warns" % ", ".join(warn) if warn else "",
+        " · %d off" % len(off) if off else ""))
+    if ctx["runs"]:
+        newest = ctx["runs"][0]
+        out.append("  runs        %d recorded · last %s, %s"
+                   % (len(ctx["runs"]), newest[1], ago(ctx["now"] - newest[0])))
+    else:
+        out.append("  runs        none yet. A normal question writes nothing; only "
+                   "/hyperpower:run records a run.")
+
+
+def render_run(run, now, out):
+    meta = run["meta"]
+    state = "finished (%s)" % meta.get("outcome") if run["finished"] else "in progress"
+    out.append("")
+    out.append("run %s  ·  %s  ·  %s  ·  started %s"
+               % (run["run"], meta.get("task_class") or "-", state,
+                  ago(now - run["started"]) if run["started"] else "unknown"))
+
+    if not run["steps"]:
+        out.append("  no stage has recorded a contract yet")
+    prev = run["started"]
+    for step, info in run["steps"].items():
+        if step == "gates":
+            continue
+        stamp = info["recorded_at"] or info["mtime"]
+        took = dur(stamp - prev) if prev and stamp > prev else "-"
+        prev = stamp
+        out.append("  %-11s ok    %s" % (step, took))
+
+    if run["gates"]:
+        marks = {"pass": "0", "fail": "1", "did_not_run": "78"}
+        ran = [g for g in run["gates"] if not g["disabled"]]
+        cells = ["%s %s" % (g["gate"], marks.get(g["result"], "?")) for g in ran]
+        tail = ""
+        disabled = len(run["gates"]) - len(ran)
+        if disabled:
+            tail = "  (+%d off)" % disabled
+        out.append("  %-11s %s%s" % ("gates", " · ".join(cells) or "none ran", tail))
+
+    rounds = fix_rounds(run)
+    if rounds:
+        out.append("  %-11s round %d of 5" % ("fix", rounds))
+
+    assume = Counter()
+    for info in run["steps"].values():
+        assume.update(info["assumptions"])
+    if assume:
+        bits = ["%d %s" % (assume[k], k)
+                for k in ("verified", "refuted", "unresolved", "declared") if assume.get(k)]
+        out.append("  %-11s %s" % ("assumptions", ", ".join(bits)))
+        if assume.get("refuted"):
+            out.append("              %d refuted - wrong, and code shipped against it. "
+                       "Read them: /hyperpower:why %s --assumptions"
+                       % (assume["refuted"], run["run"]))
+
+    if run["usage"]:
+        tok = sum(int(r.get("output_tokens") or 0) for r in run["usage"])
+        out.append("  %-11s %d model calls · %s output tokens"
+                   % ("cost", len(run["usage"]), "{:,}".format(tok)))
+
+
+def render_stuck(run, signals, out, stop_hint):
+    if not signals:
+        return
+    out.append("")
+    out.append("  STUCK SIGNALS")
+    for line in signals:
+        out.append("    - %s" % line)
+    out.append("")
+    out.append("  These are facts from the journal, not a verdict on the approach.")
+    if stop_hint:
+        out.append("  To end it, interrupt the session driving the run (Ctrl+C), then:")
+        out.append("    /hyperpower:why %s --assumptions" % run["run"])
+        out.append("    /hyperpower:resume %s --from <step>   once you have redirected it"
+                   % run["run"])
+
+
+def build_report(ctx, args):
+    out = []
+    render_env(ctx, out)
+    if not ctx["runs"]:
+        return out, EXIT_NO_RUN
+
+    wanted = ctx["runs"]
+    if args.run:
+        wanted = [r for r in ctx["runs"] if r[1].startswith(args.run)]
+        if not wanted:
+            die("no run id starting %s. Recorded: %s"
+                % (args.run, ", ".join(r[1] for r in ctx["runs"][:8])), EXIT_ERROR)
+    wanted = wanted[: args.last]
+
+    for _, name, folder in wanted:
+        run = read_run(folder, name)
+        render_run(run, ctx["now"], out)
+        render_stuck(run, stuck_signals(run, ctx["now"]), out, args.stop_hint)
+
+    hidden = len(ctx["runs"]) - len(wanted)
+    if hidden:
+        out.append("")
+        out.append("  and %d older runs. Raise --last to see them." % hidden)
+    return out, EXIT_OK
+
+
+def gather(args):
+    cfg_mod = load_config_module()
+    try:
+        loaded = cfg_mod.load(args.root)
+    except Exception as exc:
+        message = getattr(exc, "render", None)
+        die(message() if callable(message) else str(exc), EXIT_NO_CONFIG)
+
+    root = loaded["root"]
+    cfg = loaded["config"]
+    state = cfg_mod.state_dir(root, cfg)
+    runs_dir = os.path.join(state, "runs")
+    return {
+        "root": root, "cfg": cfg, "state": state,
+        "protocol": hook_would_inject(root, (loaded.get("files") or {}).get("config")),
+        "excluded": git_excluded(root, os.path.relpath(state, root)),
+        "runs": list_runs(runs_dir),
+        "now": time.time(),
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="hp-status",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--root", default=None, metavar="DIR",
+                    help="repo root. Default: HYPERPOWER_REPO_ROOT, then the git top "
+                         "level, then the nearest directory holding hyperpower.yml")
+    ap.add_argument("--run", default=None, metavar="ID",
+                    help="report one run, by id prefix. Default: the newest.")
+    ap.add_argument("--last", type=int, default=1, metavar="N",
+                    help="how many runs to report, newest first. Default 1.")
+    ap.add_argument("--watch", type=int, default=0, metavar="SECONDS",
+                    help="reprint every N seconds until the run finishes or you stop it. "
+                         "Reads the journal a running pipeline is writing.")
+    ap.add_argument("--stop-hint", action="store_true",
+                    help="when a run looks stuck, print how to end and redirect it. This "
+                         "prints commands; it never stops anything itself.")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable, for a skill that wants the facts not the prose")
+    args = ap.parse_args(argv)
+
+    if args.last < 1:
+        die("--last must be at least 1", EXIT_ERROR)
+    if args.watch and args.watch < 2:
+        die("--watch needs at least 2 seconds. Polling faster reads the same bytes.",
+            EXIT_ERROR)
+
+    while True:
+        ctx = gather(args)
+        if args.json:
+            runs = []
+            for _, name, folder in (ctx["runs"][: args.last] or []):
+                run = read_run(folder, name)
+                runs.append({
+                    "run": name,
+                    "task_class": run["meta"].get("task_class"),
+                    "finished": run["finished"],
+                    "steps": list(run["steps"].keys()),
+                    "gates": run["gates"],
+                    "fix_rounds": fix_rounds(run),
+                    "mistakes": len(run["mistakes"]),
+                    "model_calls": len(run["usage"]),
+                    "stuck": stuck_signals(run, ctx["now"]),
+                })
+            payload = {
+                "root": ctx["root"], "state": ctx["state"],
+                "protocol_injected": ctx["protocol"],
+                "state_git_excluded": ctx["excluded"],
+                "runs_recorded": len(ctx["runs"]),
+                "runs": runs,
+            }
+            sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+            return EXIT_OK if runs else EXIT_NO_RUN
+
+        lines, code = build_report(ctx, args)
+        sys.stdout.write("\n".join(lines) + "\n")
+
+        if not args.watch:
+            return code
+        newest = ctx["runs"][0] if ctx["runs"] else None
+        if newest and read_run(newest[2], newest[1])["finished"]:
+            sys.stdout.write("\nRun finished. Stopping the watch.\n")
+            return code
+        sys.stdout.write("\n-- watching, every %ds. Ctrl+C to stop --\n" % args.watch)
+        sys.stdout.flush()
+        time.sleep(args.watch)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\nhp-status: stopped watching. The run is untouched.\n")
+        sys.exit(EXIT_OK)

@@ -1,6 +1,6 @@
 # Commands
 
-Twenty-one commands in six groups. Everything is namespaced `hyperpower:`, so nothing
+Twenty-two commands in six groups. Everything is namespaced `hyperpower:`, so nothing
 collides with commands you already have.
 
 ## Setup
@@ -222,6 +222,31 @@ command line can carry anything.
 
 Exit 0 report written, 1 the session recorded nothing, 2 bad input, 78 no logs found.
 
+### `/hyperpower:status`
+
+Report what the harness is doing. Answers two questions: whether the protocol is active in
+this repo at all, and what a run in progress has done so far.
+
+Reads the run journal, so it works from a second session while the first is still driving a
+run. That is the intended way to watch one — a session running `/hyperpower:run` is busy
+until the run yields.
+
+| Flag | Does |
+|---|---|
+| `--watch N` | reprint every N seconds until the run finishes |
+| `--run <id>` | one run, by id prefix. Default: the newest |
+| `--last N` | the N newest runs |
+| `--stop-hint` | when a run looks stuck, print how to end and redirect it |
+| `--json` | the facts without the prose |
+
+Stuck signals are mechanical: the same failure key N times, a fix loop at round 4 or 5, a
+blocking gate still failing, a blocking gate at `did_not_run`, or no journal write in ten
+minutes. They are facts, not a verdict on the approach.
+
+It reads only. It never stops a run — `--stop-hint` prints the commands and you run them.
+
+Exit 0 reported, 1 no run to report on, 2 bad input, 78 no config.
+
 ## Quality
 
 ### `/hyperpower:sweep`
@@ -386,6 +411,11 @@ compare it.
 Parses the session transcript, the workflow journals and the run journal into one
 self-contained HTML report. Standard library only. Writes to disk and uploads nothing.
 Backs `/hyperpower:visualize`.
+
+### `hp-status`
+
+Reads the run journal and reports the harness environment plus any run in progress.
+Standard library only, read only. Backs `/hyperpower:status`.
 
 ### `hp-selfcheck`
 

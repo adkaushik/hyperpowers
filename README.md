@@ -365,7 +365,7 @@ becomes your priority order for free.
 
 ## Commands
 
-Twenty-one commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
+Twenty-two commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
 
 ```
 /hyperpower:init            set up this repo
@@ -382,6 +382,7 @@ Twenty-one commands in six groups. Full reference in [docs/commands.md](docs/com
 /hyperpower:cost            tokens and money by stage
 /hyperpower:review          partition, review, adjudicate
 /hyperpower:eval            score a prompt change
+/hyperpower:status          is it on, and what is a live run doing
 /hyperpower:visualize       report what the agents did this session
 ```
 
