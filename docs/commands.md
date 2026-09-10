@@ -1,6 +1,6 @@
 # Commands
 
-Twenty-two commands in six groups. Everything is namespaced `hyperpower:`, so nothing
+Twenty-four commands in six groups. Everything is namespaced `hyperpower:`, so nothing
 collides with commands you already have.
 
 ## Setup
@@ -246,6 +246,43 @@ minutes. They are facts, not a verdict on the approach.
 It reads only. It never stops a run — `--stop-hint` prints the commands and you run them.
 
 Exit 0 reported, 1 no run to report on, 2 bad input, 78 no config.
+
+### `/hyperpower:council`
+
+Put one question to the departments that own it and count independent votes. No voice sees
+another, which is the point — a voice that reads someone else's answer anchors to it, and
+you get contagion that looks like consensus.
+
+Roster and attendance come from `departments.yml`. Six departments, each a pair holding
+opposed priors: `fe-architect` against `fe-shipper`, `be-architect` against `be-pragmatist`,
+`infra-reliability` against `infra-cost`, `product-manager` against `product-analyst`,
+`ux-designer` against `ux-reasoner`, and `reviewer` against `skeptic`.
+
+Two departments, four voices, is the normal size. `--full` puts twelve in the room and is
+only for when you ask for it by name.
+
+A voice that fails to answer is reported, never dropped from the tally.
+
+### `/hyperpower:standup`
+
+The same roster, but the voices read each other and respond in rounds. Round one is
+independent; round two gives each voice every other position and asks it to answer the
+strongest argument against itself. Then one synthesis.
+
+Two rounds, never three — a third produces restatement at full price. Roughly twice the cost
+of a council.
+
+Use it when the answer turns on how two concerns trade against each other. Use `council`
+when you want independent reads.
+
+| Room | Voices | Council calls | Standup calls |
+|---|---|---|---|
+| one department | 2 | ~3 | ~5 |
+| two departments | 4 | ~5 | ~9 |
+| `--full` | 12 | ~13 | ~25 |
+
+Neither writes a decision record until you accept a recommendation. A recommendation is not
+a decision.
 
 ## Quality
 

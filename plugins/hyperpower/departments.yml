@@ -1,0 +1,82 @@
+# hyperpower departments.
+#
+# The roster /hyperpower:council and /hyperpower:standup draw from. Each department is a
+# pair holding opposed priors, because two agents with the same prior produce the same
+# answer and a room of those is an echo, not a debate.
+#
+# Quality is the proof the shape works: reviewer finds defects, skeptic tries to refute
+# them, and the disagreement is the product.
+#
+# voices maps an agent name to the thing it argues for. Spawn it as hyperpower:<name>.
+
+version: 1
+
+departments:
+
+  frontend:
+    topic: components, state, types, design-system fit, what to cut
+    voices:
+      fe-architect: the code someone maintains in a year
+      fe-shipper: a user seeing this sooner
+
+  backend:
+    topic: schema, boundaries, transactions, migrations, service shape
+    voices:
+      be-architect: data still correct after the third incident
+      be-pragmatist: the smallest thing that is actually correct
+
+  infra:
+    topic: deploys, rollback, observability, dependencies, recurring spend
+    voices:
+      infra-reliability: being able to undo this at 3am
+      infra-cost: the bill that arrives every month
+
+  product:
+    topic: whether to build it, how much, what it displaces
+    voices:
+      product-manager: the version that reaches a user soonest
+      product-analyst: finding out before building
+
+  design:
+    topic: flows, states, affordances, cognitive load
+    voices:
+      ux-designer: the flow a user actually walks
+      ux-reasoner: the version that asks least of the user
+
+  quality:
+    topic: defects in a diff, and whether a finding survives scrutiny
+    voices:
+      reviewer: finding what is broken
+      skeptic: refuting what was found
+
+# Which departments attend. Route on what the question is about, never all of them by
+# default - twelve voices on a two-department question is spend with no extra signal.
+#
+# A department attends when the question would change its work. When two fit, take both.
+attendance:
+  storage_and_shape:
+    when: schema, storage, queue, API shape, migration, backend performance
+    departments: [backend, infra]
+  screen_and_client:
+    when: component, screen behaviour, client state, bundle, frontend performance
+    departments: [frontend, design]
+  ship_and_operate:
+    when: deploy, rollback, monitoring, a new dependency, infrastructure spend
+    departments: [infra, backend]
+  whether_to_build:
+    when: whether to build it at all, scope, priority, what it displaces
+    departments: [product, design]
+  the_experience:
+    when: a screen is confusing, a flow is long, copy, empty and error states
+    departments: [design, product]
+  the_diff:
+    when: a defect in a diff, or whether a finding is real
+    departments: [quality]
+  nothing_else_fits:
+    when: the question spans the product end to end, or nothing above matches
+    departments: [product, frontend, backend]
+    note: six voices. Say why the full room was not called.
+
+# Everyone. Only when the human asks for it by name - twelve voices plus a synthesis is
+# the most expensive call in the harness.
+full_room: [product, design, frontend, backend, infra, quality]

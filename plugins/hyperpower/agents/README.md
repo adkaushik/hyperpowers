@@ -17,6 +17,29 @@ not when a name would be nice.
 | `promoter.md` | `promoter` | `hyperpower:promoter` | haiku | Promote repeat failures into `CODEBASE_RULEBOOK.md` |
 | `gardener.md` | `gardener` | `hyperpower:gardener` | sonnet | Compact the decision archive on `/hyperpower:gc` |
 
+### Departments
+
+Pairs holding opposed priors. Two voices with the same prior produce one answer twice, so
+each pair is defined by what it argues *against*. `/hyperpower:council` counts them;
+`/hyperpower:standup` lets them read each other and respond. Roster and attendance live in
+`departments.yml`.
+
+| File | Frontmatter `name` | Spawn as | Model | Argues for |
+|---|---|---|---|---|
+| `fe-architect.md` | `fe-architect` | `hyperpower:fe-architect` | inherit | The code someone maintains in a year |
+| `fe-shipper.md` | `fe-shipper` | `hyperpower:fe-shipper` | inherit | A user seeing this sooner |
+| `be-architect.md` | `be-architect` | `hyperpower:be-architect` | inherit | Data still correct after the third incident |
+| `be-pragmatist.md` | `be-pragmatist` | `hyperpower:be-pragmatist` | inherit | The smallest thing that is actually correct |
+| `infra-reliability.md` | `infra-reliability` | `hyperpower:infra-reliability` | inherit | Being able to undo this at 3am |
+| `infra-cost.md` | `infra-cost` | `hyperpower:infra-cost` | inherit | The bill that arrives every month |
+| `product-manager.md` | `product-manager` | `hyperpower:product-manager` | inherit | The version that reaches a user soonest |
+| `product-analyst.md` | `product-analyst` | `hyperpower:product-analyst` | inherit | Finding out before building |
+| `ux-designer.md` | `ux-designer` | `hyperpower:ux-designer` | inherit | The flow a user actually walks |
+| `ux-reasoner.md` | `ux-reasoner` | `hyperpower:ux-reasoner` | inherit | The version that asks least of the user |
+
+`reviewer` and `skeptic` above are the sixth pair. They already worked this way before the
+departments existed, and they are the reason the shape is worth repeating.
+
 The frontmatter `name` is the bare role. The plugin supplies the namespace, so every caller
 spawns `hyperpower:<name>`. Never spawn a bare `reviewer`: that resolves to a same-named
 agent in the user's own `~/.claude/agents/`, which does not know this contract and returns
