@@ -1,6 +1,6 @@
 ---
 name: review
-description: Partition the current diff into coherent slices, run one hyperpower:reviewer per slice, then send one hyperpower:skeptic at every finding. Reports CONFIRMED and PLAUSIBLE findings, ranked and never capped in the contract. A PLAUSIBLE finding is never dropped for want of a reproduction. Use /hyperpower:review.
+description: Review a pull request by URL or number, or the current diff. Partition it into coherent slices, run one hyperpower:reviewer per slice, then send one hyperpower:skeptic at every finding. Reports CONFIRMED and PLAUSIBLE findings, ranked and never capped in the contract. A PLAUSIBLE finding is never dropped for want of a reproduction. Use /hyperpower:review.
 ---
 
 # Review
@@ -16,6 +16,70 @@ About four minutes on a ten-file diff. Reviewers run in parallel, then skeptics 
 Every changed file lands in exactly one slice, or in `left_out` with a reason. A file in neither is a partition bug.
 
 Count the changed files before dispatch. Count the files across all slices plus `left_out` after. The two numbers must match. If they do not, fix the partition before spawning anything.
+
+## Step 0 - a pull request, or the working tree
+
+With an argument that looks like a pull request - a URL, `owner/repo#123`, or a number -
+resolve it first:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hp-pr <ref> --json
+```
+
+It fetches the PR head into a throwaway worktree and returns `worktree`, `diff_command`,
+`files_command`, plus title, author, state and base branch. **Your checkout is never
+touched** - no branch switch, no stash. Say that, because a reviewer who thinks their work
+is about to be clobbered will not run this.
+
+Then use its output in place of the local git commands in step 1:
+
+| Step 1 wants | Use instead |
+|---|---|
+| changed files | the `files_command` it returned |
+| the diff | the `diff_command` it returned |
+| surrounding code | read real files under `worktree` |
+
+**Read the surrounding code, not only the hunks.** That is what the worktree is for. A hunk
+that looks wrong is often fine three lines above the window, and one that looks fine breaks
+a caller the diff never shows. A review of hunks alone finds typos and misses bugs.
+
+`hp-pr` uses `gh pr diff` rather than a git range on purpose. A merged PR's head is already
+an ancestor of its base, so `origin/base...HEAD` is empty for every PR that landed - which
+is most of the ones worth reviewing after the fact.
+
+Exit 78 means `gh` is missing or not logged in: say `gh auth login` and stop. Exit 1 means
+no such PR.
+
+Report the PR before reviewing:
+
+```
+PR #11127  feat: migrate AdvanceModal to SimpleDialog part-2
+  MERGED by marvinswastik  ·  18 files, +597 -370
+```
+
+State matters. A draft gets a lighter touch. A merged PR is being read after the fact, so a
+finding is a follow-up rather than a blocker - say which.
+
+There is no run journal for someone else's PR. Use `run_id: null`, print the report, and do
+not create a run folder.
+
+When you are done, offer the cleanup rather than doing it:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/hp-pr <number> --clean
+```
+
+The worktree is how the human looks at the code you cited. Removing it silently takes the
+evidence away.
+
+## Also look for slop on a PR
+
+On a pull request, add one pass for what a model leaves behind - placeholders, deferrals,
+stubs, swallowed exceptions, comments restating the line, and a helper duplicating one that
+already exists. `/hyperpower:humanize` owns this in depth; here, report it inline with the
+defects and mark it `slop` so it is not confused with a bug.
+
+Nobody reviewing a PR wants two commands to find out it is full of `TODO`.
 
 ## Step 1 - resolve the diff and the run
 

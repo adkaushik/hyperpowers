@@ -335,10 +335,33 @@ invented helpers that duplicate existing ones.
 
 ### `/hyperpower:review`
 
-Partition the diff into coherent slices, review each, then send a skeptic at every finding.
+Review a pull request, or the current diff.
 
-Findings come back as CONFIRMED (traced end to end) or PLAUSIBLE (undecidable from the code
-alone). PLAUSIBLE findings are never dropped for want of a reproduction.
+```
+/hyperpower:review https://github.com/owner/repo/pull/123
+/hyperpower:review owner/repo#123
+/hyperpower:review 123
+/hyperpower:review                      the working tree
+```
+
+A PR is fetched into a throwaway worktree under the state directory. **Your checkout is
+never touched** — no branch switch, no stash. Clean it up with
+`hp-pr <number> --clean` when you are done; it is not removed automatically, because that
+worktree is how you look at the code the review cited.
+
+The diff comes from `gh pr diff`, not a git range. A merged PR's head is already an
+ancestor of its base, so `origin/base...HEAD` is empty for every PR that landed — which is
+most of the ones worth reviewing after the fact.
+
+The reviewer reads the surrounding code from the worktree, not only the hunks. A hunk that
+looks wrong is often fine three lines above the window, and one that looks fine breaks a
+caller the diff never shows.
+
+Then the usual shape: partition into slices, one reviewer per slice, one skeptic per
+finding. CONFIRMED and PLAUSIBLE are both reported, and PLAUSIBLE is never dropped for want
+of a reproduction. On a PR it also reports slop inline, marked as such.
+
+Needs `gh` installed and logged in. Exit 78 says so.
 
 ### `/hyperpower:eval`
 
@@ -494,6 +517,12 @@ Backs `/hyperpower:visualize`.
 
 Reads the run journal and reports the harness environment plus any run in progress.
 Standard library only, read only. Backs `/hyperpower:status`.
+
+### `hp-pr`
+
+Resolves a PR URL, `owner/repo#123`, or a number into a throwaway worktree plus metadata,
+and prints the commands that read its diff. `--clean` removes the worktree and the ref.
+Backs the PR target on `/hyperpower:review`.
 
 ### `hp-selfcheck`
 

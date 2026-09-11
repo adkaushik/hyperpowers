@@ -62,6 +62,7 @@ SLOP_ALLOWLIST = (
     ("docs/gates.md", "Catches placeholders"),
     ("plugins/hyperpower/skills/humanize/SKILL.md", "left behind"),
     ("docs/commands.md", "placeholders, deferrals, hedging"),
+    ("plugins/hyperpower/skills/review/SKILL.md", "it is full of"),
 )
 
 # Top-level keys in the hyperpower.yml schema. Used to find config references in text.

@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Resolve a pull request into something reviewable, without touching your working tree.
+
+A diff on its own is a weak thing to review. A hunk that looks wrong may be fine three
+lines above the window, and a hunk that looks fine may break a caller the diff never shows.
+So this fetches the PR head into a throwaway git worktree and reports where it landed -
+the reviewer then reads real files at the real ref.
+
+Your checkout is never modified. No branch is switched, nothing is stashed, and the
+worktree is removed by --clean when you are done.
+
+Exit 0 resolved. 1 no such PR. 2 bad input. 78 gh is missing or not logged in.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+EXIT_OK = 0
+EXIT_NO_PR = 1
+EXIT_ERROR = 2
+EXIT_NO_TOOL = 78
+
+# https://github.com/owner/repo/pull/123  |  owner/repo#123  |  123
+URL_RE = re.compile(r"github\.com/([\w.\-]+)/([\w.\-]+)/pull/(\d+)")
+SHORT_RE = re.compile(r"^([\w.\-]+)/([\w.\-]+)#(\d+)$")
+NUM_RE = re.compile(r"^#?(\d+)$")
+
+_CONFIG_MODULE = []
+
+
+def die(message, code=EXIT_ERROR):
+    sys.stderr.write("hp-pr: %s\n" % message)
+    raise SystemExit(code)
+
+
+def run(args, cwd=None, check=False):
+    try:
+        done = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=180)
+    except FileNotFoundError:
+        die("%s is not installed." % args[0], EXIT_NO_TOOL)
+    except subprocess.SubprocessError as exc:
+        die("%s failed: %s" % (args[0], exc))
+    if check and done.returncode != 0:
+        detail = (done.stderr or b"").decode("utf-8", "replace").strip()
+        die("%s exited %d: %s" % (" ".join(args[:2]), done.returncode, detail[:300]))
+    return done
+
+
+def load_config_module():
+    if _CONFIG_MODULE:
+        return _CONFIG_MODULE[0]
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    loader = importlib.machinery.SourceFileLoader("hp_config", path)
+    spec = importlib.util.spec_from_loader("hp_config", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _CONFIG_MODULE.append(module)
+    return module
+
+
+def state_root(root):
+    try:
+        cfg = load_config_module()
+        loaded = cfg.load(root)
+        return cfg.state_dir(root, loaded["config"])
+    except Exception:
+        return os.path.join(root, ".hyperpower")
+
+
+def repo_root(start=None):
+    done = run(["git", "rev-parse", "--show-toplevel"], cwd=start or os.getcwd())
+    if done.returncode != 0:
+        die("not inside a git repository.", EXIT_ERROR)
+    return done.stdout.decode("utf-8", "replace").strip()
+
+
+def parse_ref(raw):
+    """Accept a URL, owner/repo#123, or a bare number."""
+    raw = (raw or "").strip()
+    match = URL_RE.search(raw)
+    if match:
+        return match.group(1), match.group(2), int(match.group(3))
+    match = SHORT_RE.match(raw)
+    if match:
+        return match.group(1), match.group(2), int(match.group(3))
+    match = NUM_RE.match(raw)
+    if match:
+        return None, None, int(match.group(1))
+    die("cannot read %r as a pull request. Give a URL, owner/repo#123, or a number." % raw)
+
+
+def gh_ready():
+    done = run(["gh", "auth", "status"])
+    if done.returncode != 0:
+        die("gh is installed but not logged in. Run: gh auth login", EXIT_NO_TOOL)
+
+
+def origin_slug(root):
+    done = run(["git", "remote", "get-url", "origin"], cwd=root)
+    if done.returncode != 0:
+        return None
+    url = done.stdout.decode("utf-8", "replace").strip()
+    match = re.search(r"[:/]([\w.\-]+)/([\w.\-]+?)(?:\.git)?$", url)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def fetch_pr(root, owner, repo, number):
+    """Metadata from gh, then the head ref into the local object store."""
+    args = ["gh", "pr", "view", str(number), "--json",
+            "number,title,author,baseRefName,headRefName,headRefOid,url,"
+            "changedFiles,additions,deletions,state,isDraft,body"]
+    if owner and repo:
+        args += ["--repo", "%s/%s" % (owner, repo)]
+    done = run(args, cwd=root)
+    if done.returncode != 0:
+        detail = (done.stderr or b"").decode("utf-8", "replace").strip()
+        if "not find" in detail.lower() or "no pull requests" in detail.lower():
+            die("no pull request %s in %s." % (number, "%s/%s" % (owner, repo)
+                                               if owner else "this repo"), EXIT_NO_PR)
+        die("gh could not read the pull request: %s" % detail[:300], EXIT_NO_PR)
+    meta = json.loads(done.stdout.decode("utf-8", "replace"))
+
+    # pull/N/head exists on the remote for every PR, including from a fork, so this
+    # works without adding the fork as a remote.
+    run(["git", "fetch", "--quiet", "origin",
+         "pull/%d/head:refs/hyperpower/pr-%d" % (number, number)],
+        cwd=root, check=True)
+    return meta
+
+
+def make_worktree(root, number, force):
+    path = os.path.join(state_root(root), "pr", str(number))
+    if os.path.isdir(path):
+        if not force:
+            return path, False
+        run(["git", "worktree", "remove", "--force", path], cwd=root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    run(["git", "worktree", "add", "--quiet", "--detach", path,
+         "refs/hyperpower/pr-%d" % number], cwd=root, check=True)
+    return path, True
+
+
+def clean(root, number):
+    removed = []
+    if number is None:
+        base = os.path.join(state_root(root), "pr")
+        numbers = sorted(os.listdir(base)) if os.path.isdir(base) else []
+    else:
+        numbers = [str(number)]
+    for name in numbers:
+        path = os.path.join(state_root(root), "pr", name)
+        if os.path.isdir(path):
+            run(["git", "worktree", "remove", "--force", path], cwd=root)
+            removed.append(path)
+        run(["git", "update-ref", "-d", "refs/hyperpower/pr-%s" % name], cwd=root)
+    return removed
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="hp-pr", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("ref", nargs="?", help="PR URL, owner/repo#123, or a number")
+    ap.add_argument("--root", default=None, help="repo root. Default: the git top level.")
+    ap.add_argument("--clean", action="store_true",
+                    help="remove the worktree for this PR, or all of them with no ref")
+    ap.add_argument("--force", action="store_true",
+                    help="refetch even when a worktree for this PR already exists")
+    ap.add_argument("--json", action="store_true", help="machine-readable")
+    args = ap.parse_args(argv)
+
+    root = os.path.abspath(args.root) if args.root else repo_root()
+
+    if args.clean:
+        number = None
+        if args.ref:
+            _, _, number = parse_ref(args.ref)
+        removed = clean(root, number)
+        sys.stdout.write("hp-pr: removed %d worktree%s\n"
+                         % (len(removed), "" if len(removed) == 1 else "s"))
+        return EXIT_OK
+
+    if not args.ref:
+        die("give a pull request: a URL, owner/repo#123, or a number.")
+
+    gh_ready()
+    owner, repo, number = parse_ref(args.ref)
+
+    local = origin_slug(root)
+    if owner and local and (owner, repo) != local:
+        die("that PR is in %s/%s but this checkout is %s/%s. Run this from the other "
+            "repo - a worktree can only be made from the repository that owns the ref."
+            % (owner, repo, local[0], local[1]))
+
+    meta = fetch_pr(root, owner, repo, number)
+    path, fresh = make_worktree(root, number, args.force)
+    scope = " --repo %s/%s" % (owner, repo) if owner and repo else ""
+
+    payload = {
+        "number": meta["number"],
+        "title": meta["title"],
+        "author": (meta.get("author") or {}).get("login"),
+        "state": meta.get("state"),
+        "draft": meta.get("isDraft"),
+        "url": meta.get("url"),
+        "base": meta["baseRefName"],
+        "head": meta["headRefName"],
+        "head_sha": meta["headRefOid"],
+        "changed_files": meta.get("changedFiles"),
+        "additions": meta.get("additions"),
+        "deletions": meta.get("deletions"),
+        "worktree": path,
+        "fetched": fresh,
+        # gh, not a git range. A merged PR's head is already an ancestor of its base,
+        # so origin/base...HEAD is empty for every PR that landed - which is most of the
+        # ones worth reviewing after the fact. gh returns the stored diff either way.
+        "diff_command": "gh pr diff %d%s" % (number, scope),
+        "files_command": "gh pr diff %d%s --name-only" % (number, scope),
+    }
+
+    if args.json:
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+        return EXIT_OK
+
+    sys.stdout.write(
+        "PR #%d  %s\n"
+        "  %s by %s  ·  %s%s\n"
+        "  %s -> %s  ·  %s files, +%s -%s\n"
+        "  worktree  %s%s\n"
+        "  diff      %s\n"
+        "  files     %s\n"
+        % (payload["number"], payload["title"],
+           payload["state"], payload["author"], payload["url"],
+           "  (draft)" if payload["draft"] else "",
+           payload["head"], payload["base"],
+           payload["changed_files"], payload["additions"], payload["deletions"],
+           path, "" if fresh else "  (reused, --force to refetch)",
+           payload["diff_command"], payload["files_command"]))
+    sys.stderr.write("hp-pr: your working tree was not touched. "
+                     "Remove the worktree with: hp-pr %d --clean\n" % number)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(EXIT_ERROR)
