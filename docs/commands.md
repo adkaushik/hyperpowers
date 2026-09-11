@@ -1,6 +1,6 @@
 # Commands
 
-Twenty-four commands in six groups. Everything is namespaced `hyperpower:`, so nothing
+Twenty-five commands in six groups. Everything is namespaced `hyperpower:`, so nothing
 collides with commands you already have.
 
 ## Setup
@@ -285,6 +285,31 @@ Neither writes a decision record until you accept a recommendation. A recommenda
 a decision.
 
 ## Quality
+
+### `/hyperpower:humanize`
+
+Find the marks a model leaves on code and take them out. Standalone and self-sufficient —
+this is the one to type. `sweep` is the pipeline-internal version and assumes the slop gate
+already ran.
+
+Three passes:
+
+1. **Slop code** — placeholders, deferrals, hedging, stubs, dead paths, over-abstraction,
+   wrong-fit code, swallowed exceptions, invented helpers. Reports findings and a plan.
+   Applies nothing.
+2. **Slop comments** — enforces *this repo's* comment rule, read from
+   `CODEBASE_RULEBOOK.md`, then `CLAUDE.md`, then `.claude/rules/`. The only pass that
+   edits, and only after showing a sample and getting a yes. Never deletes a comment
+   explaining why.
+3. **Repeated code** — blocks appearing three or more times, parallel functions, copy-paste
+   with one edit. Recommends collapsing only when the copies change together. Two copies is
+   a coincidence, not a pattern.
+
+Scope is the current diff by default. A path narrows it, `--all` takes the repo.
+
+It checks for `antislop`, `ai-slop-detector` and `jscpd` first and says which are present.
+With none installed it covers their classes itself and reports the findings as a model's
+reading rather than a linter's — a weaker claim, stated as one.
 
 ### `/hyperpower:sweep`
 

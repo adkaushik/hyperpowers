@@ -56,7 +56,13 @@ SLOP_MARKERS = tuple("".join(parts) for parts in (("TO", "DO"), ("FIX", "ME"), (
 # Descriptive prose that names the markers instead of deferring work. One entry per
 # allowed line: the repo-relative path, and a substring that must appear on that line.
 # A marker anywhere else is a finding.
-SLOP_ALLOWLIST = (("docs/gates.md", "Catches placeholders"),)
+# (path, needle). The needle must sit on the same line as the marker, so a file that
+# documents what a marker looks like is exempt only on that exact line - not wholesale.
+SLOP_ALLOWLIST = (
+    ("docs/gates.md", "Catches placeholders"),
+    ("plugins/hyperpower/skills/humanize/SKILL.md", "left behind"),
+    ("docs/commands.md", "placeholders, deferrals, hedging"),
+)
 
 # Top-level keys in the hyperpower.yml schema. Used to find config references in text.
 CONFIG_ROOTS = (
