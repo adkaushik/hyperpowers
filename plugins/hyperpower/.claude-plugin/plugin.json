@@ -1,6 +1,6 @@
 {
   "name": "hyperpower",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Agentic development harness. Runs a requirement through a gated pipeline, records what it decided and assumed, and learns from repeated mistakes without adding cost to a normal run.",
   "author": {
     "name": "Kaushik",

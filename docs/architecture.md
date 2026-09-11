@@ -229,7 +229,7 @@ nothing in the output shows it.
 | `hp-validate` | checks a stage contract against `schemas/<stage>.json` | 0 valid, 1 invalid, 2 usage, 78 no schema |
 | `hp-gates` | runs every enabled gate and records the aggregate | 0 all blocking passed, 1 blocking failure, 78 blocking gate could not run, 2 hp-gates could not run |
 | `hp-redact` | hashes file paths in run records before they reach an aggregate view | 0 emitted, 1 bad input, 2 usage |
-| `hp-selfcheck` | checks the plugin against its own documentation, 13 checks | 0 clean, 1 findings |
+| `hp-selfcheck` | checks the plugin against its own documentation, 14 checks | 0 clean, 1 findings |
 
 `hp-redact` is the one read-side script. It changes nothing on disk: records go in on
 stdin, the same shape comes out with each path replaced by `path:<8 hex>`, salted from a

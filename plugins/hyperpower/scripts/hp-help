@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""Every hyperpower command, in plain language, grouped by when you would reach for it.
+
+The entries live in this file, but the command list comes from the skills directory on
+disk. A command with no entry, or an entry with no command, is reported rather than
+silently omitted - a help page that quietly drops a command is worse than none, and this
+one has drifted twice already.
+
+Exit 0 printed. 1 the help table and the skills directory disagree. 2 bad input.
+"""
+
+import argparse
+import os
+import sys
+
+EXIT_OK = 0
+EXIT_DRIFT = 1
+EXIT_ERROR = 2
+
+PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SKILLS = os.path.join(PLUGIN, "skills")
+
+# name: (what it does, when you would type it, an example)
+# "when" answers the only question a help page needs to answer.
+ENTRIES = {
+    # ---------------------------------------------------------------- setting up
+    "help": (
+        "This list",
+        "Any time. It reads the skills on disk, so it cannot go stale.",
+        "/hyperpower:help run"),
+    "init": (
+        "Sets hyperpower up in this repo",
+        "Once, the first time. Nothing else works properly until it has run.",
+        "/hyperpower:init"),
+    "doctor": (
+        "Checks every gate still runs, and says what is broken",
+        "After changing config, upgrading dependencies, or moving machine.",
+        "/hyperpower:doctor"),
+    "config": (
+        "Shows the settings in effect and which file each came from",
+        "When a setting is not doing what you expected.",
+        "/hyperpower:config"),
+    "paths": (
+        "Shows or sets the directories the harness is allowed to edit",
+        "When it touched something it should not have, or cannot touch something it should.",
+        "/hyperpower:paths frontend/ packages/core/"),
+
+    # ---------------------------------------------------------------- doing work
+    "route": (
+        "Says what it would do and how long, then stops",
+        "Before any big request. Costs nothing and shows the plan before you pay for it.",
+        '/hyperpower:route "add rate limiting to login"'),
+    "run": (
+        "Drives one requirement to the end through the whole pipeline",
+        "When you want the work done with gates, review and a record of what happened.",
+        '/hyperpower:run "add rate limiting to login"'),
+    "review": (
+        "Reviews the current diff, then tries to disprove every finding",
+        "Before merging anything spanning more than one file or subsystem.",
+        "/hyperpower:review"),
+    "humanize": (
+        "Finds the marks a model left on the code and proposes removing them",
+        "After a long session of AI-written code. Three passes: slop, comments, repetition.",
+        "/hyperpower:humanize"),
+    "sweep": (
+        "The slop pass that runs inside a pipeline run",
+        "Rarely by hand. Type humanize instead - it is the standalone one.",
+        "/hyperpower:sweep"),
+
+    # ------------------------------------------------------- what actually happened
+    "status": (
+        "Whether the harness is on here, and what a running job is doing",
+        "When you are not sure it is working, or you want to watch a run in progress.",
+        "/hyperpower:status --watch 10"),
+    "why": (
+        "What a run decided, and what it assumed",
+        "After any run. The refuted assumptions are where it guessed wrong and shipped anyway.",
+        "/hyperpower:why 4f2a --assumptions"),
+    "visualize": (
+        "An HTML report of everything the agents did this session",
+        "After the work, when you want to see where the time and money went.",
+        "/hyperpower:visualize"),
+    "usage": (
+        "Pass rates, retry counts, which gates keep failing",
+        "Every week or so. Rising retries mean the rulebook has drifted from the code.",
+        "/hyperpower:usage --since 7d"),
+    "cost": (
+        "What it spent, by stage, agent, model or run",
+        "When the bill surprises you, or before turning something expensive on.",
+        "/hyperpower:cost --by stage"),
+
+    # ------------------------------------------------------------- going back
+    "resume": (
+        "Re-runs a job from any step, after checking what changed underneath",
+        "When you fixed something by hand and do not want to start over.",
+        "/hyperpower:resume 4f2a --from gates"),
+    "correct": (
+        "Corrects something a run assumed wrongly, optionally forever",
+        "When it guessed wrong about your code and you do not want to retype it monthly.",
+        '/hyperpower:correct 4f2a plan a1 "the store is Redis-backed" --scope forever'),
+
+    # ----------------------------------------------------------- asking the team
+    "council": (
+        "Puts a question to the relevant experts and counts their independent votes",
+        "A decision that is expensive to reverse. No voice sees another, so no echo.",
+        '/hyperpower:council "should limiter state move to Redis"'),
+    "standup": (
+        "The same experts, but arguing with each other over two rounds",
+        "When the answer depends on a tradeoff nobody has settled. Twice the cost of council.",
+        '/hyperpower:standup "should limiter state move to Redis"'),
+
+    # --------------------------------------------------------- notes it keeps
+    "scout": (
+        "Logs things worth doing that were not in scope",
+        "After finishing something. Every entry has to cite evidence, so the list stays honest.",
+        "/hyperpower:scout"),
+    "janitor": (
+        "Logs outdated dependencies and files still on an old pattern",
+        "Every couple of weeks. Read-only, and it never installs anything.",
+        "/hyperpower:janitor"),
+    "decisions": (
+        "Searches the record of what was decided here and why",
+        "When you are about to re-argue something. Costs nothing until you ask.",
+        '/hyperpower:decisions "rate limiting"'),
+    "rules": (
+        "Shows the rules every run reads, and what was added recently",
+        "When it keeps doing something you did not ask for, or before raising the rule cap.",
+        "/hyperpower:rules --recent"),
+    "gc": (
+        "Tidies the decision record without deleting history",
+        "Occasionally, when the archive has grown noisy.",
+        "/hyperpower:gc"),
+
+    # ------------------------------------------------------------ maintenance
+    "eval": (
+        "Scores a change to the harness itself before it ships",
+        "Only when editing hyperpower's own prompts. Stops it getting quietly worse.",
+        "/hyperpower:eval"),
+    "telemetry": (
+        "What is recorded locally, and deleting it",
+        "When you want to know what is on disk, or want it gone. Nothing is ever uploaded.",
+        "/hyperpower:telemetry purge"),
+}
+
+GROUPS = (
+    ("Setting up", "Run these once, or when something breaks",
+     ["help", "init", "doctor", "config", "paths"]),
+    ("Getting work done", "The ones you type most",
+     ["route", "run", "review", "humanize", "sweep"]),
+    ("What actually happened", "Because a model saying 'done' is not evidence",
+     ["status", "why", "visualize", "usage", "cost"]),
+    ("Going back", "When something needs redoing, not restarting",
+     ["resume", "correct"]),
+    ("Asking the team", "Twelve specialists in six pairs, each pair arguing opposite sides",
+     ["council", "standup"]),
+    ("Notes it keeps for you", "Written in the background, read only when you ask",
+     ["scout", "janitor", "decisions", "rules", "gc"]),
+    ("Maintenance", "Rarely",
+     ["eval", "telemetry"]),
+)
+
+START_HERE = ("route", "run", "why")
+
+
+def installed_commands():
+    if not os.path.isdir(SKILLS):
+        return set()
+    return {
+        name for name in os.listdir(SKILLS)
+        if os.path.isfile(os.path.join(SKILLS, name, "SKILL.md"))
+    }
+
+
+def check_drift():
+    """A help page that quietly drops a command is worse than no help page."""
+    on_disk = installed_commands()
+    documented = set(ENTRIES)
+    grouped = {name for _, _, names in GROUPS for name in names}
+    problems = []
+    for name in sorted(on_disk - documented):
+        problems.append("/hyperpower:%s exists but has no help entry" % name)
+    for name in sorted(documented - on_disk):
+        problems.append("help describes /hyperpower:%s, which is not installed" % name)
+    for name in sorted(documented - grouped):
+        problems.append("/hyperpower:%s has an entry but is in no group" % name)
+    return problems
+
+
+def render(only=None, verbose=False):
+    out = []
+    total = len(ENTRIES)
+    out.append("hyperpower  %d commands. Everything below is typed into Claude Code." % total)
+    out.append("")
+
+    if not only:
+        out.append("If you learn three, learn these")
+        for name in START_HERE:
+            what, _, _ = ENTRIES[name]
+            out.append("  %-24s %s" % ("/hyperpower:" + name, what.lower()))
+        out.append("")
+        out.append("  route first, always. It tells you what a request will cost")
+        out.append("  before you pay for it, and it writes nothing.")
+        out.append("")
+
+    for title, blurb, names in GROUPS:
+        shown = [n for n in names if not only or only in n]
+        if not shown:
+            continue
+        out.append(title)
+        out.append("  %s" % blurb)
+        out.append("")
+        for name in shown:
+            what, when, example = ENTRIES[name]
+            out.append("  /hyperpower:%s" % name)
+            out.append("      %s" % what)
+            out.append("      %s" % when)
+            if verbose or only:
+                out.append("      e.g.  %s" % example)
+            out.append("")
+
+    if not only and not verbose:
+        out.append("Add --verbose for an example of each, or name one:")
+        out.append("  hp-help run")
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="hp-help", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", nargs="?",
+                    help="show one command, or a fragment matching several")
+    ap.add_argument("--verbose", action="store_true", help="include an example for each")
+    ap.add_argument("--check", action="store_true",
+                    help="only report drift between this table and the skills on disk")
+    args = ap.parse_args(argv)
+
+    problems = check_drift()
+
+    if args.check:
+        for line in problems:
+            sys.stdout.write("hp-help: %s\n" % line)
+        sys.stdout.write("hp-help: %d commands, %d problems\n" % (len(ENTRIES), len(problems)))
+        return EXIT_DRIFT if problems else EXIT_OK
+
+    only = args.command.lstrip("/").replace("hyperpower:", "") if args.command else None
+    if only and not any(only in name for name in ENTRIES):
+        sys.stderr.write(
+            "hp-help: no command matching %r. Run hp-help with no argument for the list.\n"
+            % only)
+        return EXIT_ERROR
+
+    sys.stdout.write("\n".join(render(only, args.verbose)) + "\n")
+
+    # Drift is a warning here, not a failure - the user asked for help, so give them help
+    # and say what is missing rather than refusing.
+    for line in problems:
+        sys.stderr.write("hp-help: %s\n" % line)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(EXIT_ERROR)

@@ -1509,6 +1509,37 @@ def check_task_classes(repo):
     return findings
 
 
+def check_help_entries(repo):
+    """14. hp-help documents every installed command, and no command it does not."""
+    findings = []
+    helper = os.path.join(repo.plugin, "scripts", "hp-help")
+    if not os.path.isfile(helper):
+        return [Finding("help-entries", repo.rel(helper), 1,
+                        "scripts/hp-help is missing. Reinstall the plugin.",
+                        fix="restore scripts/hp-help")]
+    try:
+        done = subprocess.run(
+            [sys.executable, helper, "--check"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [Finding("help-entries", repo.rel(helper), 1,
+                        "could not run hp-help --check: %s" % exc,
+                        fix="run it by hand and read the error")]
+    if done.returncode == 0:
+        return findings
+    for line in (done.stdout or b"").decode("utf-8", "replace").split("\n"):
+        line = line.strip()
+        if not line or line.startswith("hp-help: ") is False:
+            continue
+        body = line[len("hp-help: "):]
+        if body.endswith("problems") or body.endswith("problem"):
+            continue
+        findings.append(Finding(
+            "help-entries", repo.rel(helper), 1, body,
+            fix="add or remove the entry in the ENTRIES table in scripts/hp-help"))
+    return findings
+
+
 # ------------------------------------------------------------------ runner
 
 
@@ -1526,6 +1557,7 @@ CHECKS = (
     ("gate-orphan", "11. every gate script has a schema entry"),
     ("agents-index", "12. agents/README.md indexes every agent file"),
     ("task-classes", "13. task-classes.yml, route.json and plan.json name the same classes"),
+    ("help-entries", "14. hp-help documents every installed command and no others"),
 )
 
 # Checks --fix can repair. A finding carries its own repair or none. These are the only
@@ -1606,6 +1638,8 @@ def run_checks(repo, only=None):
         findings.extend(check_agents_index(repo))
     if wanted("task-classes"):
         findings.extend(check_task_classes(repo))
+    if wanted("help-entries"):
+        findings.extend(check_help_entries(repo))
 
     findings.sort(key=lambda f: (f.path, f.line, f.check, f.message))
     return findings

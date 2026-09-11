@@ -365,9 +365,10 @@ becomes your priority order for free.
 
 ## Commands
 
-Twenty-five commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
+Twenty-six commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
 
 ```
+/hyperpower:help            every command, plain language, grouped by when
 /hyperpower:init            set up this repo
 /hyperpower:doctor          check what is broken
 /hyperpower:run "<req>"     drive one requirement to the end

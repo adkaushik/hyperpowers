@@ -1,9 +1,25 @@
 # Commands
 
-Twenty-five commands in six groups. Everything is namespaced `hyperpower:`, so nothing
+Twenty-six commands in six groups. Everything is namespaced `hyperpower:`, so nothing
 collides with commands you already have.
 
 ## Setup
+
+### `/hyperpower:help`
+
+Every command in plain language, grouped by when you would reach for it rather than by
+internals. Opens with the three worth learning first.
+
+| Argument | Gives |
+|---|---|
+| none | all of them, grouped, with what and when |
+| `<command>` | one, with an example. A fragment matches several. |
+| `--verbose` | every command with its example |
+| `--check` | only drift between the help table and the skills on disk |
+
+The wording lives in one table in `scripts/hp-help`, but the command list is read from the
+skills directory at runtime. A command with no entry, or an entry with no command, is
+reported rather than silently omitted — selfcheck 14 fails on either.
 
 ### `/hyperpower:init`
 
