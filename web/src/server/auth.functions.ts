@@ -67,10 +67,10 @@ export const requestLoginCode = createServerFn({ method: 'POST' })
         'Too many codes requested for this address. Try again in 15 minutes.',
       )
     }
-    if (
-      meta.requestIp &&
-      countRecent('request_ip', meta.requestIp) >= MAX_CODES_PER_IP_PER_WINDOW
-    ) {
+    // Without a trusted address every visitor shares one bucket, so the limit
+    // still holds when the proxy header is missing.
+    const ipKey = meta.requestIp ?? 'unknown'
+    if (countRecent('request_ip', ipKey) >= MAX_CODES_PER_IP_PER_WINDOW) {
       throw new Error('Too many sign-in attempts. Try again in 15 minutes.')
     }
 
@@ -93,7 +93,7 @@ export const requestLoginCode = createServerFn({ method: 'POST' })
       hashCode(email, code),
       now,
       now + CODE_TTL_MINUTES * 60 * 1000,
-      meta.requestIp,
+      ipKey,
     )
 
     try {

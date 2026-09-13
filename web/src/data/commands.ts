@@ -39,6 +39,41 @@ export const COMMAND_GROUPS: Array<CommandGroup> = [
 
 export const COMMAND_DOCS: Array<CommandDoc> = [
   {
+    slug: 'build',
+    name: '/hyperpower:build "<what to build>"',
+    group: 'Setup',
+    note: 'start here: a feature, a whole app, or take over one',
+    invoke: '/hyperpower:build "a habit tracker with streaks"',
+    when: 'Whenever you want something built. This is the command to learn first.',
+    expect:
+      'It sets the repo up if needed, works out where it is, and builds with you, stopping for the approach and for the verify result.',
+    body: `
+The other commands are still there, but you should rarely need to type them.
+\`build\` calls each one when a step needs it.
+
+The first time, it runs setup inline, reports what it found in three lines, and
+carries on. After that it works out where it is:
+
+| It finds | It does |
+|---|---|
+| a one-file change | makes it, runs the gates, and reports |
+| an app it was already building | says where it stopped and asks before continuing |
+| code, but no app on record | shows its picture of the app and asks you to correct it |
+| an empty repo | proposes the features and the order to build them in |
+
+It can drive or ride along. Driving, it builds one feature at a time and stops
+for the approach and for the verify result. Riding along, you write the code,
+and after a turn that changed files it adds one line about what to check. Say
+"take over" or "I'll drive" to switch.
+
+After each feature it writes a report of what every agent did, decided and
+spent, and offers to open it.
+
+If you close the session partway through an app, the next session says where
+the app stopped and waits for you to ask before it continues.
+`,
+  },
+  {
     slug: 'help',
     name: '/hyperpower:help',
     group: 'Setup',
@@ -76,12 +111,13 @@ skipping it.
     group: 'Setup',
     note: 'set up this repo',
     invoke: '/hyperpower:init [--refresh] [--no-interview]',
-    when: 'First thing you run inside a repo. Once per repo.',
+    when:
+      'To set a repo up without building anything. `/hyperpower:build` runs it for you the first time.',
     expect:
       'Stack detected, at most six questions, `hyperpower.yml` written, rulebook generated, every gate verified.',
     body: `
-This is the one command you cannot skip. Nothing else works properly until the
-repo has been read.
+\`/hyperpower:build\` runs this for you the first time, so you only need it on its
+own when you want a repo set up without building anything.
 
 It looks at what you already have. Package manager, test runner, type checker,
 build command, linter, the shape of your folders. Then it asks you at most six

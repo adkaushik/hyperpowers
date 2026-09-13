@@ -1,78 +1,15 @@
-import { Suspense } from 'react'
-import { Await, Link, createFileRoute } from '@tanstack/react-router'
+import { Link, createFileRoute } from '@tanstack/react-router'
 import { CommandReference } from '../components/CommandReference'
 import CopyCommand from '../components/CopyCommand'
 import Pipeline from '../components/Pipeline'
-import { ArrowRightIcon, GitHubIcon } from '../components/icons'
-import { getRepoStats, type RepoStats } from '../server/repo.functions'
-
-const REPO_URL = 'https://github.com/adkaushik/hyperpowers'
+import { ArrowRightIcon } from '../components/icons'
 
 export const Route = createFileRoute('/')({
   // Marketing copy is the whole point of this route: render it on the server so
   // it is in the first byte for crawlers and slow connections.
   ssr: true,
-  loader: () => {
-    // Not awaited: the repo stats stream in after the shell, so a slow GitHub
-    // response cannot hold up the document.
-    return { statsPromise: getRepoStats() }
-  },
   component: Landing,
 })
-
-function StatsStrip() {
-  const { statsPromise } = Route.useLoaderData()
-
-  return (
-    <Suspense
-      fallback={
-        <div className="flex gap-2">
-          {[0, 1, 2].map((key) => (
-            <span key={key} className="shimmer h-6 w-24" />
-          ))}
-        </div>
-      }
-    >
-      <Await promise={statsPromise}>{(stats) => <Stats stats={stats} />}</Await>
-    </Suspense>
-  )
-}
-
-function Stats({ stats }: { stats: RepoStats }) {
-  const items = [
-    stats.stars === null ? null : [`${stats.stars}`, 'stars'],
-    stats.forks === null ? null : [`${stats.forks}`, 'forks'],
-    [stats.license ?? 'MIT', 'licence'],
-    stats.pushedAt === null
-      ? null
-      : [
-          new Date(stats.pushedAt).toLocaleDateString(undefined, {
-            month: 'short',
-            day: 'numeric',
-            year: 'numeric',
-          }),
-          'last push',
-        ],
-  ].filter((item): item is [string, string] => item !== null)
-
-  return (
-    <div className="flex flex-wrap items-center gap-2">
-      {items.map(([value, label]) => (
-        <span
-          key={label}
-          className="inline-flex items-baseline gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--panel)] px-2.5 py-1"
-        >
-          <span className="font-mono text-xs font-bold text-[var(--ink)]">
-            {value}
-          </span>
-          <span className="text-[0.6875rem] text-[var(--ink-dim)]">
-            {label}
-          </span>
-        </span>
-      ))}
-    </div>
-  )
-}
 
 function SectionHeading({
   kicker,
@@ -118,8 +55,8 @@ function Landing() {
         <p className="mb-7 max-w-2xl text-base leading-relaxed text-[var(--ink-soft)] sm:text-lg">
           You hand it one requirement. It routes the work through stages, runs
           your own type, test and build commands at the gate, and writes down
-          what it decided on the way through. It works on any stack: one setup
-          command reads the repo and configures the rest.
+          what it decided on the way through. It works on any stack and sets
+          itself up the first time you use it.
         </p>
 
         <div className="mb-7 flex flex-wrap items-center gap-3">
@@ -127,29 +64,21 @@ function Landing() {
             Sign in to get access
             <ArrowRightIcon />
           </Link>
-          <a
-            href={REPO_URL}
-            target="_blank"
-            rel="noreferrer"
-            className="btn btn-ghost"
-          >
-            <GitHubIcon size={16} />
-            View the source
+          <a href="#install" className="btn btn-ghost">
+            How access works
           </a>
         </div>
 
-        <StatsStrip />
-
         <div className="mt-8 grid gap-2 lg:max-w-3xl">
-          <CopyCommand command="npx hyperpowers-claude" prompt="$" />
-          <CopyCommand command="/hyperpower:init" prompt="›" />
+          <CopyCommand
+            command={'/hyperpower:build "a habit tracker with streaks"'}
+            prompt="›"
+          />
         </div>
         <p className="mt-3 text-xs text-[var(--ink-dim)]">
-          The installer prints an activation code. Enter it here while signed in
-          and it installs the plugin. Restart the session, then run{' '}
-          <code>/hyperpower:init</code> once per repository: it detects your
-          stack, asks at most six questions, and writes{' '}
-          <code>hyperpower.yml</code>. Budget five minutes the first time.
+          This is the one command you type. It sets the repository up if needed,
+          then builds a feature or a whole app with you, and stops for the
+          approach and for the verify result.
         </p>
       </section>
 
@@ -327,7 +256,7 @@ function Landing() {
           kicker="Commands"
           title="The ones you will actually type"
         >
-          Twenty-six in total, in six groups. Each one below has how to call it,
+          Twenty-seven in total, in six groups. Each one below has how to call it,
           when to reach for it, and what you get back.{' '}
           <code>/hyperpower:help</code> prints the same list in your terminal.
         </SectionHeading>
@@ -341,31 +270,32 @@ function Landing() {
         className="page-wrap mt-20 grid scroll-mt-20 gap-4 lg:grid-cols-2"
       >
         <div className="panel p-6">
-          <p className="kicker mb-2">Install</p>
+          <p className="kicker mb-2">Access</p>
           <h3 className="mb-4 text-xl font-semibold text-[var(--ink)]">
             Getting set up
           </h3>
-          <div className="grid gap-2">
-            <CopyCommand command="npx hyperpowers-claude" prompt="$" />
-            <CopyCommand command="/hyperpower:init" prompt="›" />
-          </div>
-          <ol className="mt-4 mb-0 grid gap-2 pl-5 text-sm leading-relaxed text-[var(--ink-soft)]">
-            <li>The installer prints a one-time activation code and waits.</li>
+          <ol className="m-0 grid gap-2 pl-5 text-sm leading-relaxed text-[var(--ink-soft)]">
             <li>
-              Sign in here and enter the code. The installer then unpacks the
-              plugin, registers it as a local marketplace and installs it.
+              Sign in with your email. The first sign-in creates your account.
             </li>
             <li>
-              Restart the session and run <code>/hyperpower:init</code> in
-              whichever repository you want it to learn.
+              The installer is not released yet. When it is, it signs in with
+              your account and installs the plugin with a token that belongs to
+              you.
+            </li>
+            <li>
+              Restart the session and run <code>/hyperpower:build</code> in the
+              repository you want to work in.
             </li>
           </ol>
+          <div className="mt-4 grid gap-2">
+            <CopyCommand command="/hyperpower:build" prompt="›" />
+          </div>
           <p className="mt-4 mb-0 text-sm leading-relaxed text-[var(--ink-soft)]">
             Config lives in <code>hyperpower.yml</code> at the repo root and is
             meant to be committed. If you need to override something on one
             machine, <code>hyperpower.local.yml</code> does that and stays
-            gitignored. <code>npx hyperpowers-claude uninstall</code> removes
-            everything it put on disk.
+            gitignored.
           </p>
         </div>
 
@@ -399,8 +329,8 @@ function Landing() {
             </h2>
             <p className="m-0 text-sm leading-relaxed text-[var(--ink-soft)]">
               Sign in with your email and we send a six-digit code, so there is
-              no password to remember. Your account is where you claim the
-              activation code that <code>npx hyperpowers-claude</code> prints.
+              no password to remember. The installer will use this account once
+              it is released.
             </p>
           </div>
           <Link to="/signin" className="btn btn-primary flex-shrink-0">

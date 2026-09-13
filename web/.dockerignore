@@ -1,0 +1,11 @@
+node_modules
+.output
+.nitro
+.tanstack
+.data
+.env
+.env.*
+!.env.example
+.DS_Store
+.vscode
+.claude

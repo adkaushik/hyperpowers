@@ -1,8 +1,5 @@
 import { Link } from '@tanstack/react-router'
 import ThemeToggle from './ThemeToggle'
-import { GitHubIcon } from './icons'
-
-const REPO_URL = 'https://github.com/adkaushik/hyperpowers'
 
 export default function Header({ signedIn }: { signedIn: boolean }) {
   return (
@@ -39,15 +36,6 @@ export default function Header({ signedIn }: { signedIn: boolean }) {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
-          <a
-            href={REPO_URL}
-            target="_blank"
-            rel="noreferrer"
-            className="hidden rounded-lg p-2 text-[var(--ink-soft)] transition hover:bg-[var(--panel-raised)] hover:text-[var(--ink)] sm:block"
-          >
-            <span className="sr-only">Hyperpowers on GitHub</span>
-            <GitHubIcon />
-          </a>
           <ThemeToggle />
           {signedIn ? (
             <Link to="/dashboard" className="btn btn-primary !px-4 !py-2">

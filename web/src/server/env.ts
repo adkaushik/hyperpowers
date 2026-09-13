@@ -26,6 +26,20 @@ export const MAIL_FROM =
   process.env.MAIL_FROM ?? 'Hyperpowers <no-reply@localhost>'
 
 /**
+ * The request header the hosting proxy sets to the visitor's address, such as
+ * `fly-client-ip` on Fly.io. Unset, every visitor shares one sign-in rate limit.
+ */
+export const CLIENT_IP_HEADER = (process.env.CLIENT_IP_HEADER ?? '')
+  .trim()
+  .toLowerCase()
+
+if (isProduction && !CLIENT_IP_HEADER) {
+  console.warn(
+    '[env] CLIENT_IP_HEADER is not set, so every visitor shares one sign-in rate limit.',
+  )
+}
+
+/**
  * SMTP settings for nodemailer. Either a single `SMTP_URL` connection string
  * or the discrete host/port/user/pass variables; the URL wins when both are
  * present.

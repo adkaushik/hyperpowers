@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { createFileRoute, redirect, useRouter } from '@tanstack/react-router'
 import { useServerFn } from '@tanstack/react-start'
 import { getCurrentSession, signOut } from '../server/auth.functions'
-import CopyCommand from '../components/CopyCommand'
 
 export const Route = createFileRoute('/dashboard')({
   // Account data: nothing here belongs in a crawlable or cacheable document,
@@ -87,15 +86,10 @@ function Dashboard() {
           <h2 className="mb-3 text-lg font-semibold text-[var(--ink)]">
             Add the plugin to Claude Code
           </h2>
-          <div className="grid gap-2">
-            <CopyCommand command="npx hyperpowers-claude" prompt="$" />
-            <CopyCommand command="/hyperpower:init" prompt="›" />
-          </div>
-          <p className="mt-4 mb-0 text-sm leading-relaxed text-[var(--ink-soft)]">
-            The installer prints an activation code and waits for it to be
-            claimed. Claiming is not wired up yet; this account is what it will
-            hang off once it is. In the meantime, pass the key directly:{' '}
-            <code>npx hyperpowers-claude --key &lt;key&gt;</code>.
+          <p className="m-0 text-sm leading-relaxed text-[var(--ink-soft)]">
+            The installer is not released yet. When it is, it signs in with this
+            account to install the plugin. After that, start in any repository
+            with <code>/hyperpower:build</code>.
           </p>
         </section>
       </div>

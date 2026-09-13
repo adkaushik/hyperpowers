@@ -4,7 +4,7 @@ import {
   getRequestHeader,
   setResponseHeader,
 } from '@tanstack/react-start/server'
-import { APP_SECRET, isProduction } from './env'
+import { APP_SECRET, CLIENT_IP_HEADER, isProduction } from './env'
 import { db, type SessionRow, type UserRow } from './db'
 
 /**
@@ -139,10 +139,17 @@ export function revokeAllSessionsForUser(userId: string) {
   db.prepare(`DELETE FROM sessions WHERE user_id = ?`).run(userId)
 }
 
+/**
+ * The visitor address comes only from the header the hosting proxy sets itself,
+ * named by CLIENT_IP_HEADER. X-Forwarded-For is ignored: a client can write its
+ * own first entry.
+ */
 export function requestMeta() {
-  const forwardedFor = getRequestHeader('x-forwarded-for')
+  const address = CLIENT_IP_HEADER
+    ? getRequestHeader(CLIENT_IP_HEADER)
+    : undefined
   return {
     userAgent: getRequestHeader('user-agent') ?? null,
-    requestIp: forwardedFor?.split(',')[0]?.trim() ?? null,
+    requestIp: address?.trim() || null,
   }
 }

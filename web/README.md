@@ -23,7 +23,7 @@ npm run typecheck
 
 | Route | SSR mode | Notes |
 |---|---|---|
-| `/` | full document | Landing page. Repo stats stream in after the shell. |
+| `/` | full document | Landing page. |
 | `/signin` | full document | Email → six-digit code. Step lives in validated search params. |
 | `/dashboard` | `data-only` | Account data; loader on the server, component on the client. |
 
@@ -79,10 +79,29 @@ needs a Node runtime with a filesystem.
 
 ## Deploying
 
-The build targets Nitro's runtime-agnostic preset. Set `NITRO_PRESET` (for
-example `node_server`) to target a specific runtime without touching
-application code. A serverless target would need the SQLite layer swapped for a
-hosted database — nothing above the `src/server` boundary changes.
+The site runs on Fly.io. `Dockerfile` builds it on Node 22, which TanStack Start
+requires, and `fly.toml` configures the app. SQLite lives on a Fly volume mounted
+at `/data`. A volume attaches to one Machine only, so the app runs exactly one
+Machine. Keep it at one while SQLite is the database.
+
+First deploy, from `web/`:
+
+```bash
+fly launch --copy-config --no-deploy
+fly secrets set APP_SECRET="$(openssl rand -base64 48)"
+fly secrets set SMTP_URL='smtps://user:pass@smtp.example.com:465' MAIL_FROM='Hyperpowers <login@example.com>'
+fly deploy --ha=false
+```
+
+`--ha=false` stops Fly from adding a spare Machine. A spare would get its own empty
+volume, so sign-ins would land in two different databases. The first deploy
+creates the volume from `initial_size` in `fly.toml`, and after that `fly deploy`
+ships each new version. If the app name `hyperpowers-web` is taken, `fly launch`
+asks for another.
+
+`fly.toml` sets `DATABASE_PATH=/data/hyperpowers.db` and
+`CLIENT_IP_HEADER=fly-client-ip`. Set secrets with `fly secrets`. They do not
+belong in `fly.toml`.
 
 ## Not built yet
 

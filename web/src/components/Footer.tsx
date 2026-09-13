@@ -1,7 +1,4 @@
 import { Link } from '@tanstack/react-router'
-import { GitHubIcon } from './icons'
-
-const REPO_URL = 'https://github.com/adkaushik/hyperpowers'
 
 export default function Footer({ signedIn }: { signedIn: boolean }) {
   const year = new Date().getFullYear()
@@ -23,33 +20,18 @@ export default function Footer({ signedIn }: { signedIn: boolean }) {
           <p className="rule-label mb-3">Project</p>
           <ul className="m-0 list-none space-y-2 p-0">
             <li>
-              <a
-                href={REPO_URL}
-                target="_blank"
-                rel="noreferrer"
-                className="nav-link"
-              >
-                GitHub
+              <a href="/#pipeline" className="nav-link">
+                How a run goes
               </a>
             </li>
             <li>
-              <a
-                href={`${REPO_URL}/blob/main/docs/getting-started.md`}
-                target="_blank"
-                rel="noreferrer"
-                className="nav-link"
-              >
-                Getting started
-              </a>
-            </li>
-            <li>
-              <a
-                href={`${REPO_URL}/blob/main/docs/commands.md`}
-                target="_blank"
-                rel="noreferrer"
-                className="nav-link"
-              >
+              <a href="/#commands" className="nav-link">
                 Command reference
+              </a>
+            </li>
+            <li>
+              <a href="/#install" className="nav-link">
+                Getting set up
               </a>
             </li>
           </ul>
@@ -79,15 +61,6 @@ export default function Footer({ signedIn }: { signedIn: boolean }) {
         <p className="m-0 text-xs text-[var(--ink-dim)]">
           &copy; {year} Hyperpowers. MIT licensed.
         </p>
-        <a
-          href={REPO_URL}
-          target="_blank"
-          rel="noreferrer"
-          className="text-[var(--ink-dim)] transition hover:text-[var(--ink)]"
-        >
-          <span className="sr-only">Hyperpowers on GitHub</span>
-          <GitHubIcon size={18} />
-        </a>
       </div>
     </footer>
   )

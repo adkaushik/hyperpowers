@@ -1,7 +1,7 @@
 # Handoff — hyperpowers-web
 
 Marketing site and sign-in portal for the Hyperpowers Claude Code plugin. Lives
-at `web/` inside the `adkaushik/hyperpowers` repo (public), alongside the plugin
+at `web/` inside the `adkaushik/hyperpowers` repo (being made private), alongside the plugin
 source in `plugins/`.
 
 ## Stack
@@ -22,7 +22,7 @@ node .output/server/index.mjs   # production check
 
 ```
 src/routes/__root.tsx        document shell, theme, session in router context
-src/routes/index.tsx         landing page (full-document SSR, streamed stats)
+src/routes/index.tsx         landing page (full-document SSR)
 src/routes/signin.tsx        email + code sign-in, Zod-validated ?redirect
 src/routes/dashboard.tsx     auth-gated, ssr: 'data-only'
 src/components/CommandReference.tsx  accordion + anchored index for 26 commands
@@ -33,7 +33,6 @@ src/server/session.ts        session tokens, cookie handling
 src/server/auth.functions.ts requestCode / verifyCode server functions
 src/server/auth-middleware.ts  session resolution for protected routes
 src/server/mail.ts           pooled SMTP transporter, verifyMailTransport()
-src/server/repo.functions.ts GitHub stats for the landing page
 ```
 
 Every module under `src/server/` imports `@tanstack/react-start/server-only`
@@ -72,44 +71,62 @@ before a deploy.
 See `.env.example`. `APP_SECRET` (16+ chars) is required in production and is
 the pepper for both codes and session tokens — rotating it invalidates every
 outstanding code and session. `DATABASE_PATH` defaults to
-`.data/hyperpowers.db`. `GITHUB_TOKEN` is optional and only raises the API rate
-limit for the landing page stats.
+`.data/hyperpowers.db`. `CLIENT_IP_HEADER` names the header the hosting proxy sets to the
+visitor address (`fly-client-ip` on Fly.io). Without it, every visitor shares
+one sign-in rate limit.
 
 ## Deploying
 
-`NITRO_PRESET` picks the runtime without touching application code. The target
-needs a Node filesystem: better-sqlite3 is externalized from the bundle. A
-serverless target means swapping the driver behind `src/server/db.ts`, which is
-the only module that talks to sqlite.
+The site runs on Fly.io. `Dockerfile` builds it on Node 22, which TanStack Start
+requires, and `fly.toml` configures the app. SQLite lives on a Fly volume mounted
+at `/data`. A volume attaches to one Machine only, so the app runs exactly one
+Machine. Keep it at one while SQLite is the database.
 
-## The open piece: activation-code claiming
+First deploy, from `web/`:
+
+```bash
+fly launch --copy-config --no-deploy
+fly secrets set APP_SECRET="$(openssl rand -base64 48)"
+fly secrets set SMTP_URL='smtps://user:pass@smtp.example.com:465' MAIL_FROM='Hyperpowers <login@example.com>'
+fly deploy --ha=false
+```
+
+`--ha=false` stops Fly from adding a spare Machine. A spare would get its own empty
+volume, so sign-ins would land in two different databases. The first deploy
+creates the volume from `initial_size` in `fly.toml`, and after that `fly deploy`
+ships each new version. If the app name `hyperpowers-web` is taken, `fly launch`
+asks for another.
+
+`fly.toml` sets `DATABASE_PATH=/data/hyperpowers.db` and
+`CLIENT_IP_HEADER=fly-client-ip`. Set secrets with `fly secrets`. They do not
+belong in `fly.toml`.
+
+## The open piece: installer sign-in
 
 The installer (`npx hyperpowers-claude`, separate package at
-`~/Projects/hyperpowers-claude`, not in this repo) prints a one-time activation
-code. The user is meant to sign in here, paste the code, and have the portal
-return the decryption key for the bundled encrypted plugin payload.
+`~/Projects/hyperpowers-claude`, not in this repo and not yet on npm) prints a
+one-time code. The user signs in here, enters the code, and the installer
+receives a token that belongs to that account.
+
+**Decision, 2026-09-13: per-user tokens.** This replaces the earlier shared-key
+design, where one decryption key unlocked an encrypted payload bundled in the
+npm package. The repo is being made private, and a shared key cannot be taken
+back once someone shares it. A per-user token can be revoked for one account
+without affecting anyone else.
 
 **None of that backend exists yet.** The dashboard says so plainly rather than
 faking it with stubs. What still needs building:
 
-- `POST /device/code` — issue an activation code plus device code
-- `POST /device/token` — the CLI polls this; returns the key once claimed
+- `POST /device/code` — issue a user code plus a device code
+- `POST /device/token` — the CLI polls this; returns the account's token once
+  the code is claimed
 - `POST /portal/claim` — signed-in user submits the code; checks a paid
-  entitlement before releasing anything
-- Code expiry, rate limiting, per-account activation caps
-- The decryption key stored as a server-side secret, never logged, never
-  returned to an unentitled account
+  entitlement before issuing anything
+- A download endpoint that serves the plugin only to a valid, unrevoked token
+- Token revocation, code expiry, rate limiting, per-account caps
 
-The interim workaround for anyone who has the key is `npx hyperpowers-claude
---key <key>`.
-
-Design decision already locked, do not redesign: one shared decryption key for
-the single bundled ciphertext. The activation code is unique per install; the
-key is not, and cannot be for one bundled file. This is accepted. Per-install
-keys and per-seat caps were explicitly out of scope.
-
-Note that this repo is public, which undercuts the original reason for
-encrypting the payload at all. Worth settling before the portal gets built.
+Until the package name is reserved on npm, keep `npx hyperpowers-claude` off
+the public site. `npx` runs whatever is published under that name.
 
 ## House style
 
