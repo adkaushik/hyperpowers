@@ -1,0 +1,448 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Dark is the default: this is a tool for people who live in a terminal. */
+:root {
+  --bg: #0a0c0e;
+  --bg-soft: #0e1114;
+  --panel: #12161b;
+  --panel-raised: #171c22;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --ink: #edeff1;
+  --ink-soft: #99a2aa;
+  --ink-dim: #6a737b;
+  --amber: #e0a83d;
+  --amber-bg: rgba(224, 168, 61, 0.12);
+  --green: #5fb87f;
+  --green-bg: rgba(95, 184, 127, 0.12);
+  --blue: #7fa2df;
+  --blue-bg: rgba(127, 162, 223, 0.12);
+  --red: #e58a8a;
+  --red-bg: rgba(229, 138, 138, 0.12);
+  --glow-a: rgba(224, 168, 61, 0.16);
+  --glow-b: rgba(95, 184, 127, 0.1);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: #f4f2ed;
+  --bg-soft: #efece5;
+  --panel: #ffffff;
+  --panel-raised: #fbfaf7;
+  --line: rgba(20, 24, 28, 0.1);
+  --line-strong: rgba(20, 24, 28, 0.2);
+  --ink: #15181b;
+  --ink-soft: #4d555c;
+  --ink-dim: #737b82;
+  --amber: #96631a;
+  --amber-bg: rgba(150, 99, 26, 0.1);
+  --green: #2c6e49;
+  --green-bg: rgba(44, 110, 73, 0.1);
+  --blue: #35507e;
+  --blue-bg: rgba(53, 80, 126, 0.1);
+  --red: #9b3535;
+  --red-bg: rgba(155, 53, 53, 0.1);
+  --glow-a: rgba(150, 99, 26, 0.12);
+  --glow-b: rgba(44, 110, 73, 0.1);
+  --shadow: 0 20px 48px rgba(20, 24, 28, 0.1);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f4f2ed;
+    --bg-soft: #efece5;
+    --panel: #ffffff;
+    --panel-raised: #fbfaf7;
+    --line: rgba(20, 24, 28, 0.1);
+    --line-strong: rgba(20, 24, 28, 0.2);
+    --ink: #15181b;
+    --ink-soft: #4d555c;
+    --ink-dim: #737b82;
+    --amber: #96631a;
+    --amber-bg: rgba(150, 99, 26, 0.1);
+    --green: #2c6e49;
+    --green-bg: rgba(44, 110, 73, 0.1);
+    --blue: #35507e;
+    --blue-bg: rgba(53, 80, 126, 0.1);
+    --red: #9b3535;
+    --red-bg: rgba(155, 53, 53, 0.1);
+    --glow-a: rgba(150, 99, 26, 0.12);
+    --glow-b: rgba(44, 110, 73, 0.1);
+    --shadow: 0 20px 48px rgba(20, 24, 28, 0.1);
+    color-scheme: light;
+  }
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  min-height: 100dvh;
+  background:
+    radial-gradient(800px 420px at 12% -8%, var(--glow-a), transparent 70%),
+    radial-gradient(700px 380px at 88% 4%, var(--glow-b), transparent 70%),
+    var(--bg);
+  color: var(--ink);
+}
+
+.page-wrap {
+  width: 100%;
+  max-width: 76rem;
+  margin-inline: auto;
+}
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.panel-raised {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel-raised);
+  box-shadow: var(--shadow);
+}
+
+.kicker {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--amber);
+}
+
+.rule-label {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  padding: 0.625rem 1.125rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--ink);
+  text-decoration: none;
+  background: transparent;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--panel-raised);
+  border-color: var(--ink-dim);
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  border-color: transparent;
+  background: var(--ink);
+  color: var(--bg);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--ink);
+  border-color: transparent;
+  transform: translateY(-1px);
+}
+
+.btn-ghost {
+  border-color: var(--line);
+  color: var(--ink-soft);
+}
+
+.field {
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--bg-soft);
+  padding: 0.75rem 0.875rem;
+  font-size: 0.9375rem;
+  color: var(--ink);
+  outline: none;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.field::placeholder {
+  color: var(--ink-dim);
+}
+
+.field:focus {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-bg);
+}
+
+.field-code {
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: 0.4em;
+  text-align: center;
+  padding-block: 0.875rem;
+}
+
+.cmd {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-soft);
+  padding: 0.75rem 0.875rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--ink);
+  overflow-x: auto;
+}
+
+.cmd-prompt {
+  color: var(--green);
+  user-select: none;
+  flex-shrink: 0;
+}
+
+code:not(pre code) {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-soft);
+  padding: 0.1rem 0.34rem;
+  color: var(--ink);
+}
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 0.625rem 0.75rem;
+  min-width: 0;
+}
+
+.stage-name {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+
+.stage-note {
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  color: var(--ink-dim);
+}
+
+.stage-gate {
+  border-color: color-mix(in srgb, var(--amber) 45%, transparent);
+  background: var(--amber-bg);
+}
+
+.stage-stop {
+  border-color: color-mix(in srgb, var(--red) 45%, transparent);
+  background: var(--red-bg);
+}
+
+.stage-out {
+  border-color: color-mix(in srgb, var(--green) 45%, transparent);
+  background: var(--green-bg);
+}
+
+.nav-link {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--ink-soft);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+.nav-link:hover,
+.nav-link.is-active {
+  color: var(--ink);
+}
+
+.hairline {
+  border-top: 1px solid var(--line);
+}
+
+.rise-in {
+  animation: rise-in 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--panel) 25%,
+    var(--panel-raised) 37%,
+    var(--panel) 63%
+  );
+  background-size: 400% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: 6px;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise-in,
+  .shimmer {
+    animation: none;
+  }
+  .btn-primary:hover:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* Rendered markdown inside the command reference. */
+.md-body {
+  font-size: 0.9375rem;
+  line-height: 1.7;
+  color: var(--ink-soft);
+}
+
+.md-body > :first-child {
+  margin-top: 0;
+}
+
+.md-body > :last-child {
+  margin-bottom: 0;
+}
+
+.md-body p,
+.md-body ul,
+.md-body ol {
+  margin-block: 0.85rem;
+}
+
+/* Preflight strips list markers, and these lists need them back. */
+.md-body ul {
+  padding-left: 1.25rem;
+  list-style: disc;
+}
+
+.md-body ol {
+  padding-left: 1.25rem;
+  list-style: decimal;
+}
+
+.md-body li {
+  margin-block: 0.3rem;
+}
+
+.md-body li::marker {
+  color: var(--ink-dim);
+}
+
+.md-body strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.md-body em {
+  color: var(--ink);
+  font-style: italic;
+}
+
+.md-body a {
+  color: var(--amber);
+}
+
+.md-body pre {
+  margin-block: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-soft);
+  padding: 0.875rem 1rem;
+  overflow-x: auto;
+}
+
+.md-body pre code {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--ink);
+  white-space: pre;
+}
+
+.md-body table {
+  width: 100%;
+  margin-block: 1rem;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  display: block;
+  overflow-x: auto;
+}
+
+.md-body th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--line-strong);
+  white-space: nowrap;
+}
+
+.md-body td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.md-body tr:last-child td {
+  border-bottom: 0;
+}
