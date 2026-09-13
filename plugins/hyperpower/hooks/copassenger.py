@@ -66,22 +66,16 @@ def git(args, cwd):
 
 
 def state_dir(root):
-    """Same resolution as the kernel scripts, without failing when config is absent."""
+    """The kernel's resolver. A config that does not parse raises, and the hook says nothing."""
+    import importlib.machinery
+    import importlib.util
     here = os.path.dirname(os.path.abspath(__file__))
     config = os.path.join(os.path.dirname(here), "scripts", "hp-config")
-    try:
-        import importlib.machinery
-        import importlib.util
-        loader = importlib.machinery.SourceFileLoader("hp_config", config)
-        spec = importlib.util.spec_from_loader("hp_config", loader)
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-        try:
-            return module.state_dir(root, module.load(root)["config"])
-        except Exception:
-            return module.state_dir(root, None)
-    except Exception:
-        return os.path.join(root, ".hyperpower")
+    loader = importlib.machinery.SourceFileLoader("hp_config", config)
+    spec = importlib.util.spec_from_loader("hp_config", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module.state_dir_for(root)
 
 
 def changed_files(root, base):

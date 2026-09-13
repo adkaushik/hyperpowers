@@ -40,15 +40,11 @@ RUNS_DIR = os.path.join(JOURNAL_DIR, "runs")
 
 def state_root(root):
     """The directory the harness writes into. paths.state, or .hyperpower."""
+    module = load_config_module()
     try:
-        cfg = load_config_module()
-    except Exception:
-        return os.path.join(root, JOURNAL_DIR)
-    try:
-        loaded = cfg.load(root)
-        return cfg.state_dir(root, loaded["config"])
-    except Exception:
-        return cfg.state_dir(root, None)
+        return module.state_dir_for(root)
+    except module.ConfigError as exc:
+        raise JournalError(exc.render())
 
 # The plugin ships hp-config, hp-validate and task-classes.yml beside this script.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

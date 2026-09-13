@@ -85,15 +85,11 @@ def load_config_module():
 
 def state_root(root):
     """Works before hyperpower.yml exists, because build sets the repo up inline."""
+    cfg = load_config_module()
     try:
-        cfg = load_config_module()
-    except Exception:
-        return os.path.join(root, ".hyperpower")
-    try:
-        loaded = cfg.load(root)
-        return cfg.state_dir(root, loaded["config"])
-    except Exception:
-        return cfg.state_dir(root, None)
+        return cfg.state_dir_for(root)
+    except cfg.ConfigError as exc:
+        die(exc.render())
 
 
 def paths(root):

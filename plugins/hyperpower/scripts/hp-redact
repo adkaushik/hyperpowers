@@ -198,15 +198,11 @@ def load_config_module():
 
 def state_root(root):
     """The directory the harness writes into. paths.state in config, or .hyperpower."""
+    module = load_config_module()
     try:
-        cfg = load_config_module()
-    except Exception:
-        return os.path.join(root, ".hyperpower")
-    try:
-        loaded = cfg.load(root)
-        return cfg.state_dir(root, loaded["config"])
-    except Exception:
-        return cfg.state_dir(root, None)
+        return module.state_dir_for(root)
+    except module.ConfigError as exc:
+        raise RedactError(exc.render())
 
 
 def read_config_json(path):

@@ -494,15 +494,12 @@ def load_config_module():
 
 def state_root(root):
     """The directory the harness writes into. paths.state in config, or .hyperpower."""
+    cfg = load_config_module()
     try:
-        cfg = load_config_module()
-    except Exception:
-        return os.path.join(str(root), ".hyperpower")
-    try:
-        loaded = cfg.load(str(root))
-        return cfg.state_dir(str(root), loaded["config"])
-    except Exception:
-        return cfg.state_dir(str(root), None)
+        return cfg.state_dir_for(root)
+    except cfg.ConfigError as exc:
+        sys.stderr.write("hp-gates: %s\n" % exc.render())
+        raise SystemExit(EXIT_ERROR)
 
 
 def resolve_run(args, root):

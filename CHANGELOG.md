@@ -11,6 +11,20 @@ claude plugin marketplace update hyperpowers
 claude plugin update hyperpower
 ```
 
+## 0.10.2 — 2026-09-13
+
+**One state resolver, and script docs that match the scripts.**
+
+- Every script finds the state directory through one function in `hp-config`. Eight copies
+  had grown apart.
+- A `hyperpower.yml` that does not parse is now an error. Before, the scripts quietly used
+  the default directory, where the fixed config would never look.
+- `hp-pr` honours `HYPERPOWER_STATE_DIR` when there is no config.
+- The commit gate reads runs from the state directory, so a moved `paths.state` no longer
+  denies every commit. Its flag file stays at `.hyperpower/commit-gate`.
+- `scripts/README.md` lists all twelve scripts, with exit codes checked against each one.
+  The `hp-gates` row was wrong.
+
 ## 0.10.1 — 2026-09-13
 
 **Fixes from a humanize pass over the conductor.**

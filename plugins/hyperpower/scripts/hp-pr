@@ -66,12 +66,11 @@ def load_config_module():
 
 
 def state_root(root):
+    cfg = load_config_module()
     try:
-        cfg = load_config_module()
-        loaded = cfg.load(root)
-        return cfg.state_dir(root, loaded["config"])
-    except Exception:
-        return os.path.join(root, ".hyperpower")
+        return cfg.state_dir_for(root)
+    except cfg.ConfigError as exc:
+        die(exc.render())
 
 
 def repo_root(start=None):

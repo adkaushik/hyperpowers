@@ -422,12 +422,12 @@ baseline nobody trusts, and every later comparison inherits it.
 
 ## Scripts
 
-The commands above are what you type. Underneath, six executables in
+The commands above are what you type. Underneath, twelve executables in
 `plugins/hyperpower/scripts/` do the mechanical work: config merging, journal writing,
-contract validation, gate running, path redaction, and the plugin self-check. Skills and
-agents call them instead of reimplementing any of it, so `/hyperpower:config` reports the
-config a run actually used and `/hyperpower:resume` re-derives the cache key
-`/hyperpower:run` wrote.
+contract validation, gate running, path redaction, the self-check, the eval runner, and one
+script behind each of status, visualize, help, PR review and build. Skills and agents call
+them instead of reimplementing any of it, so `/hyperpower:config` reports the config a run
+actually used and `/hyperpower:resume` re-derives the cache key `/hyperpower:run` wrote.
 
 Python 3, standard library only. No third-party imports and no network access. You rarely
 run them by hand, but they are the contract, so they are documented here.
@@ -572,24 +572,30 @@ phase, and the commit it was last reconciled against. JSON, written atomically.
 `reconcile --check` reports commits made outside the conductor without recording them.
 `note` prints the paragraph session start injects when an app is in progress.
 
+### `hp-help`
+
+Prints every command in plain language, grouped by when you would reach for it. The wording
+lives in one table in the script, and the command list is read from `skills/` at run time.
+`--check` reports drift between the two and exits 1. Backs `/hyperpower:help`.
+
 ### `hp-selfcheck`
 
 Check the plugin against its own documentation. This is a contributor tool, not something a
 user of the harness runs.
 
 ```sh
-hp-selfcheck                    # 13 checks
+hp-selfcheck                    # 14 checks
 hp-selfcheck --strict           # warnings are errors. Run this before a pull request.
 hp-selfcheck --only task-classes
 hp-selfcheck --fix              # repairs frontmatter, agent names, gate file modes only
 hp-selfcheck --list-checks
 ```
 
-Exit 0 clean, 1 findings. Each finding names the file, the line, and the repair. Checks
-cover frontmatter, agent naming and dispatch, `docs/commands.md` against `skills/` in both
-directions, gate scripts and their schema entries, placeholder markers, config fields
-against the schema, the eval suite, model pricing, the agent index, and the task-class
-vocabulary.
+Exit 0 clean, 1 findings, 2 bad usage. Each finding names the file, the line, and the
+repair. Checks cover frontmatter, agent naming and dispatch, `docs/commands.md` against
+`skills/` in both directions, gate scripts and their schema entries, placeholder markers,
+config fields against the schema, the eval suite, model pricing, the agent index, the
+task-class vocabulary, and the help table.
 
 ### `run_evals.py`
 

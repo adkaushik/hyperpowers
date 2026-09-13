@@ -160,6 +160,10 @@ A relative value is anchored to the repo root, never the working directory. An a
 path is used as given. `HYPERPOWER_STATE_DIR` overrides both, which is how `hp-gates`
 pins one value for every gate script it spawns.
 
+A `hyperpower.yml` that does not parse is an error, not a reason to use the default: state
+written there would be invisible once the file is fixed. With no `hyperpower.yml` at all,
+the default applies.
+
 Check where it resolved to:
 
 ```bash

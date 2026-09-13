@@ -714,6 +714,19 @@ def load(root=None):
     }
 
 
+def state_dir_for(root):
+    """The state directory for a repo that may not have a config yet.
+
+    No hyperpower.yml: HYPERPOWER_STATE_DIR, then the default. A hyperpower.yml that does not
+    parse raises ConfigError, because state written to the default would be invisible once
+    the file is fixed.
+    """
+    root = os.path.abspath(str(root))
+    if not os.path.isfile(os.path.join(root, CONFIG_NAME)):
+        return state_dir(root, None)
+    return state_dir(root, load(root)["config"])
+
+
 # ------------------------------------------------------------------------- cli
 
 

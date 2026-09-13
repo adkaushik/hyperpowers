@@ -170,12 +170,15 @@ Checks run in order. The first one that fails denies the commit.
 
 | Check | Deny reason |
 |---|---|
-| `.hyperpower/runs/` exists and is not empty | no run journal |
+| `runs/` in the state directory exists and is not empty | no run journal |
 | Newest run folder holds `gates.json` | the run did not reach the Gates stage |
 | `gates.json` records no `"result": "fail"` | the run recorded a failing gate |
 | `gates.json` records at least one `"result": "pass"` | nothing was verified |
 | No `"result": "did_not_run"` blames a missing tool or a timeout | a gate could not execute |
 | No changed file is newer than `gates.json` | the gate result is stale |
+
+The run journal is found with `hp-config --state-dir`, so `paths.state` moves it. The flag
+file stays at `.hyperpower/commit-gate` either way, so the opt-in check never starts Python.
 
 A `did_not_run` gate is never counted as a pass. A gate turned off in config is intended and
 does not deny. A gate whose tool is off PATH, or which exceeded

@@ -1,7 +1,8 @@
 #!/bin/sh
 # paths.state moves everything the harness writes. The default must not change, an
-# override must be honoured by every writer, and a relative value must anchor to the repo
-# root rather than the working directory.
+# override must be honoured by every writer and reader, a relative value must anchor to the
+# repo root rather than the working directory, and a config that does not parse is an error
+# rather than a reason to write to the default.
 set -eu
 
 case ${1:-} in
@@ -88,3 +89,55 @@ t_status "hp-gates exits 0 with every enabled blocking gate passing" 0
 t_file "hp-gates records gates.json under the configured directory" \
   "$MOVED/.claude/hyperpower/runs/$MRUN/gates.json"
 t_no_file "hp-gates leaves no stray tree at the default path" "$MOVED/.hyperpower"
+
+# ---------------------------------------------------------------------------
+# 5. The commit gate reads the run journal where paths.state put it. Reading the default
+#    instead would deny every commit in a repo that moved its state.
+
+mkdir -p "$MOVED/.hyperpower"
+: > "$MOVED/.hyperpower/commit-gate"
+printf '{"tool_input":{"command":"git commit -m x"}}' > "$HP_TEST_TMP/commit.json"
+T_STDIN=$HP_TEST_TMP/commit.json
+t_run env CLAUDE_PROJECT_DIR="$MOVED" sh "$HP_PLUGIN/hooks/require-commit-prep.sh"
+t_status "the commit gate allows a commit whose run passed under paths.state" 0
+t_stderr_lacks "the commit gate does not look for runs at the default path" "no run journal"
+
+# ---------------------------------------------------------------------------
+# 6. With no config, HYPERPOWER_STATE_DIR still decides, for every script that runs without
+#    one.
+
+BARE="$HP_TEST_TMP/bare-repo"
+mkdir -p "$BARE"
+( cd "$BARE" && git init -q && git commit -q --allow-empty -m init ) >/dev/null 2>&1
+
+t_run env HYPERPOWER_STATE_DIR=.pinned "$HP_PYTHON" "$HP_SCRIPTS/hp-app" --root "$BARE" \
+  init --name pinned --scope feature --mode conductor --origin new
+t_status "hp-app init works with no config" 0
+t_file "with no config, hp-app honours HYPERPOWER_STATE_DIR" "$BARE/.pinned/app.json"
+
+mkdir -p "$BARE/.pinned/pr/7"
+T_CWD=$BARE
+t_run env HYPERPOWER_STATE_DIR=.pinned "$HP_PYTHON" "$HP_SCRIPTS/hp-pr" --clean
+t_status "hp-pr --clean works with no config" 0
+t_stdout_has "with no config, hp-pr honours HYPERPOWER_STATE_DIR" "removed 1 worktree"
+t_no_file "with no config and the variable set, nothing lands at the default path" "$BARE/.hyperpower"
+
+# ---------------------------------------------------------------------------
+# 7. A hyperpower.yml that does not parse is an error. Falling back to the default would
+#    write state where the repaired config never looks.
+
+BROKEN="$HP_TEST_TMP/broken-repo"
+mkdir -p "$BROKEN"
+( cd "$BROKEN" && git init -q && git commit -q --allow-empty -m init ) >/dev/null 2>&1
+printf 'version: 1\nproject:\n\tname: tabbed\n' > "$BROKEN/hyperpower.yml"
+
+t_run "$HP_PYTHON" "$HP_SCRIPTS/hp-app" --root "$BROKEN" \
+  init --name broken --scope feature --mode conductor --origin new
+t_status "hp-app refuses a hyperpower.yml that does not parse" 2
+t_stderr_has "hp-app names the line that does not parse" "hyperpower.yml:3"
+
+T_CWD=$BROKEN
+t_run "$HP_PYTHON" "$HP_SCRIPTS/hp-pr" --clean
+t_status "hp-pr refuses a hyperpower.yml that does not parse" 2
+
+t_no_file "a config that does not parse leaves nothing at the default path" "$BROKEN/.hyperpower"

@@ -97,9 +97,17 @@ deny() {
 
 # ------------------------------------------------------------- evidence ------
 
-runs_dir="$project_root/.hyperpower/runs"
+# The flag stays at .hyperpower, so the opt-in check above never starts Python. The run
+# journal follows paths.state, so it is resolved only once the gate is on for a commit.
+state_dir=""
+plugin_root=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+if [ -n "$plugin_root" ] && command -v python3 >/dev/null 2>&1; then
+    state_dir=$(python3 "$plugin_root/scripts/hp-config" --root "$project_root" --state-dir 2>/dev/null) || state_dir=""
+fi
+[ -n "$state_dir" ] || state_dir="$project_root/.hyperpower"
+runs_dir="$state_dir/runs"
 
-[ -d "$runs_dir" ] || deny "no run journal at .hyperpower/runs."
+[ -d "$runs_dir" ] || deny "no run journal in the state directory."
 
 run_id=$(ls -1t "$runs_dir" 2>/dev/null | head -n 1)
 [ -n "$run_id" ] || deny "the run journal is empty."

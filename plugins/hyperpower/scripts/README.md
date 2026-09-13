@@ -1,19 +1,26 @@
 # scripts
 
-Six executables. Python 3.8 or newer, standard library only. No third-party imports, and no
-network access.
+Twelve executables. Python 3.8 or newer, standard library only. No third-party imports, and
+no network access.
 
-Five of them are the kernel. Skills and agents call them rather than parsing YAML, hashing
+The first five are the kernel. Skills and agents call them rather than parsing YAML, hashing
 files, validating contracts, or writing the run journal themselves, because a second
 implementation of any of those drifts from the first and nothing in the output shows it.
+The next six each back one command. `run_evals.py` has its own section below.
 
 | Script | Does | Exit codes | Reference |
 |---|---|---|---|
-| `hp-config` | merges `hyperpower.yml` and `hyperpower.local.yml`, prints the effective config, the per-field source, and the config hash | 0 ok, 1 parse error, 78 no config | `--help`, `docs/configuration.md` |
-| `hp-journal` | writes and reads `.hyperpower/runs/<run-id>/` | 0 written, 1 refused, 78 no config | `JOURNAL.md` |
+| `hp-config` | merges `hyperpower.yml` and `hyperpower.local.yml`, prints the effective config, the per-field source, and the config hash | 0 printed, 1 bad input or a file that does not parse, 78 no config | `--help`, `docs/configuration.md` |
+| `hp-journal` | writes and reads `.hyperpower/runs/<run-id>/` | 0 done, 1 bad input or a failed write, 78 no config | `JOURNAL.md` |
 | `hp-validate` | checks a stage contract against `schemas/<stage>.json` | 0 valid, 1 invalid, 2 usage, 78 no schema | `../schemas/README.md` |
-| `hp-gates` | runs every enabled gate, records the aggregate | 0 no blocking failure, 1 blocking failure, 2 could not run | `--help`, `../gates/README.md` |
-| `hp-selfcheck` | checks the plugin against its own documentation, 13 checks | 0 clean, 1 findings | `--list-checks` |
+| `hp-gates` | runs every enabled gate, records the aggregate | 0 every blocking gate passed, 1 a blocking gate failed, 78 a blocking gate could not run, 2 hp-gates could not run | `--help`, `../gates/README.md` |
+| `hp-selfcheck` | checks the plugin against its own documentation, 14 checks | 0 clean, 1 findings, 2 bad usage | `--list-checks` |
+| `hp-redact` | hashes file paths in run records before they reach an aggregate view | 0 emitted, 1 bad input, 2 usage | `--help`, `docs/commands.md` |
+| `hp-status` | reports whether the harness is on here, and what a live run is doing | 0 reported, 1 no run to report on, 2 bad input, 78 no config | `--help`, `../skills/status/SKILL.md` |
+| `hp-visualize` | builds an HTML report of a session from its logs | 0 written, 1 nothing to report, 2 bad input, 78 no logs | `--help`, `../skills/visualize/SKILL.md` |
+| `hp-help` | prints every command in plain language, grouped by when you would use it | 0 printed, 1 the help table and `skills/` disagree, 2 bad input | `--help`, `../skills/help/SKILL.md` |
+| `hp-pr` | fetches a pull request into a throwaway worktree for review | 0 resolved, 1 no such PR, 2 bad input, 78 `gh` missing or not logged in | `--help`, `../skills/review/SKILL.md` |
+| `hp-app` | keeps the conductor's app record in `<state>/app.json` | 0 done, 1 no app recorded, 2 bad input, 78 not inside a repository | `--help`, `../skills/build/SKILL.md` |
 
 Each carries its own `--help` with the full flag list. The sibling documents named above are
 the contracts; this table is the index.
@@ -30,7 +37,7 @@ the contracts; this table is the index.
 skill with no `docs/commands.md` section, a gate script with no schema entry, an agent the
 index is missing, a model id with no price, and a task class that one of
 `task-classes.yml`, `schemas/route.json`, and `schemas/plan.json` names and the others do
-not.
+not. It also fails when `/hyperpower:help` misses a command.
 
 ## run_evals.py
 
