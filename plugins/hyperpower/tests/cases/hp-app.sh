@@ -52,6 +52,20 @@ else
   t_status "outside a git repository hp-app exits 78" 78
 fi
 
+T_CWD=$NOREPO
+t_run env HYPERPOWER_REPO_ROOT="$HP_TEST_REPO" "$HP_PYTHON" "$HP_APP" path
+t_status "HYPERPOWER_REPO_ROOT names the root from any directory" 0
+case $(t_out) in
+  "$HP_TEST_REPO"/.hyperpower/app.json) t_ok "the record lives under the root the variable names" ;;
+  *) t_bad "the record lives under the root the variable names" "path printed: $(t_out)" ;;
+esac
+
+T_CWD=$NOREPO
+t_run env HYPERPOWER_REPO_ROOT="$HP_TEST_TMP/no-such-dir" "$HP_PYTHON" "$HP_APP" init --name typo --scope feature --mode conductor --origin new
+t_status "a HYPERPOWER_REPO_ROOT that is not a directory is bad input" 2
+t_stderr_has "the error names the variable" "HYPERPOWER_REPO_ROOT"
+t_no_file "nothing is created under a root that does not exist" "$HP_TEST_TMP/no-such-dir"
+
 # ---------------------------------------------------------------------------
 # 2. init records an app, and refuses to replace one silently.
 
@@ -78,6 +92,9 @@ t_json "the refused init leaves the first app in place" "$APP" name tracker
 
 app init --name tracker --scope website --mode conductor --origin new
 t_status "an unknown scope is bad input" 2
+
+app init --name tracker --scope app --mode conductor --origin resume
+t_stderr_has "resume is not an origin: an app is resumed, never recorded as one" "invalid choice"
 
 app init --name tracker --scope app --mode conductor --origin takeover --force
 t_status "init --force replaces the app" 0
@@ -229,3 +246,52 @@ t_run "$HP_PYTHON" "$HP_APP" --root "$MOVED" init --name moved --scope feature -
 t_status "init works with paths.state set" 0
 t_file "paths.state moves app.json" "$MOVED/.claude/hyperpower/app.json"
 t_no_file "nothing is written to the default state directory" "$MOVED/.hyperpower"
+
+# ---------------------------------------------------------------------------
+# 9. Drift with no usable base: a record made before the first commit, and a recorded commit
+#    the repository no longer has. Neither may report no drift.
+
+FRESH=$HP_TEST_TMP/fresh
+mkdir -p "$FRESH"
+git -C "$FRESH" init -q
+early() { t_run "$HP_PYTHON" "$HP_APP" --root "$FRESH" "$@"; }
+
+early init --name early --scope feature --mode conductor --origin new
+t_json "a record made before the first commit has no reconciled head" \
+  "$FRESH/.hyperpower/app.json" reconciled_head null
+
+printf 'one\n' > "$FRESH/one.txt"
+git -C "$FRESH" add one.txt
+git -C "$FRESH" commit -q -m one
+printf 'two\n' > "$FRESH/two.txt"
+git -C "$FRESH" add two.txt
+git -C "$FRESH" commit -q -m two
+
+early reconcile --check --json
+t_json "commits after a record with no base are drift" "$T_OUT" drifted true
+t_eq "every commit on HEAD is listed" 2 "$(count_of "$T_OUT" commits)"
+t_eq "every file on HEAD is listed" "one.txt,two.txt" "$(t_tool json-members "$T_OUT" files)"
+
+early reconcile --check
+t_stdout_has "the text says the record predates the first commit" "before the first commit"
+
+"$HP_PYTHON" - "$FRESH/.hyperpower/app.json" <<'EOF'
+import json, sys
+with open(sys.argv[1]) as handle:
+    state = json.load(handle)
+state["reconciled_head"] = "0123456789abcdef0123456789abcdef01234567"
+with open(sys.argv[1], "w") as handle:
+    json.dump(state, handle)
+EOF
+
+early reconcile --check --json
+t_json "a recorded commit the repository does not have is flagged" "$T_OUT" base_missing true
+t_json "a missing base is drift, never no drift" "$T_OUT" drifted true
+
+early reconcile --check
+t_stdout_has "the text says drift cannot be listed" "cannot be listed"
+t_file_lacks "the text never claims no drift over a missing base" "$T_OUT" "no drift"
+
+early reconcile
+t_json "reconcile records HEAD over a missing base" "$FRESH/.hyperpower/app.json" \
+  reconciled_head "$(git -C "$FRESH" rev-parse HEAD)"

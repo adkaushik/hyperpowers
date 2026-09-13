@@ -8,8 +8,8 @@ It never blocks. It emits systemMessage, which shows the user a line and lets th
 It never emits decision "block", which would force the agent to keep working - the opposite
 of a passenger.
 
-It never raises. Every failure exits 0 with no output. A hook that breaks the session is
-worse than one that says nothing.
+It never raises in a session. Every failure exits 0 with no output, because a hook that
+breaks the session is worse than one that says nothing. HYPERPOWER_HOOK_DEBUG=1 re-raises.
 """
 
 import hashlib
@@ -157,7 +157,6 @@ def main():
     except (OSError, ValueError):
         memo = {}
 
-    # Nothing new since the last turn, and no fresh claim of being done: a trivial turn.
     if memo.get("fingerprint") == print_key and not claim:
         silent()
 
@@ -169,21 +168,17 @@ def main():
                 % (len(files), "" if len(files) == 1 else "s"))
     else:
         for rule_key, test, message in RULES:
-            try:
-                if test(files):
-                    key = rule_key
-                    line = message or (
-                        "%d files changed. `/hyperpower:humanize` before this grows further."
-                        % len(files))
-                    break
-            except Exception:
-                continue
+            if test(files):
+                key = rule_key
+                line = message or (
+                    "%d files changed. `/hyperpower:humanize` before this grows further."
+                    % len(files))
+                break
 
     if not key:
         remember(memo_path, print_key, memo.get("said"))
         silent()
 
-    # Never the same suggestion twice for the same state of the code.
     if memo.get("fingerprint") == print_key and memo.get("said") == key:
         silent()
 
@@ -209,9 +204,7 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except BaseException:
-        # Silent in a live session, because a hook that breaks it is worse than one that says
-        # nothing. HYPERPOWER_HOOK_DEBUG=1 re-raises, because silence also hides a crash: a
-        # hook that dies on every turn looks exactly like one with nothing to say.
+        # A crash and nothing to say look the same from outside. The flag tells them apart.
         if os.environ.get("HYPERPOWER_HOOK_DEBUG"):
             raise
         sys.exit(0)

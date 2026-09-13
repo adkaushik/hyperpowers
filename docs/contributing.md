@@ -62,7 +62,7 @@ compares that string and nothing else. A change shipped without a bump reaches n
 the marketplace has fetched.
 
 Bump it in the same commit as the change. Patch for a fix, minor for a new command or
-agent.
+agent. Add the version's entry to `CHANGELOG.md` in that commit too, newest first.
 
 ## Evals are required
 

@@ -521,6 +521,7 @@ Deletes all of it and tells you how many files it removed.
 | [Analytics and privacy](docs/analytics.md) | Checking what is recorded |
 | [Contributing](docs/contributing.md) | Adding a skill, gate, or agent |
 | [Design spec](docs/design-spec.md) | The full long-form design |
+| [Changelog](CHANGELOG.md) | What changed in each version, and how to update |
 
 ## Credits
 

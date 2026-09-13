@@ -50,9 +50,8 @@ config="$project_root/hyperpower.yml"
 local_config="$project_root/hyperpower.local.yml"
 rulebook="$project_root/CODEBASE_RULEBOOK.md"
 
-# An app recorded by /hyperpower:build rides along with whichever branch emits, so a session
-# opened mid-app says so without anyone having to remember a command. hp-app prints nothing
-# when no app is recorded, and any failure here leaves the note empty.
+# Both branches below append this note, so a session opened mid-app says where the app
+# stopped. hp-app prints nothing when no app is recorded, and any failure leaves it empty.
 app_note=""
 plugin_root=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
 if [ -n "$plugin_root" ] && command -v python3 >/dev/null 2>&1; then

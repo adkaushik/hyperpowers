@@ -45,10 +45,10 @@ detected in three lines. `init` remains for anyone who wants it separately.
 
 | Found | Action |
 |---|---|
+| one-file change | trivial: do it, report, no stops |
 | `app.json` in the state directory | resume: say where it left off, ask before continuing |
 | code, no `app.json` | take over: reconstruct the picture, confirm it |
 | empty repo | new app: agree the feature list first |
-| one-file change | trivial: do it, report, no stops |
 
 **Step 2 — scope and mode.** Inferred from the request. Ambiguous on either: one
 multiple-choice question with the best guess marked. Never two.

@@ -41,10 +41,10 @@ found in three lines. It does not stop. Section 3 has the details.
 
 | It finds | It does |
 |---|---|
+| one obvious change to one file | makes it, runs the gates, and reports. No questions. |
 | an app it was already building | says where it stopped, and asks before it continues |
 | code, but no app on record | reads the app, shows its picture of it, and asks you to correct it |
 | an empty repo | proposes the features and their order, and asks you to agree |
-| one obvious change to one file | makes it, runs the gates, and reports. No questions. |
 
 **Picks a mode** from how you asked. If that is unclear, it asks one question.
 

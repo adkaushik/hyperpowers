@@ -10,7 +10,7 @@ support one.
 Every write goes to a temp file and is renamed into place, so a hook reading mid-write
 never sees half a file.
 
-Exit 0 done. 1 no app recorded. 2 bad input. 78 not a git repository.
+Exit 0 done. 1 no app recorded. 2 bad input. 78 not inside a repository.
 """
 
 import argparse
@@ -28,7 +28,7 @@ EXIT_NO_REPO = 78
 
 SCOPES = ("app", "feature")
 MODES = ("conductor", "copassenger")
-ORIGINS = ("new", "takeover", "resume")
+ORIGINS = ("new", "takeover")
 STATUSES = ("planned", "active", "done", "half-done", "dropped")
 PHASES = ("discovery", "explore", "clarify", "approach", "build", "verify", "report")
 
@@ -58,13 +58,15 @@ def git(args, root):
 def repo_root(explicit):
     if explicit:
         return os.path.abspath(explicit)
-    env = os.environ.get("HYPERPOWER_REPO_ROOT", "").strip()
-    if env:
-        return os.path.abspath(os.path.expanduser(env))
-    top = git(["rev-parse", "--show-toplevel"], os.getcwd())
-    if not top:
-        die("not inside a git repository.", EXIT_NO_REPO)
-    return top
+    cfg = load_config_module()
+    try:
+        found = cfg.find_root()
+    except cfg.ConfigError as exc:
+        die(exc.render())
+    if not found:
+        die("not inside a git repository, and no hyperpower.yml above this directory.",
+            EXIT_NO_REPO)
+    return found
 
 
 def load_config_module():
@@ -82,7 +84,7 @@ def load_config_module():
 
 
 def state_root(root):
-    """paths.state, or .hyperpower. Works before hyperpower.yml exists - build sets up inline."""
+    """Works before hyperpower.yml exists, because build sets the repo up inline."""
     try:
         cfg = load_config_module()
     except Exception:
@@ -113,7 +115,6 @@ def read_state(root, required=True):
 
 
 def atomic_write(path, text):
-    """Temp file then rename. A reader mid-write sees the old file or the new one, never half."""
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     handle, temp = tempfile.mkstemp(prefix=".app-", dir=directory)
@@ -266,16 +267,31 @@ def cmd_reconcile(args, root):
     state = read_state(root)
     head = git(["rev-parse", "HEAD"], root)
     since = state.get("reconciled_head")
-    report = {"head": head, "since": since, "commits": [], "files": [], "drifted": False}
-    if since and head and since != head:
-        log = git(["log", "--oneline", "%s..%s" % (since, head)], root) or ""
-        files = git(["diff", "--name-only", "%s..%s" % (since, head)], root) or ""
-        report["commits"] = [c for c in log.split("\n") if c]
-        report["files"] = [f for f in files.split("\n") if f]
-        report["drifted"] = bool(report["commits"])
+    report = {"head": head, "since": since, "base_missing": False,
+              "commits": [], "files": [], "drifted": False}
+    if head and since != head:
+        span = "%s..%s" % (since, head) if since else head
+        log = git(["log", "--oneline", span], root)
+        if log is None:
+            report["base_missing"] = True
+            report["drifted"] = True
+        else:
+            if since:
+                files = git(["diff", "--name-only", span], root)
+            else:
+                files = git(["ls-tree", "-r", "--name-only", head], root)
+            report["commits"] = [c for c in log.split("\n") if c]
+            report["files"] = [f for f in (files or "").split("\n") if f]
+            report["drifted"] = bool(report["commits"])
     if args.json:
         sys.stdout.write(json.dumps(report, indent=2) + "\n")
+    elif report["base_missing"]:
+        sys.stdout.write("the recorded commit %s is not in this repository, so drift cannot be "
+                         "listed. Check the features against the code before trusting the "
+                         "record.\n" % since[:12])
     elif report["drifted"]:
+        if not since:
+            sys.stdout.write("the record was made before the first commit.\n")
         sys.stdout.write("%d commits since the state was last checked, %d files changed.\n"
                          % (len(report["commits"]), len(report["files"])))
         for commit in report["commits"][:5]:

@@ -47,10 +47,11 @@ First match wins.
 
 | `hp-app show --json` | The repo | Action |
 |---|---|---|
+| any | the request is one obvious change to one file | **Trivial** — step 2d |
 | exits 0 | anything | **Resume** — step 2a |
 | exits 1 | has code | **Take over** — step 2b |
 | exits 1 | empty | **New** — step 2c |
-| any | the request is one obvious change to one file | **Trivial** — step 2d |
+| exits 2 | anything | `app.json` is unreadable. Show the error, then ask: fix it by hand, or start over with `hp-app init --force` |
 
 ## Step 2a — resume
 
@@ -165,8 +166,7 @@ the phase as you enter it: `hp-app feature set <id> --phase <phase>`.
 Run each stage exactly as `/hyperpower:run` specifies — journal, contract validation,
 recorded usage. `build` adds the conversation around the pipeline; it does not replace it.
 
-**Clarify** exists because the other two tools that do this well both have it, and
-`/hyperpower:run` did not. Ask only what the code cannot answer.
+**Clarify** asks only what the code cannot answer.
 
 **Approach** — offer two or three, recommend one, say what each costs:
 
