@@ -50,11 +50,22 @@ config="$project_root/hyperpower.yml"
 local_config="$project_root/hyperpower.local.yml"
 rulebook="$project_root/CODEBASE_RULEBOOK.md"
 
+# An app recorded by /hyperpower:build rides along with whichever branch emits, so a session
+# opened mid-app says so without anyone having to remember a command. hp-app prints nothing
+# when no app is recorded, and any failure here leaves the note empty.
+app_note=""
+plugin_root=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+if [ -n "$plugin_root" ] && command -v python3 >/dev/null 2>&1; then
+    app_note=$(python3 "$plugin_root/scripts/hp-app" --root "$project_root" note 2>/dev/null)
+fi
+
 # ------------------------------------------------------ no config branch -----
 
 # The harness does not guess. With no config, say one line and stop.
 if [ ! -f "$config" ] && [ ! -f "$local_config" ]; then
-    emit "hyperpower is installed, but $project_root has no hyperpower.yml. Run /hyperpower:init to set this repo up; the harness protocol stays off until that file exists."
+    emit "hyperpower is installed, but $project_root has no hyperpower.yml yet. Run /hyperpower:build to start: it sets the repo up itself, then asks what you want to build. /hyperpower:init still works for setup on its own.${app_note:+
+
+$app_note}"
 fi
 
 # --------------------------------------------------------- read config -------
@@ -165,6 +176,12 @@ Never report a pass you did not verify. Never call a skipped gate passed. Never 
 missing tool as a pass. A gate marked blocking: false reports a warning and does not stop
 the run.
 
+CONDUCTOR
+The entry point is /hyperpower:build. It sets the repo up, takes over an existing app or
+starts a new one, and pulls in the commands below without the user naming them. When the
+user describes something to build and names no command, offer /hyperpower:build in one
+line. Do not recite the command list. /hyperpower:help does that when asked.
+
 RULEBOOK
 Read CODEBASE_RULEBOOK.md at the repo root before any code change. It holds this repo's
 conventions, patterns, banned APIs, and test layout. It is capped, so every rule in it
@@ -183,13 +200,15 @@ Do not delete a refuted assumption. Refuted is the highest-value output this har
 produces. An undeclared assumption is the failure it exists to catch.
 
 NAMES
-Everything is namespaced hyperpower:. Commands are /hyperpower:init, /hyperpower:review,
+Everything is namespaced hyperpower:. Commands are /hyperpower:build, /hyperpower:review,
 /hyperpower:scout. Agents are hyperpower:reviewer, hyperpower:skeptic, and the rest.
 Never spawn an agent by a bare name. A bare name does one of two things: it fails to
 resolve, or it silently resolves to a same-named agent in the user's own ~/.claude/agents/.
 That agent has different instructions, does not know this protocol, and returns a contract
 this pipeline cannot use. The second failure is silent, so the run will look correct.
 
-$render_section"
+$render_section${app_note:+
+
+$app_note}"
 
 emit "$protocol"

@@ -1,19 +1,23 @@
 # hooks
 
-Two hooks, wired in `hooks.json`. Session start is always on. The commit gate does nothing
-until you create a flag file.
+Three hooks, wired in `hooks.json`. Session start is always on. The co-passenger speaks only
+while an app is in co-passenger mode. The commit gate does nothing until you create a flag
+file.
 
 | File | Event | Matcher | Timeout | Default |
 |---|---|---|---|---|
 | `session-start.sh` | SessionStart | `startup\|resume\|clear\|compact` | 10s | on |
 | `require-commit-prep.sh` | PreToolUse | `Bash` | 5s | inert |
+| `copassenger.py` | Stop | none | 10s | silent outside co-passenger mode |
 
-Both are POSIX `sh`. Both exit 0 on every failure path. A broken hook never blocks a
-session and never traps a commit.
+The two shell hooks are POSIX `sh`. `copassenger.py` is Python 3, standard library only.
+All three exit 0 on every failure path. A broken hook never blocks a session, never traps a
+commit, and never stops a turn from ending.
 
 ## session-start.sh
 
-Injects the harness protocol into the main agent once per session. Runs in about 3 ms.
+Injects the harness protocol into the main agent once per session. Takes about 80 ms, most
+of it Python starting up to check for an app in progress.
 
 Output goes out as a SessionStart payload on `hookSpecificOutput.additionalContext` when
 `jq` is on PATH. Without `jq` it prints the protocol as plain stdout, which Claude Code
@@ -27,6 +31,7 @@ also treats as additional context. Both paths reach the model. `jq` is not requi
 | `hyperpower.yml` | whether the harness is configured, and the `voice.*` flags |
 | `hyperpower.local.yml` | the same fields, overriding the committed file field by field |
 | `CODEBASE_RULEBOOK.md` | presence only. The hook never reads its contents |
+| `hp-app note` | a paragraph about the app in progress, or nothing |
 
 Two config fields are read and no others: `voice.adhd_shaping` and `voice.plain_english`.
 A flag that is absent defaults to `true`. Only the literal value `false` turns a flag off.
@@ -35,11 +40,22 @@ A flag that is absent defaults to `true`. Only the literal value `false` turns a
 
 | Config state | What gets injected |
 |---|---|
-| Neither config file exists | one line: run `/hyperpower:init` |
+| Neither config file exists | one line: run `/hyperpower:build`, which sets the repo up |
 | Either config file exists | the full protocol |
 
-The harness does not guess a config. With no config it says one line and stops. It does not
-infer the stack, the gates, or the commands.
+The hook does not guess a config. With no config it says one line and stops. It does not
+infer the stack, the gates, or the commands. `build` does that, with the user watching.
+
+### An app in progress
+
+`/hyperpower:build` records an app in `app.json`, in the state directory. When one exists,
+both branches end with the paragraph `hp-app note` prints: the app, how many features are
+done, the current feature and its phase, and an instruction not to resume until the user
+asks.
+
+A session opened mid-app says where it stopped. Nobody has to remember a command.
+
+No app, no `python3`, or any error: the paragraph is empty and the rest is unchanged.
 
 ### What the protocol says
 
@@ -48,6 +64,7 @@ infer the stack, the gates, or the commands.
 | SCOPE | binds the main agent in this session only |
 | PIPELINE | Route, Understand, Plan, Design, Build, Gates, Review, Fix loop, Render |
 | GATES | fail closed. Exit 0 pass, non-zero fail, 78 could-not-run |
+| CONDUCTOR | `/hyperpower:build` is the entry point. Offer it in one line. Do not recite commands |
 | RULEBOOK | read `CODEBASE_RULEBOOK.md` before any code change |
 | ASSUMPTIONS | every stage declares them; `declared -> verified \| refuted \| unresolved` |
 | NAMES | address every agent and command as `hyperpower:<name>` |
@@ -64,6 +81,67 @@ shaping is in force, rather than an empty section.
 ```
 CLAUDE_PROJECT_DIR="$PWD" sh plugins/hyperpower/hooks/session-start.sh
 ```
+
+## copassenger.py
+
+After a turn that changed files, it adds one line about what to check next. It runs only
+while `/hyperpower:build` has an app in co-passenger mode, where the human writes the code.
+
+### When it speaks
+
+Every row must hold. The first one that fails ends the hook with no output.
+
+| Condition | Why |
+|---|---|
+| `stop_hook_active` is false | loop guard |
+| `app.json` in the state directory says `mode: copassenger` | in conductor mode, the conductor is already talking |
+| files are changed or untracked, outside the state directory | its own memo is not work |
+| the changes are new since the last turn, or the turn claims done | a turn that changed nothing gets silence |
+| one of the signals below matched | most turns match none |
+| the line differs from the last one it said for the same changes | it never repeats itself |
+
+### What it says
+
+One line. Highest priority first.
+
+| Signal | Points at |
+|---|---|
+| the last message claims done: `done`, `implemented`, `should work`, `ready to ship` and similar | `/hyperpower:review` |
+| a path under `migrations`, `models` or `schema` | `/hyperpower:council` with the backend pair |
+| a lockfile or manifest: `package.json`, `go.mod`, `Cargo.toml` and the rest | `/hyperpower:janitor` |
+| five or more files | `/hyperpower:humanize` |
+| a `.tsx`, `.jsx`, `.vue` or `.svelte` file | `/hyperpower:humanize` |
+
+The claim of done outranks everything. A turn that says done when it is not is the case this
+hook exists for.
+
+Changes are fingerprinted from `git diff HEAD --stat`, the changed file names, and their
+mtimes. The last fingerprint and the last line said are kept in `copassenger.json`, in the
+state directory.
+
+### What it never does
+
+1. It never emits `decision: "block"`. That forces the agent to keep working, which is the
+   driver's call, not the passenger's.
+2. It never runs a command. It names one. The human decides.
+3. It never raises. Every failure exits 0 with no output.
+
+It emits a top-level `systemMessage`, which shows the user one line and lets the turn end.
+It takes about 75 ms.
+
+### Test it
+
+Silence has two causes: nothing to say, or a crash. `HYPERPOWER_HOOK_DEBUG=1` re-raises, so
+a crash prints a traceback instead of passing for silence.
+
+```
+printf '{"cwd":"%s","stop_hook_active":false,"last_assistant_message":"done"}' "$PWD" |
+  HYPERPOWER_HOOK_DEBUG=1 python3 plugins/hyperpower/hooks/copassenger.py
+```
+
+It says something only with an app in co-passenger mode and a changed file. Output
+`{"systemMessage": ...}` means it spoke. No output and exit 0 means a row in the first
+table did not hold.
 
 ## require-commit-prep.sh
 
@@ -144,3 +222,6 @@ Exit 0 means allow. Exit 2 means deny, and the reason is on stderr.
 Paths use `${CLAUDE_PLUGIN_ROOT}`, so the plugin works from any install location. Do not
 hardcode a path. Do not raise the SessionStart timeout to cover a slow script; the hook has
 to stay fast enough that a session start never waits on it.
+
+The Stop command checks for `python3` before it runs the co-passenger. Without that check,
+a machine with no Python would show a hook error at the end of every turn.

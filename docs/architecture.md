@@ -267,6 +267,7 @@ Who calls what:
 
 | Caller | Calls |
 |---|---|
+| `/hyperpower:build` | `hp-app` for every change to the app record, then what `/hyperpower:run` calls for each feature, then `hp-visualize` for the report |
 | `/hyperpower:run` | all four of `hp-config`, `hp-journal`, `hp-validate`, `hp-gates` |
 | `/hyperpower:route` | `hp-config`, `hp-validate`, and `hp-journal` only after route returns |
 | `/hyperpower:resume` | `hp-journal drift`, `corrections`, `resume-event`, `correction-applied`, then `hp-config` and `hp-gates` |
@@ -279,18 +280,28 @@ Who calls what:
 
 ## Hooks
 
-Two, wired in `plugins/hyperpower/hooks/hooks.json`. Both are POSIX `sh`, and both exit 0 on
-every failure path, so a broken hook never blocks a session and never traps a commit. Full
-behaviour is in `plugins/hyperpower/hooks/README.md`.
+Three, wired in `plugins/hyperpower/hooks/hooks.json`. All three exit 0 on every failure
+path, so a broken hook never blocks a session, never traps a commit, and never stops a turn
+from ending. Full behaviour is in `plugins/hyperpower/hooks/README.md`.
 
 | Hook | Event | Default | Does |
 |---|---|---|---|
 | `session-start.sh` | SessionStart | on | injects the harness protocol into the main agent, once per session |
 | `require-commit-prep.sh` | PreToolUse on Bash | inert | denies a bare `git commit` until the change has been through the gates |
+| `copassenger.py` | Stop | silent outside co-passenger mode | adds one line after a turn that changed files, naming what to check |
 
 `session-start.sh` reads two config fields and no others: `voice.adhd_shaping` and
 `voice.plain_english`. With no `hyperpower.yml` it injects one line telling you to run
-`/hyperpower:init`. It does not infer a stack, a gate, or a command.
+`/hyperpower:build`, which sets the repo up with you watching. The hook itself does not
+infer a stack, a gate, or a command.
+
+When `/hyperpower:build` has an app in progress, both branches end with the paragraph
+`hp-app note` prints. A new session knows where the app stopped, and is told not to resume
+it until the user asks.
+
+`copassenger.py` speaks only when `app.json` says `mode: copassenger`. It emits
+`systemMessage`, never `decision: "block"`, so it can suggest a command but cannot make the
+agent keep working. It never repeats a line for the same changes.
 
 The protocol reaches the main agent only. A subagent does not re-run the hook and does not
 inherit the injected text, so a rule a subagent needs goes in that subagent's prompt.

@@ -1,9 +1,49 @@
 # Commands
 
-Twenty-six commands in six groups. Everything is namespaced `hyperpower:`, so nothing
+Twenty-seven commands in six groups. Everything is namespaced `hyperpower:`, so nothing
 collides with commands you already have.
 
 ## Setup
+
+### `/hyperpower:build`
+
+**Start here.** Build a feature or a whole app, take over an app that already exists, or
+resume one in progress. It is the one command a person needs; the rest are pulled in as they
+become relevant.
+
+```
+/hyperpower:build "a habit tracker with streaks"     start something new
+/hyperpower:build                                    take over the app you are in
+/hyperpower:build --takeover                         the same, said explicitly
+```
+
+It sets the repo up itself if `hyperpower.yml` does not exist yet, then works out:
+
+| | |
+|---|---|
+| **Starting state** | resume a recorded app, take over an existing one, start new, or do a trivial change directly |
+| **Scope** | one feature, or a whole app across many sessions |
+| **Mode** | *conductor* drives phase by phase; *co-passenger* rides along while you drive |
+
+It asks one question at a time, and only when the request is genuinely ambiguous.
+
+**Stops scale with the work.** A trivial change: none. A feature: two — choosing an approach,
+and deciding what to do about what review found. A whole app: the feature list and order up
+front, then those two per feature. Taking over an app adds one stop to confirm its
+reconstructed picture before building on it.
+
+**Co-passenger** is a `Stop` hook. After a turn that changed files it may add one line —
+review when a turn claims to be done, the backend pair when a migration changed, `janitor`
+when a manifest changed, `humanize` after a lot of new code. It never blocks and never runs
+anything on its own.
+
+**Every feature and app step ends with a report** from `hp-visualize`, stored under the state
+directory and offered in one line.
+
+App state lives in `<state>/app.json`, owned by `hp-app`. On resume it is checked against the
+code first, and commits made outside the conductor are named before it continues.
+
+Steer it with four phrases: *take over*, *I'll drive*, *what's next?*, *stop*.
 
 ### `/hyperpower:help`
 
@@ -26,7 +66,8 @@ reported rather than silently omitted — selfcheck 14 fails on either.
 Set up the current repository. Detects the stack, asks at most six questions, writes
 `hyperpower.yml`, generates the rulebook, verifies every gate.
 
-Run once per repo. Safe to re-run — it reads the existing config and fills only gaps.
+`build` runs this for you the first time. Run `init` yourself only to set up without
+building anything. Safe to re-run — it reads the existing config and fills only gaps.
 
 | Flag | Does |
 |---|---|
@@ -524,6 +565,13 @@ Resolves a PR URL, `owner/repo#123`, or a number into a throwaway worktree plus 
 and prints the commands that read its diff. `--clean` removes the worktree and the ref.
 Backs the PR target on `/hyperpower:review`.
 
+### `hp-app`
+
+The conductor's record of what is being built: scope, mode, the feature list with status and
+phase, and the commit it was last reconciled against. JSON, written atomically.
+`reconcile --check` reports commits made outside the conductor without recording them.
+`note` prints the paragraph session start injects when an app is in progress.
+
 ### `hp-selfcheck`
 
 Check the plugin against its own documentation. This is a contributor tool, not something a
@@ -569,13 +617,18 @@ tree against the documentation. The suite runs the code.
 
 ## Hooks
 
-Two hooks ship with the plugin, and neither is a command you type. They are listed here
-because one of them can refuse an action you asked for.
+Three hooks ship with the plugin, and none is a command you type. They are listed here
+because one of them can refuse an action you asked for, and one of them talks to you.
 
 | Hook | Fires | Default | Does |
 |---|---|---|---|
-| `session-start.sh` | session start, resume, clear, compact | on | injects the harness protocol into the main agent |
+| `session-start.sh` | session start, resume, clear, compact | on | injects the harness protocol into the main agent, and says which app is in progress |
 | `require-commit-prep.sh` | before a Bash tool call | inert | denies a bare `git commit` until the change has been through the gates |
+| `copassenger.py` | when a turn ends | silent outside co-passenger mode | adds one line naming what to check, after a turn that changed files |
+
+The co-passenger reads `app.json` and speaks only when its mode is `copassenger`. It never
+blocks the turn and never runs anything. To see why it stays silent, run it with
+`HYPERPOWER_HOOK_DEBUG=1`, which turns a swallowed crash into a traceback.
 
 The commit gate does nothing until you create a flag file:
 

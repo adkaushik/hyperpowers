@@ -1,5 +1,5 @@
 {
-  "description": "Session start injects the hyperpower protocol into the main agent. The commit gate is registered but inert until an opt-in flag file exists.",
+  "description": "Session start injects the hyperpower protocol into the main agent. Stop runs the co-passenger, which speaks one line after real work and only in co-passenger mode. The commit gate is registered but inert until an opt-in flag file exists.",
   "hooks": {
     "SessionStart": [
       {
@@ -22,6 +22,17 @@
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/require-commit-prep.sh\"",
             "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 || exit 0; python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/copassenger.py\"",
+            "timeout": 10
           }
         ]
       }

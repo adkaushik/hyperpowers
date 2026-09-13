@@ -23,6 +23,12 @@ SKILLS = os.path.join(PLUGIN, "skills")
 # name: (what it does, when you would type it, an example)
 # "when" answers the only question a help page needs to answer.
 ENTRIES = {
+    # ---------------------------------------------------------------- start here
+    "build": (
+        "Builds a feature or a whole app, takes over an existing one, or resumes",
+        "Start here. It sets the repo up, asks what you want, and runs everything else.",
+        '/hyperpower:build "a habit tracker with streaks"'),
+
     # ---------------------------------------------------------------- setting up
     "help": (
         "This list",
@@ -30,7 +36,7 @@ ENTRIES = {
         "/hyperpower:help run"),
     "init": (
         "Sets hyperpower up in this repo",
-        "Once, the first time. Nothing else works properly until it has run.",
+        "Only to set up without building anything. build runs this for you the first time.",
         "/hyperpower:init"),
     "doctor": (
         "Checks every gate still runs, and says what is broken",
@@ -143,6 +149,8 @@ ENTRIES = {
 }
 
 GROUPS = (
+    ("Start here", "The one command you need. It pulls in everything below as it goes.",
+     ["build"]),
     ("Setting up", "Run these once, or when something breaks",
      ["help", "init", "doctor", "config", "paths"]),
     ("Getting work done", "The ones you type most",
@@ -159,7 +167,7 @@ GROUPS = (
      ["eval", "telemetry"]),
 )
 
-START_HERE = ("route", "run", "why")
+START_HERE = ("build", "status", "why")
 
 
 def installed_commands():
@@ -198,8 +206,8 @@ def render(only=None, verbose=False):
             what, _, _ = ENTRIES[name]
             out.append("  %-24s %s" % ("/hyperpower:" + name, what.lower()))
         out.append("")
-        out.append("  route first, always. It tells you what a request will cost")
-        out.append("  before you pay for it, and it writes nothing.")
+        out.append("  build is the one you type. It sets the repo up, asks what you want,")
+        out.append("  and runs the rest as it becomes relevant. status and why show what it did.")
         out.append("")
 
     for title, blurb, names in GROUPS:

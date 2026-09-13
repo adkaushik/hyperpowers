@@ -2,10 +2,11 @@
 
 An agentic development harness for Claude Code.
 
-It runs a requirement through a gated pipeline, records what it decided and what it
+One command builds a feature or a whole app with you. It stops only where a wrong guess is
+expensive. It checks the work by running real commands, records what it decided and what it
 assumed, and learns from repeated mistakes without making normal runs slower.
 
-Stack-agnostic. One setup command adapts it to any repository.
+Stack-agnostic. It sets itself up in any repository the first time you use it.
 
 ## Install
 
@@ -14,20 +15,98 @@ claude plugin marketplace add https://github.com/adkaushik/hyperpowers
 claude plugin install hyperpower@hyperpowers
 ```
 
-Restart the session, then run this once per repository:
+Restart the session. Then, inside your repo:
 
 ```
-/hyperpower:init
+/hyperpower:build "a habit tracker with streaks"
 ```
 
-`init` detects your stack, asks at most six questions, and writes `hyperpower.yml`. Budget
-five minutes the first time.
+The first run sets the repo up. It detects your stack, asks at most six questions, and
+writes `hyperpower.yml`. Then it carries on with what you asked for.
+
+## Start here: build
+
+`build` is the one command to learn. Before it does anything expensive, it works out what is
+in the repo and whether it should drive or ride along.
+
+```mermaid
+flowchart TD
+    B(["/hyperpower:build"]) --> S{"hyperpower.yml?"}
+    S -->|"missing"| SU["Set up inline<br/><i>three-line report, no stop</i>"]
+    S -->|"present"| W
+    SU --> W{"What is here?"}
+    W -->|"an app on record"| RS["Resume<br/><i>says where it stopped, asks</i>"]
+    W -->|"code, no record"| TO["Take over<br/><i>shows its picture of the app, asks</i>"]
+    W -->|"empty repo"| NW["New app<br/><i>agree the features and their order</i>"]
+    W -->|"one-file change"| TR(["Do it, run the gates, report"])
+    RS --> M{"Drive or ride along?"}
+    TO --> M
+    NW --> M
+    M -->|"drive"| C["Conductor<br/><i>builds feature by feature</i>"]
+    M -->|"ride along"| P["Co-passenger<br/><i>you build, it suggests</i>"]
+
+    style M fill:#F6EEDF,stroke:#96631A,color:#96631A
+    style C fill:#E3EFE7,stroke:#2C6E49,color:#2C6E49
+    style P fill:#E7EDF6,stroke:#35507E,color:#35507E
+```
+
+### Conductor: it builds, you decide
+
+Each feature goes through seven phases. It stops at two of them.
+
+```mermaid
+flowchart LR
+    D["Discovery"] --> E["Explore"] --> CL["Clarify"] --> A{"Approach<br/><i>you pick one</i>"}
+    A --> BU["Build<br/><i>test first</i>"] --> V{"Verify<br/><i>gates and review</i>"}
+    V -->|"fix now"| BU
+    V -->|"ship"| R(["Report<br/><i>stored, offered</i>"])
+
+    style A fill:#F6EEDF,stroke:#96631A,color:#96631A
+    style V fill:#F6EEDF,stroke:#96631A,color:#96631A
+```
+
+| Work | It stops for |
+|---|---|
+| one-file change | nothing |
+| a feature | the approach, then the verify result |
+| an app | the feature list first, then approach and verify per feature |
+
+Verify never reports a gate that did not run as a pass. After each feature, a report of what
+every agent did, decided and spent is written to `.hyperpower/reports/` and offered in one
+line.
+
+### Co-passenger: you build, it watches
+
+After a turn that changed files, it adds one line about what to check. It never runs
+anything, and it never stops the turn from ending.
+
+```
+hyperpower · the turn says it is done, with 4 files changed. `/hyperpower:review` before trusting it.
+```
+
+| It sees | It suggests |
+|---|---|
+| the turn claims done | `review` |
+| a migration or a model changed | `council`, with the backend pair |
+| a lockfile or a manifest changed | `janitor` |
+| five or more files, or a component | `humanize` |
+
+### Four phrases steer it
+
+```
+"take over"     "I'll drive"     "what's next?"     "stop"
+```
+
+Close the session mid-app and open a new one. It says where the app stopped, and it does
+not continue until you ask.
 
 ## How it works
 
+Under `build`, everything below runs for you. Each piece also works on its own.
+
 ### The pipeline
 
-One command drives one requirement to the end:
+`run` drives one requirement to the end, without the conversation around it:
 
 ```
 /hyperpower:run "add a settings screen"
@@ -365,9 +444,10 @@ becomes your priority order for free.
 
 ## Commands
 
-Twenty-six commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
+Twenty-seven commands in six groups. Full reference in [docs/commands.md](docs/commands.md).
 
 ```
+/hyperpower:build "<what>"  start here: a feature, a whole app, or take over one
 /hyperpower:help            every command, plain language, grouped by when
 /hyperpower:init            set up this repo
 /hyperpower:doctor          check what is broken

@@ -36,6 +36,10 @@ against its own documentation. `run-tests` runs the scripts and reads what they 
 | `cases/hp-selfcheck.sh` | the shipped tree passes, and each planted fault is caught by its check |
 | `cases/task-classes.sh` | `task-classes.yml`, `schemas/route.json` and `schemas/plan.json` name the same classes |
 | `cases/run_evals.sh` | `validate` passes, `score` refuses unpaired rows |
+| `cases/hp-status.sh` | it reads and never writes, says plainly when no run exists, and takes its stuck signals from the journal |
+| `cases/state-dir.sh` | `paths.state` moves everything the harness writes, the default holds, and a relative value anchors to the repo root |
+| `cases/hp-app.sh` | every subcommand and exit code, one active feature at a time, drift against a moved HEAD, `paths.state`, and the note session start injects |
+| `cases/copassenger.sh` | silent unless an app is in co-passenger mode, one line per signal in priority order, no repeat for the same changes, its own memo is not work, never a `decision` |
 
 ### Assert against the document, not against a copy of it
 

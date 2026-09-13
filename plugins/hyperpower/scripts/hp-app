@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""The conductor's memory: what is being built, how far it got, and what was decided.
+
+An app outlives a session, and the co-passenger hook cannot read a conversation, so the
+state lives on disk. Truth is <state>/app.json. <state>/app.md is rendered from it for people.
+
+JSON, not YAML. A feature list is a list of maps, and hp-config's YAML parser does not
+support one.
+
+Every write goes to a temp file and is renamed into place, so a hook reading mid-write
+never sees half a file.
+
+Exit 0 done. 1 no app recorded. 2 bad input. 78 not a git repository.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+EXIT_OK = 0
+EXIT_NO_APP = 1
+EXIT_ERROR = 2
+EXIT_NO_REPO = 78
+
+SCOPES = ("app", "feature")
+MODES = ("conductor", "copassenger")
+ORIGINS = ("new", "takeover", "resume")
+STATUSES = ("planned", "active", "done", "half-done", "dropped")
+PHASES = ("discovery", "explore", "clarify", "approach", "build", "verify", "report")
+
+_CONFIG_MODULE = []
+
+
+def die(message, code=EXIT_ERROR):
+    sys.stderr.write("hp-app: %s\n" % message)
+    raise SystemExit(code)
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def git(args, root):
+    try:
+        done = subprocess.run(["git"] + args, cwd=root, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return done.stdout.decode("utf-8", "replace").strip()
+
+
+def repo_root(explicit):
+    if explicit:
+        return os.path.abspath(explicit)
+    env = os.environ.get("HYPERPOWER_REPO_ROOT", "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    top = git(["rev-parse", "--show-toplevel"], os.getcwd())
+    if not top:
+        die("not inside a git repository.", EXIT_NO_REPO)
+    return top
+
+
+def load_config_module():
+    if _CONFIG_MODULE:
+        return _CONFIG_MODULE[0]
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp-config")
+    loader = importlib.machinery.SourceFileLoader("hp_config", path)
+    spec = importlib.util.spec_from_loader("hp_config", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _CONFIG_MODULE.append(module)
+    return module
+
+
+def state_root(root):
+    """paths.state, or .hyperpower. Works before hyperpower.yml exists - build sets up inline."""
+    try:
+        cfg = load_config_module()
+    except Exception:
+        return os.path.join(root, ".hyperpower")
+    try:
+        loaded = cfg.load(root)
+        return cfg.state_dir(root, loaded["config"])
+    except Exception:
+        return cfg.state_dir(root, None)
+
+
+def paths(root):
+    base = state_root(root)
+    return base, os.path.join(base, "app.json"), os.path.join(base, "app.md")
+
+
+def read_state(root, required=True):
+    _, json_path, _ = paths(root)
+    if not os.path.isfile(json_path):
+        if required:
+            die("no app recorded here. Start one with /hyperpower:build.", EXIT_NO_APP)
+        return None
+    try:
+        with open(json_path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        die("app.json is unreadable: %s. Fix it by hand or remove it to start over." % exc)
+
+
+def atomic_write(path, text):
+    """Temp file then rename. A reader mid-write sees the old file or the new one, never half."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    handle, temp = tempfile.mkstemp(prefix=".app-", dir=directory)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def render_md(state):
+    lines = ["# %s" % state["name"], ""]
+    lines.append("%s · %s · started as %s" % (state["scope"], state["mode"], state["origin"]))
+    if state.get("stack"):
+        lines.append("Stack: %s" % ", ".join(state["stack"]))
+    lines.append("")
+    marks = {"done": "[x]", "active": "[>]", "planned": "[ ]",
+             "half-done": "[~]", "dropped": "[-]"}
+    for feature in state["features"]:
+        line = "%s %s  %s" % (marks.get(feature["status"], "[?]"), feature["id"], feature["name"])
+        if feature.get("phase"):
+            line += "  (%s)" % feature["phase"]
+        if feature.get("report"):
+            line += "  report: %s" % feature["report"]
+        lines.append(line)
+    lines.append("")
+    lines.append("Generated from app.json by hp-app. Edit app.json, or use /hyperpower:build.")
+    return "\n".join(lines) + "\n"
+
+
+def write_state(root, state):
+    _, json_path, md_path = paths(root)
+    state["updated_at"] = now()
+    atomic_write(json_path, json.dumps(state, indent=2) + "\n")
+    atomic_write(md_path, render_md(state))
+
+
+def find_feature(state, ident):
+    for feature in state["features"]:
+        if feature["id"] == ident or feature["name"] == ident:
+            return feature
+    die("no feature %r. Recorded: %s"
+        % (ident, ", ".join(f["id"] for f in state["features"]) or "none"))
+
+
+def next_id(state):
+    taken = {f["id"] for f in state["features"]}
+    number = 1
+    while "f%d" % number in taken:
+        number += 1
+    return "f%d" % number
+
+
+# ---------------------------------------------------------------------- commands
+
+
+def cmd_init(args, root):
+    if read_state(root, required=False) and not args.force:
+        die("an app is already recorded here. Use --force to replace it, or resume with "
+            "/hyperpower:build.")
+    state = {
+        "version": 1,
+        "name": args.name,
+        "scope": args.scope,
+        "mode": args.mode,
+        "origin": args.origin,
+        "stack": [s.strip() for s in (args.stack or "").split(",") if s.strip()],
+        "current": None,
+        "features": [],
+        "reconciled_head": git(["rev-parse", "HEAD"], root),
+        "created_at": now(),
+    }
+    write_state(root, state)
+    sys.stdout.write("%s\n" % paths(root)[1])
+    return EXIT_OK
+
+
+def cmd_show(args, root):
+    state = read_state(root)
+    if args.json:
+        sys.stdout.write(json.dumps(state, indent=2) + "\n")
+    else:
+        sys.stdout.write(render_md(state))
+    return EXIT_OK
+
+
+def cmd_feature_add(args, root):
+    state = read_state(root)
+    ident = next_id(state)
+    state["features"].append({
+        "id": ident, "name": args.name, "status": args.status,
+        "phase": None, "run_id": None, "report": None,
+    })
+    write_state(root, state)
+    sys.stdout.write("%s\n" % ident)
+    return EXIT_OK
+
+
+def cmd_feature_set(args, root):
+    state = read_state(root)
+    feature = find_feature(state, args.id)
+    if args.status:
+        feature["status"] = args.status
+        if args.status != "active":
+            feature["phase"] = None
+    if args.phase:
+        if feature["status"] != "active":
+            die("phase is only meaningful on an active feature. Set --status active first.")
+        feature["phase"] = args.phase
+    if args.run:
+        feature["run_id"] = args.run
+    if args.report:
+        feature["report"] = args.report
+    write_state(root, state)
+    return EXIT_OK
+
+
+def cmd_current(args, root):
+    state = read_state(root)
+    feature = find_feature(state, args.id)
+    for other in state["features"]:
+        if other["status"] == "active" and other is not feature:
+            other["status"] = "planned"
+            other["phase"] = None
+    feature["status"] = "active"
+    state["current"] = feature["id"]
+    write_state(root, state)
+    return EXIT_OK
+
+
+def cmd_mode(args, root):
+    state = read_state(root)
+    state["mode"] = args.mode
+    write_state(root, state)
+    sys.stdout.write("mode %s\n" % args.mode)
+    return EXIT_OK
+
+
+def cmd_reconcile(args, root):
+    """Report what changed since the state was last checked, then record the new HEAD.
+
+    Drift is reported before it is recorded, never silently absorbed. With --check the
+    HEAD is not updated, so a caller can show the drift and let the human decide.
+    """
+    state = read_state(root)
+    head = git(["rev-parse", "HEAD"], root)
+    since = state.get("reconciled_head")
+    report = {"head": head, "since": since, "commits": [], "files": [], "drifted": False}
+    if since and head and since != head:
+        log = git(["log", "--oneline", "%s..%s" % (since, head)], root) or ""
+        files = git(["diff", "--name-only", "%s..%s" % (since, head)], root) or ""
+        report["commits"] = [c for c in log.split("\n") if c]
+        report["files"] = [f for f in files.split("\n") if f]
+        report["drifted"] = bool(report["commits"])
+    if args.json:
+        sys.stdout.write(json.dumps(report, indent=2) + "\n")
+    elif report["drifted"]:
+        sys.stdout.write("%d commits since the state was last checked, %d files changed.\n"
+                         % (len(report["commits"]), len(report["files"])))
+        for commit in report["commits"][:5]:
+            sys.stdout.write("  %s\n" % commit)
+        if len(report["commits"]) > 5:
+            sys.stdout.write("  and %d more\n" % (len(report["commits"]) - 5))
+    else:
+        sys.stdout.write("no drift since the state was last checked.\n")
+    if not args.check and head:
+        state["reconciled_head"] = head
+        write_state(root, state)
+    return EXIT_OK
+
+
+def cmd_path(args, root):
+    sys.stdout.write("%s\n" % paths(root)[1])
+    return EXIT_OK
+
+
+def cmd_note(args, root):
+    """The paragraph session start injects. Nothing at all when no app is recorded.
+
+    Exits 0 either way, because the hook reads empty output as no app in progress.
+    """
+    state = read_state(root, required=False)
+    if not state:
+        return EXIT_OK
+    features = state.get("features") or []
+    done = sum(1 for f in features if f.get("status") == "done")
+    current = next((f for f in features if f.get("id") == state.get("current")), None)
+    where = ""
+    if current:
+        where = " Current: %s" % current.get("name")
+        if current.get("phase"):
+            where += ", in %s" % current["phase"]
+        where += "."
+    kind = "an app" if state.get("scope") == "app" else "a feature"
+    sys.stdout.write(
+        "APP IN PROGRESS\n"
+        "%s is recorded here as %s in %s mode, %d of %d features done.%s\n"
+        "When the user starts, offer to resume it with /hyperpower:build. Say where it left "
+        "off and ask before continuing. Never resume on your own.\n"
+        "In copassenger mode the human drives. Do not take over unless they say so.\n"
+        "The user steers with: take over, I'll drive, what's next?, stop.\n"
+        % (state.get("name"), kind, state.get("mode"), done, len(features), where))
+    return EXIT_OK
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="hp-app", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=None, help="repo root. Default: the git top level.")
+    sub = ap.add_subparsers(dest="command")
+
+    p = sub.add_parser("init", help="record a new app or feature")
+    p.add_argument("--name", required=True)
+    p.add_argument("--scope", choices=SCOPES, required=True)
+    p.add_argument("--mode", choices=MODES, required=True)
+    p.add_argument("--origin", choices=ORIGINS, required=True)
+    p.add_argument("--stack", default="", help="comma-separated")
+    p.add_argument("--force", action="store_true", help="replace an existing app")
+    p.set_defaults(handler=cmd_init)
+
+    p = sub.add_parser("show", help="print the state")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_show)
+
+    feature = sub.add_parser("feature", help="add or update a feature")
+    fsub = feature.add_subparsers(dest="feature_command")
+    p = fsub.add_parser("add")
+    p.add_argument("--name", required=True)
+    p.add_argument("--status", choices=STATUSES, default="planned")
+    p.set_defaults(handler=cmd_feature_add)
+    p = fsub.add_parser("set")
+    p.add_argument("id")
+    p.add_argument("--status", choices=STATUSES)
+    p.add_argument("--phase", choices=PHASES)
+    p.add_argument("--run")
+    p.add_argument("--report")
+    p.set_defaults(handler=cmd_feature_set)
+
+    p = sub.add_parser("current", help="make one feature the active one")
+    p.add_argument("id")
+    p.set_defaults(handler=cmd_current)
+
+    p = sub.add_parser("mode", help="switch between conductor and co-passenger")
+    p.add_argument("mode", choices=MODES)
+    p.set_defaults(handler=cmd_mode)
+
+    p = sub.add_parser("reconcile", help="report drift since the state was last checked")
+    p.add_argument("--check", action="store_true", help="report only, do not record HEAD")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(handler=cmd_reconcile)
+
+    p = sub.add_parser("path", help="print where app.json lives")
+    p.set_defaults(handler=cmd_path)
+
+    p = sub.add_parser("note", help="the paragraph session start injects, or nothing")
+    p.set_defaults(handler=cmd_note)
+
+    args = ap.parse_args(argv)
+    handler = getattr(args, "handler", None)
+    if handler is None:
+        ap.print_help()
+        return EXIT_ERROR
+    return handler(args, repo_root(args.root))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(EXIT_ERROR)
